@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Secrets — NEVER commit. Holds API keys and account passwords in plaintext.
+credentials.txt
+
+# Python bytecode / virtualenv
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# FurTag runtime output (belongs next to your media, not in the repo)
+.furtag_ledger.json
+*.furtag_ledger.json.tmp
+
+# Local test media + generated sidecars
+test files/
+*.urls.txt
