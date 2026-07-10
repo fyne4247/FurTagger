@@ -1,0 +1,158 @@
+# FurTag
+
+**FurTag** reverse-image-searches your media files against furry/booru services and writes the tags and source URLs it finds into [Hydrus Network](https://hydrusnetwork.github.io/hydrus/)-compatible sidecar files. Point it at a folder of images, videos, and PDFs, and it produces a `<file>.<ext>.txt` (tags) and `<file>.<ext>.urls.txt` (source URLs) next to each file, ready to import into Hydrus.
+
+It's built for tagging a large personal media archive with as little manual work as possible: it queries multiple sources, resumes where it left off, and rate-limits itself so you don't get throttled or banned. macOS-oriented (double-clickable launcher, Finder drag-and-drop), but the Python script itself is cross-platform.
+
+---
+
+## Features
+
+- **Multi-source hash tier** — every file's local MD5 is looked up on **e621, InkBunny, Danbooru, and Gelbooru concurrently**, and all results are merged. MD5 identity means a byte-identical file, so there's zero false-positive risk and each site contributes tags the others miss.
+- **Perceptual fallback** — images that get no hash hit fall through to **Fluffle** (furry-oriented exact perceptual matching), then **SauceNAO** as a last resort. When a perceptual match identifies a specific booru post, FurTag re-queries that booru by post ID to pull the full, properly-namespaced tag set.
+- **Concurrent, pipelined tiers** — the hash tier and perceptual tier run *at the same time*: as soon as a file misses every hash lookup it's handed to a perceptual worker thread that runs alongside the rest of the hash tier. A **two-track live terminal display** shows both a hash-tier panel and a perceptual panel, framed and separated by rules, each with its own progress bar and ETA.
+- **PDF support** — every PDF is rendered to per-page PNGs (with `comic:`/`page:` sidecars) and sent straight to the perceptual tier (a re-rendered page never MD5-matches an original). Gracefully skipped if PyMuPDF isn't installed.
+- **Hydrus sidecar output** — separate tag and URL sidecars per file, using Hydrus namespace conventions.
+- **Session ledger / resumable runs** — a `.furtag_ledger.json` in the scanned folder records every file as matched/no-match keyed by path + size + mtime, so re-runs skip already-done work without re-hashing or re-querying. A file is only re-checked if it was edited or replaced.
+- **Per-service rate limiting** — each service has its own thread-safe pacer tuned to its documented/observed limit, so successive calls to one service stay polite while different services never block each other.
+- **Junk-tag stripping** — "artist unknown / anonymous" placeholder tags that boorus emit are automatically dropped before writing.
+- **SauceNAO rate auto-detection** — SauceNAO's own API responses report your account's short-window allowance, so FurTag adapts its pace automatically: enhanced/donor accounts speed up, free accounts stay within limits, with no configuration needed. It also backs off and disables SauceNAO for the run when the daily limit is reached.
+
+---
+
+## Requirements
+
+- **macOS** (the launcher and drag-and-drop are macOS-oriented; the script is otherwise cross-platform)
+- **Python 3.7+**
+- Python packages (installed automatically on first run — see below):
+  - `pillow`, `requests`, `regex`
+  - `PyMuPDF` (import name `fitz` / `pymupdf`) — only needed for PDF support. **PDFs are gracefully skipped if it's missing**; everything else still works.
+
+### Running it
+
+The intended entry point is the double-clickable **`FurTag.command`**. On first run it creates a `.venv`, installs the dependencies, and launches the tool. It re-installs deps automatically whenever `requirements.txt` changes, so you never have to delete the venv by hand.
+
+```bash
+./FurTag.command
+```
+
+Or set it up and run manually:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python furtag.py
+```
+
+> The project venv is required — your system `python3` won't have the dependencies.
+
+---
+
+## Setup: credentials
+
+Create a single **`credentials.txt`** alongside the script, one `key = value` per line. **Any missing or incomplete key simply disables that source** instead of crashing — so you can fill in only the services you have accounts for.
+
+```ini
+# credentials.txt — one key = value per line
+e621_username     = your_e621_username
+e621_api_key      = your_e621_api_key_here
+inkbunny_username = your_inkbunny_username
+inkbunny_password = your_inkbunny_password
+danbooru_username = your_danbooru_username
+danbooru_api_key  = your_danbooru_api_key_here
+gelbooru_user_id  = your_gelbooru_user_id
+gelbooru_api_key  = your_gelbooru_api_key_here
+sauce_nao_api_key = your_saucenao_api_key_here
+```
+
+**InkBunny note:** in your InkBunny account settings you must enable **API access** *and* **adult ratings**, or explicit results stay hidden from the API.
+
+**Danbooru note:** API auth requires a verified-email account; if the key is rejected FurTag falls back to anonymous Danbooru access (which still allows MD5 lookups).
+
+---
+
+## ⚠️ Security warning — read this
+
+`credentials.txt` stores API keys **and account passwords in plaintext**. Treat the file as a secret.
+
+- **It's git-ignored by default.** This repo's `.gitignore` already excludes `credentials.txt`, so it won't be committed. **If you fork or push your own copy, verify it's still ignored before you push** (`git status` should never list it).
+- **Lock down its permissions.** Restrict it to owner read/write only:
+  ```bash
+  chmod 600 credentials.txt
+  ```
+- **Some fields are real account passwords** (InkBunny), which makes a leak worse than exposing a mere API key. Where a service supports it, prefer app-specific or throwaway credentials, and **rotate anything that ever gets exposed**.
+- **"Should I just delete the file after each run?"** You *can* — but the tool needs it again on every run, so deleting and recreating it each time is more hassle than it's worth. In practice, locking it down (`chmod 600` + gitignore) is the more useful protection than deleting it.
+- **Future enhancement:** secrets could be stored in the macOS Keychain (via the `keyring` library) instead of plaintext, for anyone who wants that. **This is not implemented yet.**
+
+---
+
+## Usage
+
+Run `./FurTag.command` (or `.venv/bin/python furtag.py`). FurTag prompts for a folder to scan:
+
+- **Blank entry** = the current directory.
+- **Finder drag-and-drop** paths are accepted (the escaping Terminal inserts is undone automatically).
+- Type `q`, `quit`, or `exit` (or press Ctrl+C / Ctrl+D) to quit. An invalid path re-prompts rather than exiting.
+
+It then walks the folder tree and processes files, showing the **two-track live display** — one panel for the hash tier, one for the perceptual tier — each with a previous/current/next file view, a phase label, and a progress bar with elapsed time and ETA. The current file carries a live sub-status showing which site is being checked.
+
+**Symbol legend:**
+
+| Symbol | Meaning |
+| ------ | ------- |
+| `…` | querying |
+| `✓` | found |
+| `✗` | not found (clean miss) |
+| `⚠` | error / blocked |
+
+When it finishes, each media file that matched has two sidecars written next to it (see below).
+
+---
+
+## How it works
+
+The pipeline runs in stages (see `CLAUDE.md` for the full architecture):
+
+1. **Index** — one walk of the folder tree. Dotfiles, macOS `._` metadata, non-media files, files that already have a tag sidecar, and files the ledger already recorded (unchanged) are skipped. Survivors are returned videos-first, then images, each in natural path order for stable, resumable runs.
+2. **Hash** — every candidate's local MD5 is computed in a thread pool.
+3. **Hash tier** — e621, InkBunny, Danbooru, and Gelbooru are queried by MD5 concurrently and their results merged. Videos go through this tier only (they can't be reverse-image-searched).
+4. **Perceptual tier** — images that missed every hash lookup run through Fluffle, then SauceNAO. This tier runs *concurrently* with the hash tier via a worker thread: a file that misses the hash tier is handed off immediately.
+
+**Resumability** — the `.furtag_ledger.json` session ledger, written in the scanned folder, records each file as matched or no-match keyed by path + size + mtime. On the next run those files are ruled out before any hashing or querying, so interrupted runs pick up right where they stopped. It's checkpointed periodically and saved atomically.
+
+**PDFs** — each PDF is rendered to per-page PNGs in a subfolder beside it, each with a `comic:`/`page:` sidecar, then fed straight into the perceptual tier (their perceptual tags append to that same sidecar). Already-rendered PDFs are skipped on re-runs.
+
+For the complete architecture — rate-limiting internals, perceptual→authoritative enrichment, per-source parsing quirks — see **[`CLAUDE.md`](./CLAUDE.md)**.
+
+---
+
+## Output format
+
+Two sidecars are written per matched file (Hydrus imports them via two separate sidecar routers):
+
+- **`<file>.<ext>.txt`** — tags, one per line
+- **`<file>.<ext>.urls.txt`** — source URLs, one per line
+
+The `<file>.<ext>.txt` suffix (rather than an extension-stripped `<file>.txt`) is deliberate — it avoids collisions when a folder holds, say, `cat.jpg` and `cat.png`.
+
+Tags follow Hydrus namespace conventions:
+
+| Namespace | Meaning |
+| --------- | ------- |
+| `creator:` | artist / author |
+| `character:` | character name |
+| `species:` | species |
+| `series:` | franchise the character is *from* (for fanart) |
+| `comic:` | e621 pool / comic name |
+| `page:` | numeric page position within a pool |
+| `site:` | origin platform |
+| `title:` | SauceNAO work title (fallback tier only) |
+| *(none)* | general / meta tags |
+
+---
+
+## Notes
+
+FurTag is a consolidation of four earlier iterations into a single script. The main entry point is `furtag.py`; `pdf_to_pages.py` doubles as a standalone PDF→PNG CLI and the library FurTag uses for its PDF pre-pass.
+
+No license specified yet.

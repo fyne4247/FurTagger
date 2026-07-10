@@ -60,12 +60,13 @@ import concurrent.futures as cf
 import hashlib
 import json
 import os
+import queue
 import re
 import shlex
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -94,8 +95,8 @@ SAUCENAO_INTERVAL = 6.0   # ~6 requests / 30s short limit (+ daily cap via heade
 # Gelbooru tag "type" → Hydrus namespace prefix ("" = unnamespaced)
 GELBOORU_TYPE = {0: "", 1: "creator:", 3: "series:", 4: "character:", 5: ""}
 
-MIN_SIMILARITY = 70.0           # accept SauceNAO's own (thinner) tags above this
-SAUCENAO_AUTH_SIMILARITY = 80.0  # trust a booru-ID match enough to re-query that
+MIN_SIMILARITY = 80.0           # accept SauceNAO's own (thinner) tags above this
+SAUCENAO_AUTH_SIMILARITY = 88.0  # trust a booru-ID match enough to re-query that
                                  # booru for its authoritative tag set
 
 # Fluffle: always trust "exact". Also accept "tossUp" BUT only when it resolves
@@ -110,6 +111,30 @@ PDF_DPI    = 300            # render resolution for PDF pages (see pdf_to_pages)
 
 CREDENTIALS_FILE = "credentials.txt"
 LEDGER_FILE      = ".furtag_ledger.json"
+
+# "Artist unknown" placeholder tags that every booru emits in some form — useless
+# noise in a Hydrus library, so they're dropped before writing. Compared against
+# the tag lowercased with underscores already normalised to spaces (see
+# _clean_tag_text / parsers). Bare general-tag forms plus any creator:<value>
+# whose value is one of _JUNK_CREATOR_VALUES are removed.
+_JUNK_TAGS = {
+    "unknown artist", "artist request", "anonymous artist",
+    "unknown_artist", "artist_request", "anonymous_artist",
+    "creator:unknown", "creator:anonymous",
+}
+_JUNK_CREATOR_VALUES = {
+    "unknown", "unknown artist", "anonymous", "anonymous artist", "artist request",
+}
+
+
+def _is_junk_tag(tag: str) -> bool:
+    """True for 'artist unknown' placeholder tags that shouldn't be written."""
+    low = tag.lower().strip()
+    if low in _JUNK_TAGS:
+        return True
+    if low.startswith("creator:"):
+        return low[len("creator:"):].strip() in _JUNK_CREATOR_VALUES
+    return False
 
 EMOJI_PATTERN = regex.compile(
     r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF'
@@ -152,25 +177,42 @@ class Pacer:
 
 # ── Live terminal display ────────────────────────────────────────────────────
 
+@dataclass
+class _Track:
+    """Per-track progress state for LiveDisplay (one for the hash tier, one for
+    perceptual). `growing=True` while the total isn't final yet — perceptual's
+    total grows as the hash tier discovers new misses, so its ETA is only
+    computed once the producer signals no more items are coming."""
+    phase: str = ""
+    total: int = 0
+    done: int = 0
+    idx: int = 0
+    current: str = ""
+    nxt: str = "—"
+    prev: Tuple[str, str] = ("—", "")   # (name, result)
+    sub: str = ""
+    start: float = field(default_factory=time.monotonic)
+    growing: bool = False
+
+
 class LiveDisplay:
-    """A fixed, in-place status panel: previous / current / next file, a phase
-    label, and a bottom progress bar with elapsed time and ETA. The current line
-    carries a live sub-status (which site is being checked, ✓ hit / ✗ miss, etc.).
-    Thread-safe. Falls back to one plain line per file when stdout isn't a TTY."""
+    """A fixed, in-place status panel with two independently-updating tracks
+    (hash tier / perceptual tier), each showing previous / current / next
+    file, a phase label, and a bottom progress bar with elapsed time and ETA.
+    The current line carries a live sub-status (which site is being checked,
+    ✓ hit / ✗ miss, etc.). Thread-safe — both tracks share one lock since the
+    hash tier and perceptual worker run on different threads and can update
+    concurrently. Falls back to one plain line per file when stdout isn't a TTY."""
 
     _ABBR = {"e621": "e621", "inkbunny": "ib", "danbooru": "dan", "gelbooru": "gel"}
-    _SYM  = {"pending": "·", "run": "…", "hit": "✓", "miss": "✗"}
+    # · not started yet · … querying · ✓ found · ✗ not found (clean miss) · ⚠ error/blocked
+    _SYM  = {"pending": "·", "run": "…", "hit": "✓", "miss": "✗", "err": "⚠"}
+    _LEGEND = ("legend:  … querying   ✓ found   ✗ not found   ⚠ error/blocked")
+    _TRACK_ORDER = ("hash", "perceptual")
+    _SEP = "  " + "═" * 60
 
     def __init__(self) -> None:
-        self.total = 0
-        self.done = 0
-        self.idx = 0
-        self.current = ""
-        self.nxt = "—"
-        self.prev = ("—", "")     # (name, result)
-        self.phase = ""
-        self.sub = ""
-        self.start = time.monotonic()
+        self.tracks: Dict[str, _Track] = {k: _Track() for k in self._TRACK_ORDER}
         self._drawn = 0
         self._lock = threading.Lock()
         self.tty = sys.stdout.isatty()
@@ -190,34 +232,56 @@ class LiveDisplay:
         return "hash ▸ " + "  ".join(
             f"{self._ABBR.get(s, s)} {self._SYM.get(st, '?')}" for s, st in state.items())
 
-    def begin_phase(self, label: str, total: int) -> None:
+    def begin_phase(self, track: str, label: str, total: int,
+                     growing: bool = False) -> None:
         with self._lock:
-            self.phase, self.total, self.done, self.idx = label, total, 0, 0
-            self.prev, self.sub = ("—", ""), ""
-            self.start = time.monotonic()
+            t = self.tracks[track]
+            t.phase, t.total, t.done, t.idx = label, total, 0, 0
+            t.prev, t.sub = ("—", ""), ""
+            t.start = time.monotonic()
+            t.growing = growing
             if not self.tty:
                 print(f"\n=== {label} — {total} file(s) ===")
 
-    def start_file(self, idx: int, current: str, nxt: Optional[str]) -> None:
+    def grow(self, track: str, by: int = 1) -> None:
+        """Bump a still-growing track's total (perceptual gains items as the
+        hash tier discovers misses)."""
         with self._lock:
-            self.idx, self.current, self.nxt, self.sub = idx, current, nxt or "—", "…"
+            self.tracks[track].total += by
             if self.tty:
                 self._render()
 
-    def status(self, sub: str) -> None:
+    def freeze_total(self, track: str) -> None:
+        """Stop treating this track's total as still-increasing, so its ETA
+        becomes computable (called once the producer feeding it is done)."""
         with self._lock:
-            self.sub = sub
+            self.tracks[track].growing = False
             if self.tty:
                 self._render()
 
-    def finish_file(self, result: str) -> None:
+    def start_file(self, track: str, idx: int, current: str,
+                    nxt: Optional[str]) -> None:
         with self._lock:
-            self.done = self.idx
-            self.prev = (self.current, result)
+            t = self.tracks[track]
+            t.idx, t.current, t.nxt, t.sub = idx, current, nxt or "—", "…"
+            if self.tty:
+                self._render()
+
+    def status(self, track: str, sub: str) -> None:
+        with self._lock:
+            self.tracks[track].sub = sub
+            if self.tty:
+                self._render()
+
+    def finish_file(self, track: str, result: str) -> None:
+        with self._lock:
+            t = self.tracks[track]
+            t.done = t.idx
+            t.prev = (t.current, result)
             if self.tty:
                 self._render()
             else:
-                print(f"[{self.idx}/{self.total}] {self._trim(self.current)} → {result}")
+                print(f"[{track}] [{t.idx}/{t.total}] {self._trim(t.current)} → {result}")
 
     def log(self, msg: str) -> None:
         """Print a message above the live panel (warnings, errors), then redraw."""
@@ -226,7 +290,7 @@ class LiveDisplay:
                 sys.stdout.write(f"\033[{self._drawn}A\033[J")  # to panel top, clear below
                 self._drawn = 0
             print(msg)
-            if self.tty and self.idx:
+            if self.tty and any(t.idx for t in self.tracks.values()):
                 self._render()
 
     def close(self) -> None:
@@ -236,23 +300,33 @@ class LiveDisplay:
                 sys.stdout.flush()
                 self._drawn = 0
 
-    def _render(self) -> None:
-        """Draw the panel. Caller must hold self._lock."""
-        elapsed = time.monotonic() - self.start
-        rate = self.done / elapsed if (elapsed > 0 and self.done > 0) else 0
-        eta = (self.total - self.done) / rate if rate > 0 else 0
+    def _render_track(self, t: _Track) -> List[str]:
+        elapsed = time.monotonic() - t.start
+        rate = t.done / elapsed if (elapsed > 0 and t.done > 0) else 0
+        if t.growing or rate <= 0:
+            eta = "…"
+        else:
+            eta = self._fmt((t.total - t.done) / rate)
         width = 28
-        filled = int(width * self.done / self.total) if self.total else 0
+        filled = int(width * t.done / t.total) if t.total else 0
         bar = "█" * filled + "░" * (width - filled)
-        pname, presult = self.prev
+        pname, presult = t.prev
 
-        lines = [
+        return [
             f"  ✓ prev:    {self._trim(pname)}   {presult}",
-            f"  ▶ current: {self._trim(self.current)}   {self.sub}",
-            f"    next:    {self._trim(self.nxt)}",
-            f"  {self.phase}",
-            f"  [{bar}] {self.done}/{self.total}   ⏱ {self._fmt(elapsed)} · ETA {self._fmt(eta)}",
+            f"  ▶ current: {self._trim(t.current)}   {t.sub}",
+            f"    next:    {self._trim(t.nxt)}",
+            f"  {t.phase}",
+            f"  [{bar}] {t.done}/{t.total}   ⏱ {self._fmt(elapsed)} · ETA {eta}",
         ]
+
+    def _render(self) -> None:
+        """Draw both tracks' panels stacked, framed and separated by rules so the
+        two are easy to tell apart. Caller must hold self._lock."""
+        lines: List[str] = [self._SEP]
+        for i, key in enumerate(self._TRACK_ORDER):
+            lines += self._render_track(self.tracks[key])
+            lines.append(self._SEP)          # rule after each block
         out = (f"\033[{self._drawn}A" if self._drawn else "")
         out += "".join("\033[2K" + ln + "\n" for ln in lines)
         sys.stdout.write(out)
@@ -262,6 +336,10 @@ class LiveDisplay:
 
 # Active display, if any. notify() routes warnings around the live panel.
 _display: Optional["LiveDisplay"] = None
+
+# Sentinel pushed onto the perceptual queue once the hash tier is done
+# producing, so the perceptual worker thread knows to stop and exit.
+_PERCEPTUAL_DONE = object()
 
 
 def notify(msg: str) -> None:
@@ -988,6 +1066,19 @@ class TagIntegrator:
 
     def _saucenao_check_quota(self, header: Dict) -> None:
         """Read SauceNAO's own quota counters and self-throttle/disable as needed."""
+        # Auto-adapt the pace to the account's actual short-window allowance:
+        # SauceNAO reports `short_limit` (calls per 30s) on every response — 4 for
+        # free, higher for enhanced/donor accounts. Spacing calls to 30/limit means
+        # a paid account speeds up automatically, and a lapsed one slows back down,
+        # with no config key to keep in sync. Only the single perceptual worker
+        # thread ever calls SauceNAO, so mutating the pacer here is race-free.
+        try:
+            short_limit = int(header.get("short_limit"))
+        except (TypeError, ValueError):
+            short_limit = None
+        if short_limit and short_limit > 0:
+            self.pace["saucenao"].interval = 30.0 / short_limit
+
         try:
             short_remaining = int(header.get("short_remaining"))
         except (TypeError, ValueError):
@@ -1199,6 +1290,9 @@ class TagIntegrator:
             return 0
 
     def write_results(self, media: Path, tags: Set[str], urls: Set[str]) -> None:
+        # Drop "artist unknown / anonymous" placeholder tags from every source
+        # before writing — they're noise in a Hydrus library.
+        tags = {t for t in tags if not _is_junk_tag(t)}
         if tags:
             self._append_lines(self.tag_sidecar_path(media), tags)
         if urls:
@@ -1353,14 +1447,18 @@ class TagIntegrator:
 
         state = {s: "run" for s in services}
         futs = {ex.submit(self._hash_lookup, s, item.md5): s for s in services}
-        disp.status(disp.hash_line(state))
+        disp.status("hash", disp.hash_line(state))
         for fut in cf.as_completed(futs):
             s = futs[fut]
             try:
                 t, u = fut.result()
             except Exception as e:
-                t, u = set(), set()
+                # Network/HTTP failure — distinct from a clean "not found" miss,
+                # so surface it as ⚠ rather than ✗ (the file may still exist there).
                 notify(f"❌ {s} failed on {item.path.name}: {e}")
+                state[s] = "err"
+                disp.status("hash", disp.hash_line(state))
+                continue
             if t or u:
                 tags |= t
                 urls |= u
@@ -1368,7 +1466,7 @@ class TagIntegrator:
                 state[s] = "hit"
             else:
                 state[s] = "miss"
-            disp.status(disp.hash_line(state))
+            disp.status("hash", disp.hash_line(state))
 
         sources = [s for s in services if s in hit]   # deterministic order
         return tags, urls, sources
@@ -1382,7 +1480,7 @@ class TagIntegrator:
         sources: List[str] = []
         fp = item.path
 
-        disp.status("perceptual ▸ Fluffle…")
+        disp.status("perceptual", "Fluffle…")
         js = self.fluffle_search(fp)
         if js:
             f_tags, f_urls, md5_u, pid = self.find_best_exact_match(js)
@@ -1393,7 +1491,7 @@ class TagIntegrator:
                 # e621 by ID for the full, properly-namespaced tag set. Prefer
                 # the post ID (reliable) over the MD5-from-URL trick.
                 if self.has_e621 and (pid or md5_u):
-                    disp.status("perceptual ▸ Fluffle → e621 enrich…")
+                    disp.status("perceptual", "Fluffle → e621 enrich…")
                     e_tags, e_urls = (self.e621_lookup_by_id(pid)
                                       if pid else (set(), set()))
                     if not e_tags and md5_u:
@@ -1403,12 +1501,12 @@ class TagIntegrator:
                 sources.append("fluffle")
 
         if not (tags or urls) and self.has_saucenao and not self.saucenao_exhausted:
-            disp.status("perceptual ▸ SauceNAO…")
+            disp.status("perceptual", "SauceNAO…")
             service, rid, s_tags, s_urls = self.saucenao_search(fp)
             if service and rid:
                 # High-confidence booru match → pull the authoritative,
                 # properly-namespaced tag set instead of SauceNAO's own.
-                disp.status(f"perceptual ▸ SauceNAO → {service} enrich…")
+                disp.status("perceptual", f"SauceNAO → {service} enrich…")
                 a_tags, a_urls = self._authoritative_lookup(service, rid)
                 if a_tags or a_urls:
                     tags |= a_tags
@@ -1442,66 +1540,110 @@ class TagIntegrator:
         self.hash_all(items)
 
         print("🔄 Hash tier: e621 · InkBunny · Danbooru · Gelbooru (concurrent, merged)"
-              "  →  Perceptual: Fluffle → SauceNAO\n")
+              "  →  Perceptual: Fluffle → SauceNAO")
+        print(f"   {LiveDisplay._LEGEND}\n")
 
         counts = {k: 0 for k in ("e621", "inkbunny", "danbooru",
                                  "gelbooru", "fluffle", "saucenao")}
         tagged = nomatch = 0
-        # PDF pages bypass the hash tier and go straight to perceptual.
+        counts_lock = threading.Lock()
+
+        def _bump_hit(sources: List[str]) -> None:
+            nonlocal tagged
+            with counts_lock:
+                tagged += 1
+                for s in sources:
+                    counts[s] += 1
+
+        def _bump_miss() -> None:
+            nonlocal nomatch
+            with counts_lock:
+                nomatch += 1
+
+        # PDF pages bypass the hash tier and go straight into the perceptual
+        # queue, seeded before either tier starts so they're worked on as
+        # soon as the perceptual worker is free.
         hash_items = [it for it in items if not it.perceptual_only]
-        pending_perceptual: List[FileItem] = [it for it in items if it.perceptual_only]
+        perceptual_q: "queue.Queue" = queue.Queue()
+        seed_count = 0
+        for it in items:
+            if it.perceptual_only:
+                perceptual_q.put(it)
+                seed_count += 1
 
         disp = LiveDisplay()
         _display = disp
         hash_workers = max(1, len(self.enabled_hash_services()))
+
+        def perceptual_worker() -> None:
+            idx = 0
+            while True:
+                item = perceptual_q.get()
+                if item is _PERCEPTUAL_DONE:
+                    perceptual_q.task_done()
+                    return
+                idx += 1
+                try:
+                    disp.start_file("perceptual", idx, item.path.name,
+                                     f"{perceptual_q.qsize()} queued")
+                    tags, urls, sources = self.perceptual_tier(item, disp)
+                    if tags or urls:
+                        self.write_results(item.path, tags, urls)
+                        ledger.record(item, "matched", sources)
+                        _bump_hit(sources)
+                        disp.finish_file(
+                            "perceptual", f"{'+'.join(sources)}  ({len(tags)} tags)")
+                    else:
+                        ledger.record(item, "nomatch", [])
+                        _bump_miss()
+                        disp.finish_file("perceptual", "— no match")
+                    ledger.maybe_save()
+                except Exception as e:
+                    notify(f"❌ perceptual worker error on {item.path.name}: {e}")
+                finally:
+                    perceptual_q.task_done()
+
         try:
-            # ── Phase 1/2: hash tier over every hashable candidate (videos first)
             disp.begin_phase(
-                "Phase 1/2 · hash lookups (e621·InkBunny·Danbooru·Gelbooru)", len(hash_items))
+                "hash", "Phase · hash lookups (e621·InkBunny·Danbooru·Gelbooru)",
+                len(hash_items))
+            disp.begin_phase(
+                "perceptual", "Phase · perceptual (Fluffle → SauceNAO)",
+                seed_count, growing=True)
+
+            perc_thread = threading.Thread(
+                target=perceptual_worker, name="perceptual-worker", daemon=True)
+            perc_thread.start()
+
+            # ── Hash tier over every hashable candidate (videos first). Images
+            # that miss are handed straight to the perceptual worker, which
+            # runs concurrently on its own thread rather than waiting for the
+            # whole hash tier to finish — the two tiers hit disjoint services,
+            # each still individually rate-paced by its own Pacer.
             with cf.ThreadPoolExecutor(max_workers=hash_workers) as ex:
                 for i, item in enumerate(hash_items):
                     nxt = hash_items[i + 1].path.name if i + 1 < len(hash_items) else None
-                    disp.start_file(i + 1, item.path.name, nxt)
+                    disp.start_file("hash", i + 1, item.path.name, nxt)
 
                     tags, urls, sources = self.hash_tier(item, disp, ex)
                     if tags or urls:
                         self.write_results(item.path, tags, urls)
                         ledger.record(item, "matched", sources)
-                        tagged += 1
-                        for s in sources:
-                            counts[s] += 1
-                        disp.finish_file(f"{'+'.join(sources)}  ({len(tags)} tags)")
+                        _bump_hit(sources)
+                        disp.finish_file("hash", f"{'+'.join(sources)}  ({len(tags)} tags)")
                     elif item.kind == "image":
-                        pending_perceptual.append(item)   # decided in phase 2
-                        disp.finish_file("no hash match → perceptual")
+                        perceptual_q.put(item)
+                        disp.grow("perceptual")
+                        disp.finish_file("hash", "no hash match → perceptual")
                     else:                                  # video: hash-only
                         ledger.record(item, "nomatch", [])
-                        nomatch += 1
-                        disp.finish_file("— no match")
+                        _bump_miss()
+                        disp.finish_file("hash", "— no match")
                     ledger.maybe_save()
 
-            # ── Phase 2/2: perceptual over hash-tier misses (images only) ─────
-            if pending_perceptual:
-                disp.begin_phase(
-                    "Phase 2/2 · perceptual (Fluffle → SauceNAO)", len(pending_perceptual))
-                for i, item in enumerate(pending_perceptual):
-                    nxt = (pending_perceptual[i + 1].path.name
-                           if i + 1 < len(pending_perceptual) else None)
-                    disp.start_file(i + 1, item.path.name, nxt)
-
-                    tags, urls, sources = self.perceptual_tier(item, disp)
-                    if tags or urls:
-                        self.write_results(item.path, tags, urls)
-                        ledger.record(item, "matched", sources)
-                        tagged += 1
-                        for s in sources:
-                            counts[s] += 1
-                        disp.finish_file(f"{'+'.join(sources)}  ({len(tags)} tags)")
-                    else:
-                        ledger.record(item, "nomatch", [])
-                        nomatch += 1
-                        disp.finish_file("— no match")
-                    ledger.maybe_save()
+            disp.freeze_total("perceptual")
+            perceptual_q.put(_PERCEPTUAL_DONE)
+            perc_thread.join()
         finally:
             disp.close()
             _display = None
