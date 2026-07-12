@@ -1,6 +1,6 @@
 # FurTag
 
-**FurTag** reverse-image-searches your media files against furry/booru services and writes the tags and source URLs it finds into [Hydrus Network](https://hydrusnetwork.github.io/hydrus/)-compatible sidecar files. Point it at a folder of images, videos, and PDFs, and it produces a `<file>.<ext>.txt` (tags) and `<file>.<ext>.urls.txt` (source URLs) next to each file, ready to import into Hydrus.
+**FurTag** reverse-image-searches your media files against furry/booru services and writes the tags and source URLs it finds into [Hydrus Network](https://hydrusnetwork.github.io/hydrus/). Point it at a folder of images, videos, and PDFs — it can either **push straight into a running Hydrus client** via the Client API (import + tags + URLs, no sidecars), or write classic Hydrus-compatible sidecars (`<file>.<ext>.txt` + `<file>.<ext>.urls.txt`) for drag-and-drop import.
 
 It's built for tagging a large personal media archive with as little manual work as possible: it queries multiple sources, resumes where it left off, and rate-limits itself so you don't get throttled or banned. macOS-oriented (double-clickable launcher, Finder drag-and-drop), but the Python script itself is cross-platform.
 
@@ -12,7 +12,8 @@ It's built for tagging a large personal media archive with as little manual work
 - **Perceptual fallback** — images that get no hash hit fall through to **Fluffle** (furry-oriented exact perceptual matching), then **SauceNAO** as a last resort. When a perceptual match identifies a specific booru post, FurTag re-queries that booru by post ID to pull the full, properly-namespaced tag set.
 - **Concurrent, pipelined tiers** — the hash tier and perceptual tier run *at the same time*: as soon as a file misses every hash lookup it's handed to a perceptual worker thread that runs alongside the rest of the hash tier. A **two-track live terminal display** shows both a hash-tier panel and a perceptual panel, framed and separated by rules, each with its own progress bar and ETA.
 - **PDF support** — every PDF is rendered to per-page PNGs (with `comic:`/`page:` sidecars) and sent straight to the perceptual tier (a re-rendered page never MD5-matches an original). Gracefully skipped if PyMuPDF isn't installed.
-- **Hydrus sidecar output** — separate tag and URL sidecars per file, using Hydrus namespace conventions.
+- **Hydrus Client API output** — with `hydrus_api_url` + `hydrus_access_key` set, FurTag imports each hit into Hydrus and applies tags/URLs on the spot (default service: **downloader tags**). No `.txt` sidecars required.
+- **Hydrus sidecar fallback** — without the API (or with `hydrus_also_sidecars = true`), writes separate tag and URL sidecars per file using Hydrus namespace conventions.
 - **Session ledger / resumable runs** — a `.furtag_ledger.json` in the scanned folder records every file as matched/no-match keyed by path + size + mtime, so re-runs skip already-done work without re-hashing or re-querying. A file is only re-checked if it was edited or replaced.
 - **Per-service rate limiting** — each service has its own thread-safe pacer tuned to its documented/observed limit, so successive calls to one service stay polite while different services never block each other.
 - **Junk-tag stripping** — "artist unknown / anonymous" placeholder tags that boorus emit are automatically dropped before writing.
@@ -63,11 +64,20 @@ danbooru_api_key  = your_danbooru_api_key_here
 gelbooru_user_id  = your_gelbooru_user_id
 gelbooru_api_key  = your_gelbooru_api_key_here
 sauce_nao_api_key = your_saucenao_api_key_here
+
+# Optional — push straight into Hydrus (Client API). No sidecars needed.
+hydrus_api_url       = http://127.0.0.1:45869
+hydrus_access_key    = your_64char_client_api_access_key
+hydrus_tag_service   = downloader tags
+hydrus_import        = true    # import the file then tag it (false = tag-only by hash)
+hydrus_also_sidecars = false   # also write .txt sidecars when the API is on
 ```
 
 **InkBunny note:** in your InkBunny account settings you must enable **API access** *and* **adult ratings**, or explicit results stay hidden from the API.
 
 **Danbooru note:** API auth requires a verified-email account; if the key is rejected FurTag falls back to anonymous Danbooru access (which still allows MD5 lookups).
+
+**Hydrus Client API note:** enable the API under *services → manage services*, then create an access key under *review services* with permissions to **import files**, **edit tags**, and **edit URLs**. FurTag verifies the key and resolves `hydrus_tag_service` (name or service key) on startup; if the client is offline it falls back to sidecars.
 
 ---
 
@@ -153,6 +163,6 @@ Tags follow Hydrus namespace conventions:
 
 ## Notes
 
-FurTag is a consolidation of four earlier iterations into a single script. The main entry point is `furtag.py`; `pdf_to_pages.py` doubles as a standalone PDF→PNG CLI and the library FurTag uses for its PDF pre-pass.
+FurTag is a consolidation of earlier iterations into a single script (`furtag.py`). Double-click `FurTag.command` (or run the script in the project venv) to launch it. PDF rendering lives in the same file and runs as a pre-pass when you scan a folder.
 
 No license specified yet.

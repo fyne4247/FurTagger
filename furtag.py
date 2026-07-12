@@ -29,14 +29,22 @@ path + size + mtime): records every file as "matched" or "nomatch" so re-runs
 skip work already done — without needing to re-hash or re-query anything. A file
 is only re-checked if it was edited/replaced (size or mtime changed).
 
-Output (Hydrus-compatible sidecars):
-    - <file>.<ext>.txt        → tags (one per line)
-    - <file>.<ext>.urls.txt   → source URLs (one per line)
+Output — pick one (or both) via credentials.txt:
+
+  A) Hydrus Client API (preferred when configured):
+        import file → add tags → associate source URLs
+        No sidecar files. Tags land on a local tag service
+        (default: "downloader tags").
+
+  B) Hydrus-compatible sidecars (default when API is off):
+        <file>.<ext>.txt       → tags (one per line)
+        <file>.<ext>.urls.txt  → source URLs (one per line)
 
 Python 3.7+ compatible.
 
 Dependencies:
     pip install pillow requests regex
+    (+ PyMuPDF for PDFs; optional)
 
 Credentials live in a single credentials.txt alongside this script
 (any missing/incomplete key just disables that source instead of crashing):
@@ -52,8 +60,16 @@ Credentials live in a single credentials.txt alongside this script
         gelbooru_api_key  = your_gelbooru_api_key
         sauce_nao_api_key = your_saucenao_api_key
 
+        # Optional — push straight into a running Hydrus client (no sidecars):
+        hydrus_api_url       = http://127.0.0.1:45869
+        hydrus_access_key    = your_64char_client_api_access_key
+        hydrus_tag_service   = downloader tags
+        hydrus_import        = true    # import file then tag (false = tag-only)
+        hydrus_also_sidecars = false   # also write .txt sidecars when API is on
+
     Note: Danbooru requires a verified-email account for API auth; if the key
     is rejected (403) the script falls back to anonymous Danbooru access.
+    Hydrus Client API needs permissions: import files, edit tags, edit URLs.
 """
 
 import concurrent.futures as cf
@@ -107,7 +123,7 @@ FLUFFLE_TOSSUP_E621 = True
 IMG_EXTS   = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"}
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv"}
 PDF_EXTS   = {".pdf"}
-PDF_DPI    = 300            # render resolution for PDF pages (see pdf_to_pages)
+PDF_DPI    = 300            # render resolution for PDF pages
 
 CREDENTIALS_FILE = "credentials.txt"
 LEDGER_FILE      = ".furtag_ledger.json"
@@ -135,6 +151,13 @@ def _is_junk_tag(tag: str) -> bool:
     if low.startswith("creator:"):
         return low[len("creator:"):].strip() in _JUNK_CREATOR_VALUES
     return False
+
+
+def _truthy(val: str, default: bool = False) -> bool:
+    """Parse a credentials.txt boolean (true/yes/1/on). Empty → default."""
+    if val is None or str(val).strip() == "":
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
 EMOJI_PATTERN = regex.compile(
     r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF'
@@ -440,6 +463,56 @@ class Ledger:
                 notify(f"⚠️  Couldn't write ledger: {e}")
 
 
+# ── PDF → per-page PNGs ──────────────────────────────────────────────────────
+
+def _import_fitz():
+    """Load PyMuPDF (import name `pymupdf` or legacy `fitz`). Raises ImportError
+    if neither is available — callers treat that as optional PDF support."""
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        import fitz  # PyMuPDF (older package layout)
+    return fitz
+
+
+def convert_pdf(pdf_path: Path, output_root: Path, dpi: int = PDF_DPI,
+                write_sidecars: bool = True) -> List[Path]:
+    """Render every page of ``pdf_path`` to a PNG under ``output_root/<stem>/``.
+
+    Returns the list of PNG paths written. When ``write_sidecars`` is True each
+    PNG also gets a ``comic:``/``page:`` ``.txt`` sidecar (lowercase extension
+    so it matches ``tag_sidecar_path`` on case-sensitive volumes and perceptual
+    tags append to the same file later).
+    """
+    fitz = _import_fitz()
+    stem = pdf_path.stem
+    out_dir = output_root / stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        print(f"  ! Failed to open {pdf_path.name}: {e}", file=sys.stderr)
+        return []
+
+    generated: List[Path] = []
+    for i, page in enumerate(doc, start=1):
+        base_name = f"{stem} PAGE{i}.PNG"
+        png_path = out_dir / base_name
+        txt_path = out_dir / f"{base_name}.txt"
+
+        pix = page.get_pixmap(dpi=dpi)
+        pix.save(png_path)
+        generated.append(png_path)
+
+        if write_sidecars:
+            txt_path.write_text(f"comic:{stem}\npage:{i}\n", encoding="utf-8")
+
+    doc.close()
+    print(f"  {pdf_path.name}: {len(generated)} page(s) -> {out_dir}")
+    return generated
+
+
 # ── TagIntegrator ────────────────────────────────────────────────────────────
 
 class TagIntegrator:
@@ -491,6 +564,16 @@ class TagIntegrator:
         self.has_saucenao = False
         self.saucenao_exhausted = False   # set True when the daily quota runs out
 
+        # Hydrus Client API (optional output sink — skip sidecars when on)
+        self.hydrus_api_url = ""
+        self.hydrus_access_key = ""
+        self.hydrus_tag_service_name = "downloader tags"
+        self.hydrus_tag_service_key = ""
+        self.hydrus_import = True
+        self.hydrus_also_sidecars = False
+        self.has_hydrus = False
+        self._hydrus_lock = threading.Lock()  # serialise API writes (hash + perc)
+
     # ── Credential loading ───────────────────────────────────────────────────
 
     @staticmethod
@@ -517,6 +600,7 @@ class TagIntegrator:
         self._init_danbooru(cfg)
         self._init_gelbooru(cfg)
         self._init_saucenao(cfg)
+        self._init_hydrus(cfg)
 
     def _init_e621(self, cfg: Dict[str, str]) -> None:
         self.e621_username = cfg.get("e621_username", "")
@@ -566,6 +650,93 @@ class TagIntegrator:
         print("✅ SauceNAO API key loaded")
         self.has_saucenao = True
 
+    def _init_hydrus(self, cfg: Dict[str, str]) -> None:
+        """Optional Client API sink. Missing/unreachable → sidecars only."""
+        url = (cfg.get("hydrus_api_url") or cfg.get("hydrus_url") or "").rstrip("/")
+        key = (cfg.get("hydrus_access_key") or cfg.get("hydrus_api_key") or "").strip()
+        if not (url and key):
+            return  # silent — Hydrus API is optional
+
+        self.hydrus_api_url = url
+        self.hydrus_access_key = key
+        self.hydrus_tag_service_name = (
+            cfg.get("hydrus_tag_service") or cfg.get("hydrus_tag_service_name")
+            or "downloader tags"
+        ).strip()
+        self.hydrus_import = _truthy(cfg.get("hydrus_import", "true"), default=True)
+        self.hydrus_also_sidecars = _truthy(
+            cfg.get("hydrus_also_sidecars", "false"), default=False)
+
+        try:
+            r = self.session.get(
+                f"{self.hydrus_api_url}/verify_access_key",
+                headers=self._hydrus_headers(),
+                timeout=10,
+            )
+            if r.status_code != 200:
+                print(f"‼️  Hydrus API rejected access key (HTTP {r.status_code}) – "
+                      f"sidecars only.")
+                return
+            svc_key = self._hydrus_resolve_tag_service(self.hydrus_tag_service_name)
+            if not svc_key:
+                print(f"‼️  Hydrus tag service '{self.hydrus_tag_service_name}' not found – "
+                      f"sidecars only.")
+                return
+            self.hydrus_tag_service_key = svc_key
+            self.has_hydrus = True
+            print(f"✅ Hydrus Client API → {self.hydrus_api_url}  "
+                  f"[{self.hydrus_tag_service_name}]  ({self.hydrus_mode_desc()})")
+        except requests.RequestException as e:
+            print(f"‼️  Hydrus API unreachable ({e}) – sidecars only. "
+                  f"Is the client running with the API enabled?")
+
+    def hydrus_mode_desc(self) -> str:
+        """e.g. "import+tag" / "tag-only + sidecars" — used in startup banners."""
+        mode = "import+tag" if self.hydrus_import else "tag-only"
+        extra = " + sidecars" if self.hydrus_also_sidecars else ""
+        return f"{mode}{extra}"
+
+    def _hydrus_headers(self) -> Dict[str, str]:
+        return {
+            "Hydrus-Client-API-Access-Key": self.hydrus_access_key,
+            "User-Agent": "FurTag/1.0 (Hydrus Client API)",
+        }
+
+    def _hydrus_resolve_tag_service(self, name_or_key: str) -> str:
+        """Map a tag service display name (or raw key) to its service_key."""
+        r = self.session.get(
+            f"{self.hydrus_api_url}/get_services",
+            headers=self._hydrus_headers(),
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        # Normalize both the modern services_v2 list and the legacy services
+        # object into one (name, type, service_key) iterable.
+        services = data.get("services_v2")
+        if isinstance(services, list):
+            entries = [(s.get("name") or "", s.get("type"), s.get("service_key") or "")
+                       for s in services if isinstance(s, dict)]
+        else:
+            legacy = data.get("services") or {}
+            entries = [(sname, (sinfo or {}).get("type"), (sinfo or {}).get("service_key") or "")
+                       for sname, sinfo in legacy.items()]
+
+        if any(key == name_or_key for _, _, key in entries):
+            return name_or_key  # already a raw service_key
+
+        # Prefer a local tag service (type 5) on a name collision.
+        want = name_or_key.lower()
+        matches = [(typ, key) for name, typ, key in entries if name.lower() == want]
+        matches.sort(key=lambda m: m[0] != 5)
+        return matches[0][1] if matches else ""
+
+    @property
+    def write_sidecars(self) -> bool:
+        """Sidecars when Hydrus API is off, or when hydrus_also_sidecars is set."""
+        return (not self.has_hydrus) or self.hydrus_also_sidecars
+
     def any_source(self) -> bool:
         return any((self.has_e621, self.has_inkbunny, self.has_danbooru,
                     self.has_gelbooru, self.has_saucenao))
@@ -597,16 +768,24 @@ class TagIntegrator:
             return None
 
     @staticmethod
-    def _md5_local(fp: Path) -> Optional[str]:
-        h = hashlib.md5()
+    def _hash_local(fp: Path, algo: str) -> Optional[str]:
+        h = hashlib.new(algo)
         try:
             with fp.open("rb") as f:
                 for chunk in iter(lambda: f.read(1 << 20), b""):
                     h.update(chunk)
             return h.hexdigest()
         except Exception as e:
-            notify(f"❌ MD5 failed on {fp.name}: {e}")
+            notify(f"❌ {algo.upper()} failed on {fp.name}: {e}")
             return None
+
+    @classmethod
+    def _md5_local(cls, fp: Path) -> Optional[str]:
+        return cls._hash_local(fp, "md5")
+
+    @classmethod
+    def _sha256_local(cls, fp: Path) -> Optional[str]:
+        return cls._hash_local(fp, "sha256")
 
     @staticmethod
     def _md5_from_url(url: str) -> str:
@@ -1289,23 +1468,135 @@ class TagIntegrator:
             notify(f"❌ Write failed for {path.name}: {e}")
             return 0
 
+    @staticmethod
+    def _pdf_page_base_tags(media: Path) -> Set[str]:
+        """comic:/page: for a PDF-rendered page named like ``STEM PAGEN.PNG``."""
+        tags: Set[str] = {f"comic:{media.parent.name}"}
+        m = re.search(r"PAGE(\d+)", media.name, re.I)
+        if m:
+            tags.add(f"page:{int(m.group(1))}")
+        return tags
+
     def write_results(self, media: Path, tags: Set[str], urls: Set[str]) -> None:
         # Drop "artist unknown / anonymous" placeholder tags from every source
         # before writing — they're noise in a Hydrus library.
         tags = {t for t in tags if not _is_junk_tag(t)}
-        if tags:
-            self._append_lines(self.tag_sidecar_path(media), tags)
-        if urls:
-            self._append_lines(self.url_sidecar_path(media), urls)
+        urls = {u for u in urls if u}
+
+        if self.has_hydrus and (tags or urls):
+            self._hydrus_push(media, tags, urls)
+
+        if self.write_sidecars:
+            if tags:
+                self._append_lines(self.tag_sidecar_path(media), tags)
+            if urls:
+                self._append_lines(self.url_sidecar_path(media), urls)
+
+    # ── Hydrus Client API push ───────────────────────────────────────────────
+
+    def _hydrus_push(self, media: Path, tags: Set[str], urls: Set[str]) -> None:
+        """Import (optional) + tag + associate URLs for one file. Thread-safe.
+
+        Safety: only *adds* content (never deletes files/tags/URLs). If import
+        is on and the import is refused (previously deleted, vetoed, error),
+        we abort the whole push — we do NOT fall through to bare-hash tagging.
+        """
+        with self._hydrus_lock:
+            try:
+                if self.hydrus_import:
+                    # Must get an accepted import (status 1/2). No hash → stop.
+                    file_hash = self._hydrus_add_file(media)
+                    if not file_hash:
+                        return
+                else:
+                    # Tag-only mode: file must already live in Hydrus under this hash.
+                    file_hash = self._sha256_local(media)
+                    if not file_hash:
+                        notify(f"❌ Hydrus: no hash for {media.name}; skipped push.")
+                        return
+
+                if tags:
+                    self._hydrus_add_tags(file_hash, tags)
+                if urls:
+                    self._hydrus_associate_urls(file_hash, urls)
+            except Exception as e:
+                notify(f"❌ Hydrus push failed for {media.name}: {e}")
+
+    def _hydrus_post(self, endpoint: str, body: dict, timeout: int) -> requests.Response:
+        """POST to a Hydrus Client API endpoint with the standard headers."""
+        return self.session.post(
+            f"{self.hydrus_api_url}/{endpoint}",
+            headers={**self._hydrus_headers(), "Content-Type": "application/json"},
+            json=body,
+            timeout=timeout,
+        )
+
+    def _hydrus_add_file(self, media: Path) -> Optional[str]:
+        """POST /add_files/add_file by path. Returns SHA-256 hex on success/already-in."""
+        try:
+            r = self._hydrus_post("add_files/add_file", {"path": str(media.resolve())}, 120)
+        except requests.RequestException as e:
+            notify(f"❌ Hydrus import request failed for {media.name}: {e}")
+            return None
+
+        if r.status_code != 200:
+            notify(f"⚠️  Hydrus import HTTP {r.status_code} for {media.name}: "
+                   f"{r.text[:200]}")
+            return None
+
+        try:
+            data = r.json()
+        except ValueError:
+            notify(f"⚠️  Hydrus import returned non-JSON for {media.name}")
+            return None
+
+        status = data.get("status")
+        h = data.get("hash") or ""
+        note = (data.get("note") or "").strip()
+        # 1 = imported, 2 = already in db — both give us a usable hash
+        if status in (1, 2) and h:
+            return h
+        if status == 3:
+            notify(f"⚠️  Hydrus: {media.name} previously deleted"
+                   + (f" ({note})" if note else "") + " — not tagging.")
+            return None
+        if status == 7:
+            notify(f"⚠️  Hydrus vetoed {media.name}"
+                   + (f": {note}" if note else ""))
+            return None
+        notify(f"⚠️  Hydrus import failed for {media.name} (status={status})"
+               + (f": {note}" if note else ""))
+        return None
+
+    def _hydrus_add_tags(self, file_hash: str, tags: Set[str]) -> None:
+        """POST /add_tags/add_tags — act like a downloader (don't override deletes)."""
+        body = {
+            "hash": file_hash,
+            "service_keys_to_tags": {
+                self.hydrus_tag_service_key: sorted(tags),
+            },
+            # Behave like a gallery parser: don't re-add human-deleted mappings.
+            "override_previously_deleted_mappings": False,
+        }
+        r = self._hydrus_post("add_tags/add_tags", body, 30)
+        if r.status_code != 200:
+            raise RuntimeError(f"add_tags HTTP {r.status_code}: {r.text[:200]}")
+
+    def _hydrus_associate_urls(self, file_hash: str, urls: Set[str]) -> None:
+        """POST /add_urls/associate_url."""
+        body = {"hash": file_hash, "urls_to_add": sorted(urls)}
+        r = self._hydrus_post("add_urls/associate_url", body, 30)
+        if r.status_code != 200:
+            raise RuntimeError(f"associate_url HTTP {r.status_code}: {r.text[:200]}")
 
     # ── PDF pre-pass ───────────────────────────────────────────────────────────
 
     def expand_pdfs(self, root: Path) -> Set[Path]:
         """Render every PDF under `root` to per-page PNGs *before* indexing, so
-        the pages are tagged like any other image. Reuses `pdf_to_pages` and
-        returns the set of page-folder paths it produced/owns; `index()` routes
-        PNGs living in those folders to perceptual-only (a re-rendered page never
-        MD5-matches a booru, so the hash tier is pure waste on them).
+        the pages are tagged like any other image. Returns the set of page-folder
+        paths it produced/owns; `index()` routes PNGs living in those folders to
+        perceptual-only (a re-rendered page never MD5-matches a booru, so the
+        hash tier is pure waste on them).
 
         Already-rendered PDFs are skipped, so a re-run doesn't churn the pages
         (which would bump their mtime and defeat the ledger). Missing PyMuPDF is
@@ -1322,7 +1613,7 @@ class TagIntegrator:
             return set()
 
         try:
-            from pdf_to_pages import convert_pdf
+            _import_fitz()                      # probe once before the loop
         except Exception as e:                  # PyMuPDF missing / import error
             print(f"⚠️  {len(pdfs)} PDF(s) found but PDF support is unavailable "
                   f"({e}). Install PyMuPDF to tag them; skipping for now.")
@@ -1338,7 +1629,8 @@ class TagIntegrator:
             if already:
                 continue                        # rendered on a previous run
             try:
-                convert_pdf(pdf, pdf.parent, PDF_DPI)
+                convert_pdf(pdf, pdf.parent, PDF_DPI,
+                            write_sidecars=self.write_sidecars)
             except Exception as e:
                 print(f"  ! Failed to render {pdf.name}: {e}")
         return page_dirs
@@ -1588,6 +1880,8 @@ class TagIntegrator:
                                      f"{perceptual_q.qsize()} queued")
                     tags, urls, sources = self.perceptual_tier(item, disp)
                     if tags or urls:
+                        if item.perceptual_only:
+                            tags = set(tags) | self._pdf_page_base_tags(item.path)
                         self.write_results(item.path, tags, urls)
                         ledger.record(item, "matched", sources)
                         _bump_hit(sources)
@@ -1707,13 +2001,20 @@ def prompt_for_folder() -> Path:
 def main() -> None:
     print("🐾 Unified Furry Tag Integrator for Hydrus 🐾")
     print("📋 e621 + InkBunny + Danbooru + Gelbooru MD5 (concurrent) → Fluffle → SauceNAO")
-    print("📝 Tags → <file>.<ext>.txt   |   URLs → <file>.<ext>.urls.txt")
     print("⏭️  Skips files already tagged or logged in .furtag_ledger.json\n")
 
     root = prompt_for_folder()
 
     ti = TagIntegrator()
     ti.load_credentials(Path(__file__).with_name(CREDENTIALS_FILE))
+
+    if ti.has_hydrus:
+        print(f"📝 Output → Hydrus Client API  ({ti.hydrus_mode_desc()})")
+    else:
+        print("📝 Output → sidecars  "
+              "(<file>.<ext>.txt + <file>.<ext>.urls.txt)")
+        print("   Tip: set hydrus_api_url + hydrus_access_key in credentials.txt "
+              "to push straight into Hydrus.")
 
     if not ti.any_source():
         print("\n⚠️  No API credentials loaded! Only Fluffle will be used.")

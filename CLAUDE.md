@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-FurTag is a single Python script (`furtag.py`) that reverse-image-searches media files against furry/booru services and writes the retrieved metadata to Hydrus Network-compatible sidecar files. It is the consolidation of four earlier iterations (now deleted).
+FurTag is a single Python script (`furtag.py`) that reverse-image-searches media files against furry/booru services and writes the retrieved metadata into Hydrus Network — either via the **Client API** (import + tags + URLs, no sidecars) or as classic Hydrus-compatible sidecar files. It is the consolidation of four earlier iterations (now deleted).
 
 ## Running It
 
@@ -23,9 +23,11 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 `LiveDisplay` renders an in-place panel (previous / current / next file, a **phase label**, and a bottom progress bar with elapsed/ETA). The current line carries a live sub-status: during the hash tier it shows each site ticking off (`hash ▸ e621 ✓  ib ·  dan ✓  gel …` — ✓ hit, ✗/· miss, … in-flight); during perceptual it names the engine and any enrichment step. It is **thread-safe** (a lock guards every write) because the hash tier renders from a worker pool. All warnings/errors go through the module-level **`notify()`** (not `print`), which routes them *above* the live panel via `_display.log()`. When stdout isn't a TTY it degrades to one line per file. **Use `notify()` for any user-facing status message inside the processing loop** — a raw `print` would corrupt the panel.
 
-## Output: Two Sidecars Per File
+## Output
 
-Tags and URLs are written to **separate** sidecars (Hydrus imports them via two different sidecar routers):
+**Preferred:** Hydrus Client API (`has_hydrus`) — import file, add tags to `hydrus_tag_service` (default `downloader tags`), associate source URLs. No sidecar files.
+
+**Fallback / dual-write:** sidecars when the API is off, or when `hydrus_also_sidecars = true`:
 
 - `<file>.<ext>.txt` — tags, one per line
 - `<file>.<ext>.urls.txt` — source URLs, one per line
@@ -42,15 +44,31 @@ inkbunny_username inkbunny_password
 danbooru_username danbooru_api_key
 gelbooru_user_id  gelbooru_api_key
 sauce_nao_api_key
+
+# optional Hydrus Client API sink (no sidecars when on):
+hydrus_api_url       hydrus_access_key
+hydrus_tag_service   (= "downloader tags" by default)
+hydrus_import        (true/false, default true)
+hydrus_also_sidecars (true/false, default false)
 ```
 
-For InkBunny, enable API access **and** adult ratings in account settings, or explicit results stay hidden. `load_credentials()` reads the file once into a dict and the `_init_<source>` helpers each pull their keys.
+For InkBunny, enable API access **and** adult ratings in account settings, or explicit results stay hidden. `load_credentials()` reads the file once into a dict and the `_init_<source>` helpers each pull their keys. `_init_hydrus()` verifies the access key and resolves the tag service name → `service_key`; on failure FurTag keeps writing sidecars.
+
+### Hydrus Client API output
+
+When `has_hydrus` is true, `write_results()` calls `_hydrus_push()` instead of (or in addition to, if `hydrus_also_sidecars`) writing `.txt` sidecars:
+
+1. `POST /add_files/add_file` with `{path}` when `hydrus_import` (status 1/2 → hash)
+2. `POST /add_tags/add_tags` with `service_keys_to_tags` and `override_previously_deleted_mappings: false` (downloader-like)
+3. `POST /add_urls/associate_url` with `urls_to_add`
+
+Pushes are serialised with `_hydrus_lock` because the hash tier and perceptual worker can both call `write_results`. PDF pages still get `comic:`/`page:` via `_pdf_page_base_tags()` even when convert sidecars are skipped.
 
 ## Pipeline (the core architecture)
 
 `TagIntegrator.run()` drives four stages (preceded by a PDF pre-pass):
 
-- **PDF pre-pass** (`expand_pdfs()`): before indexing, every `*.pdf` under the root is rendered to per-page PNGs via `pdf_to_pages.convert_pdf()` (into a `<stem>/` subfolder beside the PDF, with `comic:`/`page:` `.txt` sidecars). Returns the set of page-folder paths. Already-rendered PDFs are skipped (guarded on an existing `.png` in the out-dir) so a re-run doesn't churn page mtimes and defeat the ledger. Missing PyMuPDF is non-fatal — PDFs are just left untouched, like a missing credential. See **PDFs** below.
+- **PDF pre-pass** (`expand_pdfs()`): before indexing, every `*.pdf` under the root is rendered to per-page PNGs via in-module `convert_pdf()` (into a `<stem>/` subfolder beside the PDF, with `comic:`/`page:` `.txt` sidecars). Returns the set of page-folder paths. Already-rendered PDFs are skipped (guarded on an existing `.png` in the out-dir) so a re-run doesn't churn page mtimes and defeat the ledger. Missing PyMuPDF is non-fatal — PDFs are just left untouched, like a missing credential. See **PDFs** below.
 0. **Index** (`index()`): one `os.walk` of the tree. Skips dotfiles / macOS `._` metadata (`fn.startswith(".")`), non-media extensions, files with an existing tag sidecar, and files the ledger already recorded as matched/no-match (unchanged). Returns the survivors **videos-first, then images** (each group in **natural path order** via `_natural_key` — `PAGE2` before `PAGE10` — for stable, resumable runs). A PNG living in a `pdf_page_dirs` folder is flagged `perceptual_only` and is **exempt from the has-sidecar skip** (its sidecar holds only the base `comic:`/`page:` tags), so it still gets perceptually searched — the ledger alone rules it out on a re-run.
 1. **Hash** (`hash_all()`): compute every candidate's local MD5 in a thread pool (disk-bound, safe to parallelize) so the network stage never recomputes it.
 2. **Hash tier — run ALL and merge** (`hash_tier()`): e621 + InkBunny + Danbooru + Gelbooru queried by MD5 and unioned. The four boorus are **queried concurrently per file** via a `ThreadPoolExecutor` (four different hosts), each self-paced by its own `Pacer`. MD5 identity means byte-identical file, so there is zero false-positive risk and the tag sets genuinely differ. **Never short-circuit between these.** Gelbooru's post API returns a *flat* tag list, so `_gelbooru_categorize()` makes one extra batched call to map tags to `character:`/`creator:`/`series:`, falling back to unnamespaced tags if it fails.
@@ -60,7 +78,7 @@ The hash tier and perceptual tier are **separate passes** over the file list (ph
 
 ### PDFs
 
-`pdf_to_pages.py` is both a standalone CLI and a library (`convert_pdf(pdf, out_root, dpi=300, write_sidecars=True) -> [png_paths]`). FurTag imports it lazily inside `expand_pdfs()` (so a missing PyMuPDF degrades gracefully). The sidecar is written with a **lowercase `.txt`** extension to match FurTag's `tag_sidecar_path` (`<file>.<ext>.txt`), so perceptual tags append to the *same* file even on a case-sensitive volume. Requires **PyMuPDF** (in `requirements.txt`, import name `fitz`/`pymupdf`). Comic pages therefore never hit the boorus by hash — Fluffle/SauceNAO are their only shot, which is the intended behavior for re-rendered art.
+`convert_pdf(pdf, out_root, dpi=300, write_sidecars=True) -> [png_paths]` lives in `furtag.py`. `expand_pdfs()` probes for PyMuPDF via `_import_fitz()` once before the render loop (missing PyMuPDF degrades gracefully). The sidecar is written with a **lowercase `.txt`** extension to match `tag_sidecar_path` (`<file>.<ext>.txt`), so perceptual tags append to the *same* file even on a case-sensitive volume. Requires **PyMuPDF** (in `requirements.txt`, import name `fitz`/`pymupdf`). Comic pages therefore never hit the boorus by hash — Fluffle/SauceNAO are their only shot, which is the intended behavior for re-rendered art.
 
 ### Session ledger
 
