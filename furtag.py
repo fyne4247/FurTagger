@@ -632,20 +632,21 @@ def convert_pdf(pdf_path: Path, output_root: Path, dpi: int = PDF_DPI,
         return []
 
     generated: List[Path] = []
-    for i, page in enumerate(doc, start=1):
-        base_name = f"{stem} PAGE{i}.PNG"
-        png_path = out_dir / base_name
-        txt_path = out_dir / f"{base_name}.txt"
+    try:
+        for i, page in enumerate(doc, start=1):
+            base_name = f"{stem} PAGE{i}.PNG"
+            png_path = out_dir / base_name
+            txt_path = out_dir / f"{base_name}.txt"
 
-        pix = page.get_pixmap(dpi=dpi)
-        pix.save(png_path)
-        generated.append(png_path)
+            pix = page.get_pixmap(dpi=dpi)
+            pix.save(png_path)
+            generated.append(png_path)
 
-        if write_sidecars:
-            txt_path.write_text(f"comic:{stem}\npage:{i}\n", encoding="utf-8")
-
-    doc.close()
-    print(f"  {pdf_path.name}: {len(generated)} page(s) -> {out_dir}")
+            if write_sidecars:
+                txt_path.write_text(f"comic:{stem}\npage:{i}\n", encoding="utf-8")
+    finally:
+        doc.close()
+    print(f"  {pdf_path.name}: {len(generated)} page(s) at {dpi} DPI -> {out_dir}")
     return generated
 
 
@@ -1945,15 +1946,53 @@ class TagIntegrator:
             jobs.append(pdf)
         return page_dirs, jobs
 
-    def render_pdf_jobs(self, pdfs: List[Path], dpi: int) -> List[Path]:
-        """Render planned PDFs serially on the dedicated background worker."""
+    @staticmethod
+    def _clear_partial_pdf_render(pdf: Path) -> None:
+        """Remove only this PDF's precisely named partial page outputs."""
+        out_dir = pdf.parent / pdf.stem
+        if not out_dir.is_dir():
+            return
+        pattern = re.compile(
+            rf"^{re.escape(pdf.stem)} PAGE\d+\.PNG(?:\.txt)?$", re.I)
+        try:
+            targets = [p for p in out_dir.iterdir()
+                       if p.is_file() and pattern.match(p.name)]
+        except OSError:
+            return
+        for path in targets:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def render_pdf_jobs(self, pdfs: List[Path], dpi: int,
+                        completed: Optional["queue.Queue"] = None) -> List[Path]:
+        """Render planned PDFs serially with adaptive oversized-page fallback."""
         generated: List[Path] = []
         for pdf in pdfs:
-            try:
-                generated += convert_pdf(
-                    pdf, pdf.parent, dpi, write_sidecars=self.write_sidecars)
-            except Exception as e:
-                notify(f"⚠️  Failed to render {pdf.name}: {e}")
+            attempt_dpi = dpi
+            pdf_generated: List[Path] = []
+            while True:
+                try:
+                    pdf_generated = convert_pdf(
+                        pdf, pdf.parent, attempt_dpi,
+                        write_sidecars=self.write_sidecars)
+                    break
+                except Exception as e:
+                    oversized = "overly large image" in str(e).lower()
+                    next_dpi = max(72, attempt_dpi // 2)
+                    if oversized and next_dpi < attempt_dpi:
+                        self._clear_partial_pdf_render(pdf)
+                        notify(f"⚠️  {pdf.name} is too large at {attempt_dpi} DPI; "
+                               f"retrying losslessly at {next_dpi} DPI.")
+                        attempt_dpi = next_dpi
+                        continue
+                    self._clear_partial_pdf_render(pdf)
+                    notify(f"⚠️  Failed to render {pdf.name}: {e}")
+                    break
+            generated += pdf_generated
+            if completed is not None:
+                completed.put((pdf.name, pdf_generated, attempt_dpi))
         return generated
 
     # ── Index ────────────────────────────────────────────────────────────────
@@ -1987,10 +2026,13 @@ class TagIntegrator:
         ledger alone rules them out on a re-run."""
         print("📂 Scanning folder tree…")
         media = tagged = seen = skipped_dirs = 0
+        scanned_dirs = 0
+        discovered_media = 0
         items: List[FileItem] = []
         candidate_dirs: Set[Path] = set()
 
         for dp, dirs, files in os.walk(root):
+            scanned_dirs += 1
             dirs.sort()
             dp_path = Path(dp)
             if excluded_dirs:
@@ -1998,6 +2040,12 @@ class TagIntegrator:
 
             media_files = [fn for fn in sorted(files)
                            if not fn.startswith(".") and self._media_kind(fn)]
+            discovered_media += len(media_files)
+            if sys.stdout.isatty() and scanned_dirs % 100 == 0:
+                sys.stdout.write(
+                    f"\r  indexed {scanned_dirs:,} folders · "
+                    f"{discovered_media:,} media found")
+                sys.stdout.flush()
             if not media_files:
                 continue
 
@@ -2013,7 +2061,6 @@ class TagIntegrator:
                 stats[fn] = st
                 total_size += st.st_size
             count = len(stats)
-
             if count and dir_ledger.fingerprint_matches(count, total_size):
                 media += count
                 seen += count
@@ -2054,7 +2101,11 @@ class TagIntegrator:
         items.sort(key=lambda it: (0 if it.kind == "video" else 1,
                                    _natural_key(it.relpath)))
         if skipped_dirs:
+            if sys.stdout.isatty():
+                sys.stdout.write("\r\033[2K")
             print(f"⏭️  {skipped_dirs} folder(s) skipped wholesale (unchanged since last run)")
+        elif sys.stdout.isatty():
+            sys.stdout.write("\r\033[2K")
 
         print(f"📊 {media} media files · {tagged} already tagged · "
               f"{seen} previously checked · {len(items)} to process")
@@ -2133,17 +2184,21 @@ class TagIntegrator:
         if not todo:
             return
         workers = min(8, (os.cpu_count() or 2))
-        print(f"🔢 Hashing {len(todo)} files (×{workers})…")
+        if _display is not None:
+            _display.status("perceptual", f"local hash · {len(todo)} PDF page(s)")
+        else:
+            print(f"🔢 Hashing {len(todo)} files (×{workers})…")
         done = 0
         with cf.ThreadPoolExecutor(max_workers=workers) as ex:
             futmap = {ex.submit(self._md5_local, it.path): it for it in todo}
             for fut in cf.as_completed(futmap):
                 futmap[fut].md5 = fut.result()
                 done += 1
-                if sys.stdout.isatty() and (done % 25 == 0 or done == len(todo)):
+                if (_display is None and sys.stdout.isatty() and
+                        (done % 25 == 0 or done == len(todo))):
                     sys.stdout.write(f"\r  hashed {done}/{len(todo)}")
                     sys.stdout.flush()
-        if sys.stdout.isatty():
+        if _display is None and sys.stdout.isatty():
             sys.stdout.write("\n")
 
     def deduplicate(self, root: Path, items: List[FileItem],
@@ -2367,13 +2422,15 @@ class TagIntegrator:
         pdf_page_dirs, pdf_jobs = self.plan_pdf_renders(root)
         pdf_executor: Optional[cf.ThreadPoolExecutor] = None
         pdf_future = None
+        pdf_completed: "queue.Queue" = queue.Queue()
         pending_pdf_dirs = {pdf.parent / pdf.stem for pdf in pdf_jobs}
         if pdf_jobs:
             pdf_dpi = prompt_for_pdf_dpi(len(pdf_jobs))
             print(f"📄 Rendering {len(pdf_jobs)} PDF(s) at {pdf_dpi} DPI in background…")
             pdf_executor = cf.ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="pdf-render")
-            pdf_future = pdf_executor.submit(self.render_pdf_jobs, pdf_jobs, pdf_dpi)
+            pdf_future = pdf_executor.submit(
+                self.render_pdf_jobs, pdf_jobs, pdf_dpi, pdf_completed)
 
         items, candidate_dirs = self.index(
             root, ledger_mgr, pdf_page_dirs, excluded_dirs=pending_pdf_dirs)
@@ -2529,25 +2586,43 @@ class TagIntegrator:
             # locally hashed/deduplicated, and appended to the live perceptual
             # queue. They never enter the booru hash tier.
             if pdf_future is not None:
+                pdfs_received = 0
+                while not pdf_future.done() or not pdf_completed.empty():
+                    try:
+                        pdf_name, rendered_paths, effective_dpi = pdf_completed.get(
+                            timeout=0.25)
+                    except queue.Empty:
+                        disp.status(
+                            "perceptual",
+                            f"waiting for PDF render · {pdfs_received}/{len(pdf_jobs)} complete")
+                        continue
+                    pdfs_received += 1
+                    pdf_items = self.index_rendered_pdf_pages(
+                        rendered_paths, root, ledger_mgr)
+                    self.hash_all(pdf_items)
+                    pdf_items, pdf_duplicates = self.deduplicate(
+                        root, pdf_items, ledger_mgr, canonical_items=items)
+                    if pdf_duplicates:
+                        duplicates += pdf_duplicates
+                        notify(f"♊ {pdf_duplicates} duplicate PDF page(s) skipped; "
+                               f"see {DUPLICATES_FILE}.")
+                    for item in pdf_items:
+                        candidate_dirs.add(item.path.parent)
+                        perceptual_q.put(item)
+                        disp.grow("perceptual")
+                    items.extend(pdf_items)
+                    pdf_completed.task_done()
+                    disp.status(
+                        "perceptual",
+                        f"PDF {pdfs_received}/{len(pdf_jobs)} · {effective_dpi} DPI · "
+                        f"{pdf_name}")
+                    # Finish this PDF's page searches before the next ledger
+                    # snapshot/dedup pass; later PDFs keep rendering meanwhile.
+                    perceptual_q.join()
                 try:
-                    rendered_paths = pdf_future.result()
+                    pdf_future.result()
                 except Exception as e:
                     notify(f"⚠️  Background PDF rendering failed: {e}")
-                    rendered_paths = []
-                pdf_items = self.index_rendered_pdf_pages(
-                    rendered_paths, root, ledger_mgr)
-                self.hash_all(pdf_items)
-                pdf_items, pdf_duplicates = self.deduplicate(
-                    root, pdf_items, ledger_mgr, canonical_items=items)
-                if pdf_duplicates:
-                    duplicates += pdf_duplicates
-                    notify(f"♊ {pdf_duplicates} duplicate PDF page(s) skipped; "
-                           f"see {DUPLICATES_FILE}.")
-                for item in pdf_items:
-                    candidate_dirs.add(item.path.parent)
-                    perceptual_q.put(item)
-                    disp.grow("perceptual")
-                items.extend(pdf_items)
 
             disp.freeze_total("perceptual")
             perceptual_q.put(_PERCEPTUAL_DONE)
