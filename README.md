@@ -71,13 +71,15 @@ hydrus_access_key    = your_64char_client_api_access_key
 hydrus_tag_service   = downloader tags
 hydrus_import        = true    # import the file then tag it (false = tag-only by hash)
 hydrus_also_sidecars = false   # also write .txt sidecars when the API is on
+hydrus_results_page  = FurTag Results  # silently collect accepted files; false disables
+hydrus_already_tagged_page = Already Tagged  # matched ledger history; false disables
 ```
 
 **InkBunny note:** in your InkBunny account settings you must enable **API access** *and* **adult ratings**, or explicit results stay hidden from the API.
 
 **Danbooru note:** API auth requires a verified-email account; if the key is rejected FurTag falls back to anonymous Danbooru access (which still allows MD5 lookups).
 
-**Hydrus Client API note:** enable the API under *services → manage services*, then create an access key under *review services* with permissions to **import files**, **edit tags**, and **edit URLs**. FurTag verifies the key and resolves `hydrus_tag_service` (name or service key) on startup; if the client is offline it falls back to sidecars.
+**Hydrus Client API note:** enable the API under *services → manage services*, then create an access key under *review services* with permissions to **import files**, **edit tags**, **edit URLs**, and **manage pages**. FurTag verifies the key and resolves `hydrus_tag_service` (name or service key) on startup; if the client is offline it falls back to sidecars. Successfully imported/already-present files collect on a new, unfocused `hydrus_results_page` each run. Files marked `matched` by existing ledgers collect on a separate, unfocused `hydrus_already_tagged_page`; their SHA-256 values are cached into the ledgers after the first page load. Set either page option to `false` to disable it.
 
 ---
 
@@ -103,6 +105,9 @@ Run `./FurTag.command` (or `.venv/bin/python furtag.py`). FurTag prompts for a f
 - **Blank entry** = the current directory.
 - **Finder drag-and-drop** paths are accepted (the escaping Terminal inserts is undone automatically).
 - Type `q`, `quit`, or `exit` (or press Ctrl+C / Ctrl+D) to quit. An invalid path re-prompts rather than exiting.
+- Type **`NUKE!`** instead of a folder to enter reset mode. FurTag asks for the target folder, counts its generated ledgers/reports and media sidecars recursively, and requires `ARE YOU SURE? [y/N]` confirmation. A separate second `[y/N]` question then offers to remove precisely named rendered PDF pages so they are re-exported. Source PDFs, ordinary media, and unrelated output-folder contents are never selected; filesystem roots are refused. The reset then immediately scans that folder from scratch.
+
+After local hashing, FurTag detects byte-identical files by MD5 before making any network requests. One deterministic canonical path is searched; the other copies are recorded as `duplicate` in their ledgers and skipped on later runs. A readable `duplicates.log` in the scanned folder lists each exact hash, the selected canonical file, and every skipped location. An unchanged file already represented by a matched/no-match ledger takes precedence over a new copy.
 
 It then walks the folder tree and processes files, showing the **two-track live display** — one panel for the hash tier, one for the perceptual tier — each with a previous/current/next file view, a phase label, and a progress bar with elapsed time and ETA. The current file carries a live sub-status showing which site is being checked.
 
@@ -130,7 +135,7 @@ The pipeline runs in stages (see `CLAUDE.md` for the full architecture):
 
 **Resumability** — the `.furtag_ledger.json` session ledger, written in the scanned folder, records each file as matched or no-match keyed by path + size + mtime. On the next run those files are ruled out before any hashing or querying, so interrupted runs pick up right where they stopped. It's checkpointed periodically and saved atomically.
 
-**PDFs** — each PDF is rendered to per-page PNGs in a subfolder beside it, each with a `comic:`/`page:` sidecar, then fed straight into the perceptual tier (their perceptual tags append to that same sidecar). Already-rendered PDFs are skipped on re-runs.
+**PDFs** — each PDF is rendered to per-page, lossless PNGs in a subfolder beside it, each with a `comic:`/`page:` sidecar, then fed straight into the perceptual tier (their perceptual tags append to that same sidecar). When new PDFs are found, a numbered menu offers standard 300 DPI, archival 600 DPI, or a custom 72–2400 DPI value. Rendering runs on a dedicated background worker while ordinary files continue through hashing and tagging; incomplete page folders are excluded until rendering finishes, then complete pages join the live perceptual queue. Already-rendered PDFs are skipped unless the optional PDF portion of `NUKE!` removes them for re-export.
 
 For the complete architecture — rate-limiting internals, perceptual→authoritative enrichment, per-source parsing quirks — see **[`CLAUDE.md`](./CLAUDE.md)**.
 

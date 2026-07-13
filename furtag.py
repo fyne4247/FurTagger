@@ -24,10 +24,16 @@ Pipeline (per run):
                  resort). Fluffle only serves one request per client at a time and
                  SauceNAO has a tiny daily quota, so this tier is intentionally serial.
 
-Session ledger (.furtag_ledger.json in the scanned root, keyed by relative
-path + size + mtime): records every file as "matched" or "nomatch" so re-runs
-skip work already done — without needing to re-hash or re-query anything. A file
-is only re-checked if it was edited/replaced (size or mtime changed).
+Session ledger (.furtag_ledger.json, one per folder, keyed by filename + size +
+mtime): records every file as "matched" or "nomatch" so re-runs skip work
+already done — without needing to re-hash or re-query anything (each record
+also caches the file's MD5). Living inside the folder it describes rather than
+the scan root, a subfolder's ledger is honored no matter which ancestor
+directory a later run scans. Each ledger also seals a directory-level
+fingerprint (file count + total size) once every file in it is accounted for,
+so an unchanged folder can be skipped wholesale on the next run without
+checking any individual file. A file/folder is only re-checked if something
+in it actually changed (size, mtime, or membership).
 
 Output — pick one (or both) via credentials.txt:
 
@@ -66,10 +72,13 @@ Credentials live in a single credentials.txt alongside this script
         hydrus_tag_service   = downloader tags
         hydrus_import        = true    # import file then tag (false = tag-only)
         hydrus_also_sidecars = false   # also write .txt sidecars when API is on
+        hydrus_results_page  = FurTag Results  # blank/false disables background page
+        hydrus_already_tagged_page = Already Tagged  # matched ledger history; false disables
 
     Note: Danbooru requires a verified-email account for API auth; if the key
     is rejected (403) the script falls back to anonymous Danbooru access.
-    Hydrus Client API needs permissions: import files, edit tags, edit URLs.
+    Hydrus Client API needs permissions: import files, edit tags, edit URLs,
+    and manage pages for the optional unfocused results page.
 """
 
 import concurrent.futures as cf
@@ -124,9 +133,11 @@ IMG_EXTS   = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"}
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv"}
 PDF_EXTS   = {".pdf"}
 PDF_DPI    = 300            # render resolution for PDF pages
+PDF_ARCHIVAL_DPI = 600      # lossless archival preset; custom values are allowed
 
 CREDENTIALS_FILE = "credentials.txt"
 LEDGER_FILE      = ".furtag_ledger.json"
+DUPLICATES_FILE  = "duplicates.log"
 
 # "Artist unknown" placeholder tags that every booru emits in some form — useless
 # noise in a Hydrus library, so they're dropped before writing. Compared against
@@ -216,6 +227,7 @@ class _Track:
     sub: str = ""
     start: float = field(default_factory=time.monotonic)
     growing: bool = False
+    interval: float = 0.0   # seconds/file for a rate-limit-based ETA (hash track only)
 
 
 class LiveDisplay:
@@ -232,12 +244,15 @@ class LiveDisplay:
     _SYM  = {"pending": "·", "run": "…", "hit": "✓", "miss": "✗", "err": "⚠"}
     _LEGEND = ("legend:  … querying   ✓ found   ✗ not found   ⚠ error/blocked")
     _TRACK_ORDER = ("hash", "perceptual")
-    _SEP = "  " + "═" * 60
+    _SEP = "  " + "─" * 60
+    _MAX_ISSUES = 3
 
     def __init__(self) -> None:
         self.tracks: Dict[str, _Track] = {k: _Track() for k in self._TRACK_ORDER}
         self._drawn = 0
         self._lock = threading.Lock()
+        self._issues: List[str] = []
+        self._issue_total = 0
         self.tty = sys.stdout.isatty()
 
     @staticmethod
@@ -256,13 +271,14 @@ class LiveDisplay:
             f"{self._ABBR.get(s, s)} {self._SYM.get(st, '?')}" for s, st in state.items())
 
     def begin_phase(self, track: str, label: str, total: int,
-                     growing: bool = False) -> None:
+                     growing: bool = False, interval: float = 0.0) -> None:
         with self._lock:
             t = self.tracks[track]
             t.phase, t.total, t.done, t.idx = label, total, 0, 0
             t.prev, t.sub = ("—", ""), ""
             t.start = time.monotonic()
             t.growing = growing
+            t.interval = interval
             if not self.tty:
                 print(f"\n=== {label} — {total} file(s) ===")
 
@@ -307,13 +323,21 @@ class LiveDisplay:
                 print(f"[{track}] [{t.idx}/{t.total}] {self._trim(t.current)} → {result}")
 
     def log(self, msg: str) -> None:
-        """Print a message above the live panel (warnings, errors), then redraw."""
+        """Keep warnings/errors in a three-line rolling panel while live.
+
+        Non-interactive output stays line-oriented so redirected logs retain
+        every issue. In a terminal, old issues roll off instead of permanently
+        accumulating above the progress display.
+        """
         with self._lock:
-            if self.tty and self._drawn:
-                sys.stdout.write(f"\033[{self._drawn}A\033[J")  # to panel top, clear below
-                self._drawn = 0
-            print(msg)
-            if self.tty and any(t.idx for t in self.tracks.values()):
+            if not self.tty:
+                print(msg)
+                return
+            clean = " ".join(str(msg).split())
+            self._issue_total += 1
+            self._issues.append(self._trim(clean, 56))
+            self._issues = self._issues[-self._MAX_ISSUES:]
+            if any(t.phase for t in self.tracks.values()):
                 self._render()
 
     def close(self) -> None:
@@ -325,22 +349,27 @@ class LiveDisplay:
 
     def _render_track(self, t: _Track) -> List[str]:
         elapsed = time.monotonic() - t.start
-        rate = t.done / elapsed if (elapsed > 0 and t.done > 0) else 0
-        if t.growing or rate <= 0:
-            eta = "…"
-        else:
-            eta = self._fmt((t.total - t.done) / rate)
         width = 28
         filled = int(width * t.done / t.total) if t.total else 0
         bar = "█" * filled + "░" * (width - filled)
         pname, presult = t.prev
+
+        if t.interval > 0:
+            # Rate-limit-bound track (hash tier): throughput is capped by the
+            # slowest enabled service's pacer, so files-left × that interval
+            # is a tighter, non-jittery estimate than an observed-rate ETA.
+            eta_part = f" · ETA {self._fmt(t.interval * max(0, t.total - t.done))}"
+        else:
+            # Perceptual's pace is conditional (Fluffle vs. SauceNAO, growing
+            # total) — an ETA here is more misleading than useful.
+            eta_part = ""
 
         return [
             f"  ✓ prev:    {self._trim(pname)}   {presult}",
             f"  ▶ current: {self._trim(t.current)}   {t.sub}",
             f"    next:    {self._trim(t.nxt)}",
             f"  {t.phase}",
-            f"  [{bar}] {t.done}/{t.total}   ⏱ {self._fmt(elapsed)} · ETA {eta}",
+            f"  [{bar}] {t.done}/{t.total}   ⏱ {self._fmt(elapsed)}{eta_part}",
         ]
 
     def _render(self) -> None:
@@ -350,6 +379,13 @@ class LiveDisplay:
         for i, key in enumerate(self._TRACK_ORDER):
             lines += self._render_track(self.tracks[key])
             lines.append(self._SEP)          # rule after each block
+        if self._issues:
+            shown = len(self._issues)
+            history = (f" · latest {shown} of {self._issue_total}"
+                       if self._issue_total > shown else "")
+            lines.append(f"  Recent issues{history}")
+            lines += [f"    {issue}" for issue in self._issues]
+            lines.append(self._SEP)
         out = (f"\033[{self._drawn}A" if self._drawn else "")
         out += "".join("\033[2K" + ln + "\n" for ln in lines)
         sys.stdout.write(out)
@@ -357,7 +393,7 @@ class LiveDisplay:
         self._drawn = len(lines)
 
 
-# Active display, if any. notify() routes warnings around the live panel.
+# Active display, if any. notify() routes warnings into its rolling history.
 _display: Optional["LiveDisplay"] = None
 
 # Sentinel pushed onto the perceptual queue once the hash tier is done
@@ -390,6 +426,7 @@ class FileItem:
     size: int
     mtime: float
     kind: str                       # "image" | "video"
+    ledger: "Ledger" = None          # this file's directory-scoped ledger
     md5: Optional[str] = None
     perceptual_only: bool = False   # PDF-derived page: skip hash tier, go perceptual
 
@@ -397,16 +434,27 @@ class FileItem:
 # ── Session ledger ───────────────────────────────────────────────────────────
 
 class Ledger:
-    """Per-root JSON record of every file already processed, keyed by relative
-    path with a (size, mtime) fingerprint. Lets a re-run rule a file out BEFORE
-    hashing or querying it. A file is re-checked only if its size or mtime
-    changed (i.e. it was edited/replaced)."""
+    """Per-directory JSON record of every file in that directory already
+    processed, keyed by filename with a (size, mtime) fingerprint, plus a
+    cached MD5 so an unchanged file is never re-hashed. Lives inside the
+    directory it describes (not the scan root), so it travels with that
+    folder and is picked up no matter which ancestor directory a later run
+    scans from.
+
+    Also carries a directory-level fingerprint (media file count + total
+    size). Once every file in the directory has a resolved record, that
+    fingerprint is "sealed" (`mark_dir_complete`) — a future run can then
+    skip the entire folder on one count/size comparison, without touching
+    any individual file, as long as the fingerprint still matches."""
 
     MTIME_EPS = 1e-3
 
-    def __init__(self, root: Path) -> None:
-        self.path = root / LEDGER_FILE
+    def __init__(self, dir_path: Path) -> None:
+        self.dir = dir_path
+        self.path = dir_path / LEDGER_FILE
         self.records: Dict[str, Dict] = {}
+        self.dir_count: Optional[int] = None
+        self.dir_size: Optional[int] = None
         self._dirty = 0
         self._lock = threading.Lock()
 
@@ -415,37 +463,95 @@ class Ledger:
             return
         try:
             data = json.loads(self.path.read_text("utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("records"), dict):
-                self.records = data["records"]
+            if isinstance(data, dict):
+                if isinstance(data.get("records"), dict):
+                    self.records = data["records"]
+                fp = data.get("dir_fingerprint")
+                if isinstance(fp, dict):
+                    self.dir_count = fp.get("count")
+                    self.dir_size = fp.get("size")
         except Exception as e:
-            notify(f"⚠️  Couldn't read ledger ({e}); starting fresh.")
+            notify(f"⚠️  Couldn't read ledger {self.path} ({e}); starting fresh.")
 
-    def status_for(self, item: FileItem) -> Optional[str]:
+    def status_for(self, name: str, size: int, mtime: float) -> Optional[str]:
         """'matched' / 'nomatch' if this exact file was already processed, else None."""
-        rec = self.records.get(item.relpath)
-        if not rec or rec.get("size") != item.size:
+        rec = self.records.get(name)
+        if not rec or rec.get("size") != size:
             return None
         try:
-            if abs(float(rec.get("mtime", -1)) - item.mtime) > self.MTIME_EPS:
+            if abs(float(rec.get("mtime", -1)) - mtime) > self.MTIME_EPS:
                 return None
         except (TypeError, ValueError):
             return None
         return rec.get("status")
 
-    def record(self, item: FileItem, status: str, sources: List[str]) -> None:
+    def md5_for(self, name: str, size: int, mtime: float) -> Optional[str]:
+        """Reuse a previously-computed MD5 for an unchanged file even if its
+        status isn't matched/nomatch (e.g. a booru was briefly unreachable
+        last time) — saves re-hashing on retry."""
+        rec = self.records.get(name)
+        if not rec or rec.get("size") != size:
+            return None
+        try:
+            if abs(float(rec.get("mtime", -1)) - mtime) > self.MTIME_EPS:
+                return None
+        except (TypeError, ValueError):
+            return None
+        return rec.get("md5")
+
+    def sha256_for(self, name: str, size: int, mtime: float) -> Optional[str]:
+        """Return a cached Hydrus/SHA-256 hash for this unchanged file."""
+        rec = self.records.get(name)
+        if not rec or rec.get("size") != size:
+            return None
+        try:
+            if abs(float(rec.get("mtime", -1)) - mtime) > self.MTIME_EPS:
+                return None
+        except (TypeError, ValueError):
+            return None
+        return rec.get("sha256")
+
+    def cache_sha256(self, name: str, size: int, mtime: float, sha256: str) -> None:
+        """Add SHA-256 to an existing unchanged record for future page loads."""
         with self._lock:
-            self.records[item.relpath] = {
-                "size": item.size,
-                "mtime": round(item.mtime, 3),
-                "md5": item.md5,
+            rec = self.records.get(name)
+            if not rec or rec.get("size") != size:
+                return
+            try:
+                unchanged = abs(float(rec.get("mtime", -1)) - mtime) <= self.MTIME_EPS
+            except (TypeError, ValueError):
+                unchanged = False
+            if unchanged and rec.get("sha256") != sha256:
+                rec["sha256"] = sha256
+                self._dirty += 1
+
+    def record(self, name: str, size: int, mtime: float, md5: Optional[str],
+               status: str, sources: List[str], duplicate_of: str = "") -> None:
+        with self._lock:
+            record = {
+                "size": size,
+                "mtime": round(mtime, 3),
+                "md5": md5,
                 "status": status,
                 "sources": sources,
             }
+            if duplicate_of:
+                record["duplicate_of"] = duplicate_of
+            self.records[name] = record
             self._dirty += 1
 
-    def maybe_save(self, every: int = 25) -> None:
-        if self._dirty >= every:
-            self.save()
+    def fingerprint_matches(self, count: int, total_size: int) -> bool:
+        return self.dir_count is not None and (self.dir_count, self.dir_size) == (count, total_size)
+
+    def mark_dir_complete(self, count: int, total_size: int) -> None:
+        """Seal the directory-level fingerprint. Only call once every current
+        media file in the directory has a sidecar or a matched/nomatch record —
+        otherwise an interrupted run could make a future scan wrongly skip
+        files that were never actually processed."""
+        with self._lock:
+            if (self.dir_count, self.dir_size) != (count, total_size):
+                self.dir_count, self.dir_size = count, total_size
+                self._dirty += 1
 
     def save(self) -> None:
         with self._lock:
@@ -453,14 +559,44 @@ class Ledger:
                 return
             try:
                 tmp = self.path.with_name(self.path.name + ".tmp")
+                payload: Dict = {"version": 2, "records": self.records}
+                if self.dir_count is not None:
+                    payload["dir_fingerprint"] = {"count": self.dir_count, "size": self.dir_size}
                 tmp.write_text(
-                    json.dumps({"version": 1, "records": self.records},
-                               ensure_ascii=False, indent=0),
+                    json.dumps(payload, ensure_ascii=False, indent=0),
                     encoding="utf-8")
                 tmp.replace(self.path)   # atomic
                 self._dirty = 0
             except Exception as e:
-                notify(f"⚠️  Couldn't write ledger: {e}")
+                notify(f"⚠️  Couldn't write ledger {self.path}: {e}")
+
+
+class LedgerManager:
+    """Lazily creates and caches one Ledger per directory encountered during a
+    scan, so a tree with many folders doesn't reload the same ledger twice and
+    concurrent workers touching different directories don't contend on a
+    single lock (each Ledger has its own)."""
+
+    def __init__(self) -> None:
+        self._ledgers: Dict[Path, Ledger] = {}
+        self._lock = threading.Lock()
+
+    def get(self, dir_path: Path) -> Ledger:
+        with self._lock:
+            led = self._ledgers.get(dir_path)
+            if led is None:
+                led = Ledger(dir_path)
+                led.load()
+                self._ledgers[dir_path] = led
+            return led
+
+    def touched(self) -> List[Ledger]:
+        with self._lock:
+            return list(self._ledgers.values())
+
+    def save_all(self) -> None:
+        for led in self.touched():
+            led.save()
 
 
 # ── PDF → per-page PNGs ──────────────────────────────────────────────────────
@@ -511,6 +647,40 @@ def convert_pdf(pdf_path: Path, output_root: Path, dpi: int = PDF_DPI,
     doc.close()
     print(f"  {pdf_path.name}: {len(generated)} page(s) -> {out_dir}")
     return generated
+
+
+def prompt_for_pdf_dpi(pdf_count: int) -> int:
+    """Choose lossless PNG render resolution when new PDFs need conversion."""
+    print(f"\n📄 {pdf_count} PDF(s) need page rendering (PNG is lossless).")
+    print(f"   1) Standard — {PDF_DPI} DPI (recommended for reverse search)")
+    print(f"   2) Archival — {PDF_ARCHIVAL_DPI} DPI (larger, maximum practical preset)")
+    print("   3) Custom DPI (higher can use dramatically more memory and disk)")
+    while True:
+        try:
+            raw = input("Choose PDF quality [1-3, default 1]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n↩️  Using standard {PDF_DPI} DPI.")
+            return PDF_DPI
+        if raw in {"", "1"}:
+            return PDF_DPI
+        if raw == "2":
+            return PDF_ARCHIVAL_DPI
+        if raw != "3":
+            print("‼️  Choose 1, 2, or 3.")
+            continue
+        try:
+            custom = input("Custom DPI [72-2400]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n↩️  Using standard {PDF_DPI} DPI.")
+            return PDF_DPI
+        try:
+            dpi = int(custom)
+        except ValueError:
+            print("‼️  Enter a whole-number DPI.")
+            continue
+        if 72 <= dpi <= 2400:
+            return dpi
+        print("‼️  Custom DPI must be between 72 and 2400.")
 
 
 # ── TagIntegrator ────────────────────────────────────────────────────────────
@@ -571,6 +741,11 @@ class TagIntegrator:
         self.hydrus_tag_service_key = ""
         self.hydrus_import = True
         self.hydrus_also_sidecars = False
+        self.hydrus_results_page_name = "FurTag Results"
+        self.hydrus_results_page_enabled = False
+        self._hydrus_results_page_key = ""
+        self.hydrus_already_tagged_page_name = "Already Tagged"
+        self.hydrus_already_tagged_page_enabled = False
         self.has_hydrus = False
         self._hydrus_lock = threading.Lock()  # serialise API writes (hash + perc)
 
@@ -666,6 +841,14 @@ class TagIntegrator:
         self.hydrus_import = _truthy(cfg.get("hydrus_import", "true"), default=True)
         self.hydrus_also_sidecars = _truthy(
             cfg.get("hydrus_also_sidecars", "false"), default=False)
+        page_setting = cfg.get("hydrus_results_page", "FurTag Results").strip()
+        self.hydrus_results_page_name = page_setting or "FurTag Results"
+        page_requested = page_setting.lower() not in {"", "0", "false", "no", "off"}
+        old_page_setting = cfg.get(
+            "hydrus_already_tagged_page", "Already Tagged").strip()
+        self.hydrus_already_tagged_page_name = old_page_setting or "Already Tagged"
+        old_page_requested = old_page_setting.lower() not in {
+            "", "0", "false", "no", "off"}
 
         try:
             r = self.session.get(
@@ -677,6 +860,14 @@ class TagIntegrator:
                 print(f"‼️  Hydrus API rejected access key (HTTP {r.status_code}) – "
                       f"sidecars only.")
                 return
+            access = r.json()
+            permissions = access.get("basic_permissions") or []
+            can_manage_pages = access.get("permits_everything", False) or 4 in permissions
+            self.hydrus_results_page_enabled = page_requested and can_manage_pages
+            self.hydrus_already_tagged_page_enabled = (
+                old_page_requested and can_manage_pages)
+            if (page_requested or old_page_requested) and not can_manage_pages:
+                print("⚠️  Hydrus pages disabled – access key needs Manage Pages permission.")
             svc_key = self._hydrus_resolve_tag_service(self.hydrus_tag_service_name)
             if not svc_key:
                 print(f"‼️  Hydrus tag service '{self.hydrus_tag_service_name}' not found – "
@@ -1519,6 +1710,7 @@ class TagIntegrator:
                     self._hydrus_add_tags(file_hash, tags)
                 if urls:
                     self._hydrus_associate_urls(file_hash, urls)
+                self._hydrus_add_to_results_page(file_hash)
             except Exception as e:
                 notify(f"❌ Hydrus push failed for {media.name}: {e}")
 
@@ -1589,18 +1781,140 @@ class TagIntegrator:
         if r.status_code != 200:
             raise RuntimeError(f"associate_url HTTP {r.status_code}: {r.text[:200]}")
 
+    def _hydrus_add_to_results_page(self, file_hash: str) -> None:
+        """Silently append a known file to this run's Hydrus results page."""
+        if not self.hydrus_results_page_enabled:
+            return
+
+        if not self._hydrus_results_page_key:
+            body = {
+                "page_type": 6,
+                "page_name": self.hydrus_results_page_name,
+                "hashes": [file_hash],
+                "system_hash_locked": True,
+                "focus_page": False,
+            }
+            r = self._hydrus_post("manage_pages/new_page", body, 30)
+            if r.status_code != 200:
+                self.hydrus_results_page_enabled = False
+                notify(f"⚠️  Hydrus results page unavailable (HTTP {r.status_code}); "
+                       "continuing without it.")
+                return
+            try:
+                self._hydrus_results_page_key = r.json()["page_key"]
+            except (ValueError, KeyError, TypeError):
+                self.hydrus_results_page_enabled = False
+                notify("⚠️  Hydrus results page returned no page key; "
+                       "continuing without it.")
+            return
+
+        body = {
+            "page_key": self._hydrus_results_page_key,
+            "hashes": [file_hash],
+        }
+        r = self._hydrus_post("manage_pages/add_files", body, 30)
+        if r.status_code != 200:
+            self.hydrus_results_page_enabled = False
+            notify(f"⚠️  Hydrus could not update the results page "
+                   f"(HTTP {r.status_code}); continuing without it.")
+
+    def _hydrus_populate_already_tagged_page(self, ledger_mgr: LedgerManager) -> int:
+        """Create an unfocused page from unchanged `matched` ledger records.
+
+        Old ledgers only contain MD5, while Hydrus page APIs require SHA-256.
+        Missing SHA-256 values are calculated in parallel once and cached back
+        into their ledger records. Unknown/non-local hashes are harmlessly
+        omitted by Hydrus's local file-search page.
+        """
+        if not (self.has_hydrus and self.hydrus_already_tagged_page_enabled):
+            return 0
+
+        entries: List[Tuple[Path, Ledger, str, int, float, Optional[str]]] = []
+        for ledger in ledger_mgr.touched():
+            for name, rec in ledger.records.items():
+                if not isinstance(rec, dict) or rec.get("status") != "matched":
+                    continue
+                path = ledger.dir / name
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                if ledger.status_for(name, st.st_size, st.st_mtime) != "matched":
+                    continue
+                entries.append((path, ledger, name, st.st_size, st.st_mtime,
+                                ledger.sha256_for(name, st.st_size, st.st_mtime)))
+
+        if not entries:
+            return 0
+
+        missing = [entry for entry in entries if not entry[5]]
+        if missing:
+            print(f"🏷️  Preparing {self.hydrus_already_tagged_page_name} page "
+                  f"({len(entries)} ledger match(es))…")
+            workers = min(8, max(1, os.cpu_count() or 1))
+            with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = {ex.submit(self._sha256_local, entry[0]): entry
+                           for entry in missing}
+                for future in cf.as_completed(futures):
+                    path, ledger, name, size, mtime, _ = futures[future]
+                    try:
+                        sha256 = future.result()
+                    except Exception as e:
+                        notify(f"❌ SHA256 failed on {path.name}: {e}")
+                        continue
+                    if sha256:
+                        ledger.cache_sha256(name, size, mtime, sha256)
+
+        hashes: List[str] = []
+        seen_hashes: Set[str] = set()
+        for path, ledger, name, size, mtime, cached in entries:
+            sha256 = cached or ledger.sha256_for(name, size, mtime)
+            if sha256 and sha256 not in seen_hashes:
+                hashes.append(sha256)
+                seen_hashes.add(sha256)
+        if not hashes:
+            return 0
+
+        batch_size = 256
+        first = hashes[:batch_size]
+        body = {
+            "page_type": 6,
+            "page_name": self.hydrus_already_tagged_page_name,
+            "hashes": first,
+            "system_hash_locked": True,
+            "focus_page": False,
+        }
+        with self._hydrus_lock:
+            try:
+                r = self._hydrus_post("manage_pages/new_page", body, 30)
+                if r.status_code != 200:
+                    notify(f"⚠️  Hydrus Already Tagged page unavailable "
+                           f"(HTTP {r.status_code}).")
+                    return 0
+                page_key = r.json()["page_key"]
+                for start in range(batch_size, len(hashes), batch_size):
+                    r = self._hydrus_post("manage_pages/add_files", {
+                        "page_key": page_key,
+                        "hashes": hashes[start:start + batch_size],
+                    }, 30)
+                    if r.status_code != 200:
+                        notify(f"⚠️  Hydrus stopped filling Already Tagged page "
+                               f"(HTTP {r.status_code}).")
+                        break
+            except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+                notify(f"⚠️  Hydrus Already Tagged page failed: {e}")
+                return 0
+        return len(hashes)
+
     # ── PDF pre-pass ───────────────────────────────────────────────────────────
 
-    def expand_pdfs(self, root: Path) -> Set[Path]:
-        """Render every PDF under `root` to per-page PNGs *before* indexing, so
-        the pages are tagged like any other image. Returns the set of page-folder
-        paths it produced/owns; `index()` routes PNGs living in those folders to
-        perceptual-only (a re-rendered page never MD5-matches a booru, so the
-        hash tier is pure waste on them).
+    def plan_pdf_renders(self, root: Path) -> Tuple[Set[Path], List[Path]]:
+        """Discover PDF page folders and return the PDFs that still need rendering.
 
-        Already-rendered PDFs are skipped, so a re-run doesn't churn the pages
-        (which would bump their mtime and defeat the ledger). Missing PyMuPDF is
-        non-fatal — PDFs are simply left untouched, like a missing credential."""
+        The caller launches `render_pdf_jobs` in a background worker, while
+        excluding those jobs' output folders from its initial index so a
+        half-written page can never enter the pipeline.
+        """
         pdfs: List[Path] = []
         for dp, dirs, files in os.walk(root):
             dirs.sort()
@@ -1610,17 +1924,17 @@ class TagIntegrator:
                 if Path(fn).suffix.lower() in PDF_EXTS:
                     pdfs.append(Path(dp) / fn)
         if not pdfs:
-            return set()
+            return set(), []
 
         try:
             _import_fitz()                      # probe once before the loop
         except Exception as e:                  # PyMuPDF missing / import error
             print(f"⚠️  {len(pdfs)} PDF(s) found but PDF support is unavailable "
                   f"({e}). Install PyMuPDF to tag them; skipping for now.")
-            return set()
+            return set(), []
 
         page_dirs: Set[Path] = set()
-        print(f"📄 {len(pdfs)} PDF(s) → rendering pages (once each)…")
+        jobs: List[Path] = []
         for pdf in pdfs:
             out_dir = pdf.parent / pdf.stem
             page_dirs.add(out_dir)
@@ -1628,57 +1942,110 @@ class TagIntegrator:
                 f.suffix.lower() == ".png" for f in out_dir.iterdir())
             if already:
                 continue                        # rendered on a previous run
+            jobs.append(pdf)
+        return page_dirs, jobs
+
+    def render_pdf_jobs(self, pdfs: List[Path], dpi: int) -> List[Path]:
+        """Render planned PDFs serially on the dedicated background worker."""
+        generated: List[Path] = []
+        for pdf in pdfs:
             try:
-                convert_pdf(pdf, pdf.parent, PDF_DPI,
-                            write_sidecars=self.write_sidecars)
+                generated += convert_pdf(
+                    pdf, pdf.parent, dpi, write_sidecars=self.write_sidecars)
             except Exception as e:
-                print(f"  ! Failed to render {pdf.name}: {e}")
-        return page_dirs
+                notify(f"⚠️  Failed to render {pdf.name}: {e}")
+        return generated
 
     # ── Index ────────────────────────────────────────────────────────────────
 
-    def index(self, root: Path, ledger: Ledger,
-              pdf_page_dirs: Set[Path]) -> List[FileItem]:
+    @staticmethod
+    def _media_kind(fn: str) -> Optional[str]:
+        ext = Path(fn).suffix.lower()
+        if ext in IMG_EXTS:
+            return "image"
+        if ext in VIDEO_EXTS:
+            return "video"
+        return None
+
+    def index(self, root: Path, ledger_mgr: LedgerManager,
+              pdf_page_dirs: Set[Path],
+              excluded_dirs: Optional[Set[Path]] = None
+              ) -> Tuple[List[FileItem], Set[Path]]:
         """Walk the tree once and return the files that actually need work,
-        videos first. Skips dotfiles/._ metadata, non-media, already-tagged, and
-        ledger-recorded (matched or no-match, unchanged) files. PNGs inside a
-        `pdf_page_dirs` folder are flagged perceptual-only and are exempt from
-        the has-sidecar skip (their sidecar holds only the base comic:/page:
-        tags) — the ledger alone rules them out on a re-run."""
+        videos first, plus the set of directories that needed a per-file check
+        (for `finalize_dir_fingerprints` to potentially seal afterwards).
+
+        Each directory carries its own Ledger (found in-place, or created).
+        Before checking any individual file, a directory whose ledger has a
+        sealed fingerprint (`file_count`, `total_size`) matching the current
+        listing is skipped wholesale — no stat, hash, or lookup work at all.
+        Otherwise it falls back to the old per-file check: skip files with an
+        existing tag sidecar, then ones the ledger already recorded as
+        matched/no-match (unchanged size+mtime). PNGs inside a `pdf_page_dirs`
+        folder are flagged perceptual-only and are exempt from the has-sidecar
+        skip (their sidecar holds only the base comic:/page: tags) — the
+        ledger alone rules them out on a re-run."""
         print("📂 Scanning folder tree…")
-        media = tagged = seen = 0
+        media = tagged = seen = skipped_dirs = 0
         items: List[FileItem] = []
+        candidate_dirs: Set[Path] = set()
 
         for dp, dirs, files in os.walk(root):
             dirs.sort()
-            for fn in sorted(files):
-                if fn.startswith("."):          # dotfiles + macOS ._ metadata
-                    continue
-                p = Path(dp) / fn
-                ext = p.suffix.lower()
-                if ext in IMG_EXTS:
-                    kind = "image"
-                elif ext in VIDEO_EXTS:
-                    kind = "video"
-                else:
-                    continue                    # not postable media → ignore
-                media += 1
+            dp_path = Path(dp)
+            if excluded_dirs:
+                dirs[:] = [d for d in dirs if dp_path / d not in excluded_dirs]
 
-                is_pdf_page = ext == ".png" and p.parent in pdf_page_dirs
+            media_files = [fn for fn in sorted(files)
+                           if not fn.startswith(".") and self._media_kind(fn)]
+            if not media_files:
+                continue
+
+            dir_ledger = ledger_mgr.get(dp_path)
+
+            stats: Dict[str, os.stat_result] = {}
+            total_size = 0
+            for fn in media_files:
+                try:
+                    st = (dp_path / fn).stat()
+                except OSError:
+                    continue
+                stats[fn] = st
+                total_size += st.st_size
+            count = len(stats)
+
+            if count and dir_ledger.fingerprint_matches(count, total_size):
+                media += count
+                seen += count
+                skipped_dirs += 1
+                continue   # whole folder unchanged since it was last fully processed
+
+            candidate_dirs.add(dp_path)
+            for fn in media_files:
+                st = stats.get(fn)
+                if st is None:
+                    continue
+                media += 1
+                p = dp_path / fn
+                kind = self._media_kind(fn)
+                is_pdf_page = kind == "image" and p.suffix.lower() == ".png" and p.parent in pdf_page_dirs
                 if self.has_sidecar(p) and not is_pdf_page:
                     tagged += 1
                     continue
-                try:
-                    stat = p.stat()
-                except OSError:
+
+                status = dir_ledger.status_for(fn, st.st_size, st.st_mtime)
+                if status == "duplicate":
+                    canonical = dir_ledger.records.get(fn, {}).get("duplicate_of", "")
+                    if canonical and not (root / canonical).is_file():
+                        status = None  # chosen copy disappeared; elect/search again
+                if status in ("matched", "nomatch", "duplicate"):
+                    seen += 1
                     continue
 
                 item = FileItem(path=p, relpath=str(p.relative_to(root)),
-                                size=stat.st_size, mtime=stat.st_mtime, kind=kind,
-                                perceptual_only=is_pdf_page)
-                if ledger.status_for(item) in ("matched", "nomatch"):
-                    seen += 1
-                    continue
+                                size=st.st_size, mtime=st.st_mtime, kind=kind,
+                                ledger=dir_ledger, perceptual_only=is_pdf_page,
+                                md5=dir_ledger.md5_for(fn, st.st_size, st.st_mtime))
                 items.append(item)
 
         # Videos first (can't reverse-image-search; rarely hash-match), then
@@ -1686,16 +2053,83 @@ class TagIntegrator:
         # stable, resumable runs.
         items.sort(key=lambda it: (0 if it.kind == "video" else 1,
                                    _natural_key(it.relpath)))
+        if skipped_dirs:
+            print(f"⏭️  {skipped_dirs} folder(s) skipped wholesale (unchanged since last run)")
 
         print(f"📊 {media} media files · {tagged} already tagged · "
               f"{seen} previously checked · {len(items)} to process")
+        return items, candidate_dirs
+
+    def index_rendered_pdf_pages(self, paths: List[Path], root: Path,
+                                 ledger_mgr: LedgerManager) -> List[FileItem]:
+        """Turn completely rendered pages into perceptual-only queue items."""
+        items: List[FileItem] = []
+        for path in paths:
+            try:
+                st = path.stat()
+                relpath = str(path.relative_to(root))
+            except (OSError, ValueError):
+                continue
+            ledger = ledger_mgr.get(path.parent)
+            status = ledger.status_for(path.name, st.st_size, st.st_mtime)
+            if status in ("matched", "nomatch", "duplicate"):
+                continue
+            items.append(FileItem(
+                path=path, relpath=relpath, size=st.st_size, mtime=st.st_mtime,
+                kind="image", ledger=ledger, perceptual_only=True,
+                md5=ledger.md5_for(path.name, st.st_size, st.st_mtime)))
+        items.sort(key=lambda it: _natural_key(it.relpath))
         return items
+
+    def finalize_dir_fingerprints(self, candidate_dirs: Set[Path],
+                                   pdf_page_dirs: Set[Path],
+                                   ledger_mgr: LedgerManager) -> None:
+        """After a run, re-check each directory that wasn't wholesale-skipped:
+        if every media file currently in it now has a tag sidecar or a
+        matched/nomatch ledger record, seal that directory's fingerprint so
+        the *next* run can skip it wholesale. A directory left incomplete
+        (interrupted run, persistent no-match-pending file) simply isn't
+        sealed and gets rechecked file-by-file next time — never wrongly
+        skipped."""
+        for dp_path in candidate_dirs:
+            dir_ledger = ledger_mgr.get(dp_path)
+            try:
+                names = sorted(f for f in os.listdir(dp_path) if not f.startswith("."))
+            except OSError:
+                continue
+
+            count = 0
+            total_size = 0
+            complete = True
+            for fn in names:
+                kind = self._media_kind(fn)
+                if kind is None:
+                    continue
+                p = dp_path / fn
+                try:
+                    st = p.stat()
+                except OSError:
+                    complete = False
+                    break
+                count += 1
+                total_size += st.st_size
+                is_pdf_page = kind == "image" and p.suffix.lower() == ".png" and p.parent in pdf_page_dirs
+                if self.has_sidecar(p) and not is_pdf_page:
+                    continue
+                if dir_ledger.status_for(fn, st.st_size, st.st_mtime) not in (
+                        "matched", "nomatch", "duplicate"):
+                    complete = False
+                    break
+
+            if complete and count:
+                dir_ledger.mark_dir_complete(count, total_size)
 
     # ── Parallel local hashing ───────────────────────────────────────────────
 
     def hash_all(self, items: List[FileItem]) -> None:
-        # PDF pages skip the hash tier entirely, so don't waste I/O hashing them.
-        todo = [it for it in items if it.md5 is None and not it.perceptual_only]
+        # Perceptual-only PDF pages still need a local hash for exact duplicate
+        # detection, even though that hash is never sent to a booru.
+        todo = [it for it in items if it.md5 is None]
         if not todo:
             return
         workers = min(8, (os.cpu_count() or 2))
@@ -1711,6 +2145,113 @@ class TagIntegrator:
                     sys.stdout.flush()
         if sys.stdout.isatty():
             sys.stdout.write("\n")
+
+    def deduplicate(self, root: Path, items: List[FileItem],
+                    ledger_mgr: LedgerManager,
+                    canonical_items: Optional[List[FileItem]] = None
+                    ) -> Tuple[List[FileItem], int]:
+        """Remove exact-MD5 duplicates from this run before network searching.
+
+        An unchanged earlier matched/no-match ledger record wins over a new
+        candidate. Otherwise the first item in the stable videos/images +
+        natural-path order is canonical. Skipped copies receive a `duplicate`
+        ledger status and `duplicate_of` path, then all valid duplicate records
+        are rendered to ``duplicates.log`` in the scan root.
+        """
+        canonical_by_md5: Dict[str, Path] = {}
+        for ledger in sorted(ledger_mgr.touched(), key=lambda led: str(led.dir)):
+            for name, rec in sorted(ledger.records.items()):
+                if not isinstance(rec, dict) or rec.get("status") not in (
+                        "matched", "nomatch"):
+                    continue
+                path = ledger.dir / name
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                if ledger.status_for(name, st.st_size, st.st_mtime) not in (
+                        "matched", "nomatch"):
+                    continue
+                md5 = rec.get("md5")
+                if md5:
+                    canonical_by_md5.setdefault(md5, path)
+        for item in canonical_items or []:
+            if item.md5:
+                canonical_by_md5.setdefault(item.md5, item.path)
+
+        survivors: List[FileItem] = []
+        duplicate_count = 0
+        for item in items:
+            if not item.md5:
+                survivors.append(item)
+                continue
+            canonical = canonical_by_md5.get(item.md5)
+            if canonical is None:
+                canonical_by_md5[item.md5] = item.path
+                survivors.append(item)
+                continue
+            if canonical == item.path:
+                survivors.append(item)
+                continue
+            try:
+                canonical_rel = str(canonical.relative_to(root))
+            except ValueError:
+                canonical_rel = str(canonical)
+            item.ledger.record(item.path.name, item.size, item.mtime, item.md5,
+                               "duplicate", [], duplicate_of=canonical_rel)
+            duplicate_count += 1
+
+        self._write_duplicates_log(root, ledger_mgr)
+        return survivors, duplicate_count
+
+    @staticmethod
+    def _write_duplicates_log(root: Path, ledger_mgr: LedgerManager) -> None:
+        groups: Dict[Tuple[str, str], List[str]] = {}
+        for ledger in ledger_mgr.touched():
+            for name, rec in ledger.records.items():
+                if not isinstance(rec, dict) or rec.get("status") != "duplicate":
+                    continue
+                path = ledger.dir / name
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                if ledger.status_for(name, st.st_size, st.st_mtime) != "duplicate":
+                    continue
+                canonical = rec.get("duplicate_of") or "(canonical unknown)"
+                md5 = rec.get("md5") or "(hash unavailable)"
+                try:
+                    duplicate = str(path.relative_to(root))
+                except ValueError:
+                    duplicate = str(path)
+                groups.setdefault((canonical, md5), []).append(duplicate)
+
+        log_path = root / DUPLICATES_FILE
+        if not groups:
+            if log_path.exists():
+                try:
+                    log_path.unlink()
+                except OSError as e:
+                    notify(f"⚠️  Couldn't remove stale {DUPLICATES_FILE}: {e}")
+            return
+
+        lines = [
+            "FurTag exact duplicate report",
+            "Only the canonical file is searched; copies are skipped.",
+            "Reason for every group: byte-identical MD5 hash.",
+            "",
+        ]
+        for (canonical, md5), duplicates in sorted(groups.items()):
+            lines.append(f"MD5:       {md5}")
+            lines.append(f"SEARCH:    {canonical}")
+            lines += [f"DUPLICATE: {path}" for path in sorted(duplicates, key=_natural_key)]
+            lines.append("")
+        try:
+            tmp = log_path.with_name(log_path.name + ".tmp")
+            tmp.write_text("\n".join(lines), encoding="utf-8")
+            tmp.replace(log_path)
+        except OSError as e:
+            notify(f"⚠️  Couldn't write {DUPLICATES_FILE}: {e}")
 
     # ── Hash tier (four boorus, concurrent per file) ─────────────────────────
 
@@ -1822,14 +2363,39 @@ class TagIntegrator:
     def run(self, root: Path) -> None:
         global _display
 
-        ledger = Ledger(root)
-        ledger.load()
-        pdf_page_dirs = self.expand_pdfs(root)
-        items = self.index(root, ledger, pdf_page_dirs)
-        if not items:
+        ledger_mgr = LedgerManager()
+        pdf_page_dirs, pdf_jobs = self.plan_pdf_renders(root)
+        pdf_executor: Optional[cf.ThreadPoolExecutor] = None
+        pdf_future = None
+        pending_pdf_dirs = {pdf.parent / pdf.stem for pdf in pdf_jobs}
+        if pdf_jobs:
+            pdf_dpi = prompt_for_pdf_dpi(len(pdf_jobs))
+            print(f"📄 Rendering {len(pdf_jobs)} PDF(s) at {pdf_dpi} DPI in background…")
+            pdf_executor = cf.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="pdf-render")
+            pdf_future = pdf_executor.submit(self.render_pdf_jobs, pdf_jobs, pdf_dpi)
+
+        items, candidate_dirs = self.index(
+            root, ledger_mgr, pdf_page_dirs, excluded_dirs=pending_pdf_dirs)
+        already_tagged = self._hydrus_populate_already_tagged_page(ledger_mgr)
+        if already_tagged:
+            ledger_mgr.save_all()
+            print(f"✅ Already Tagged page → {already_tagged} ledger-matched file(s)")
+        if not items and pdf_future is None:
             print("✅ Nothing to do — everything is tagged or already checked.")
+            self.finalize_dir_fingerprints(candidate_dirs, pdf_page_dirs, ledger_mgr)
+            ledger_mgr.save_all()
             return
         self.hash_all(items)
+        items, duplicates = self.deduplicate(root, items, ledger_mgr)
+        if duplicates:
+            ledger_mgr.save_all()
+            print(f"♊ {duplicates} exact duplicate(s) skipped — see {DUPLICATES_FILE}")
+        if not items and pdf_future is None:
+            print("✅ Nothing unique left to search.")
+            self.finalize_dir_fingerprints(candidate_dirs, pdf_page_dirs, ledger_mgr)
+            ledger_mgr.save_all()
+            return
 
         print("🔄 Hash tier: e621 · InkBunny · Danbooru · Gelbooru (concurrent, merged)"
               "  →  Perceptual: Fluffle → SauceNAO")
@@ -1851,6 +2417,18 @@ class TagIntegrator:
             nonlocal nomatch
             with counts_lock:
                 nomatch += 1
+
+        save_lock = threading.Lock()
+        save_counter = 0
+
+        def _maybe_save_ledgers(every: int = 25) -> None:
+            nonlocal save_counter
+            with save_lock:
+                save_counter += 1
+                if save_counter < every:
+                    return
+                save_counter = 0
+            ledger_mgr.save_all()
 
         # PDF pages bypass the hash tier and go straight into the perceptual
         # queue, seeded before either tier starts so they're worked on as
@@ -1883,24 +2461,29 @@ class TagIntegrator:
                         if item.perceptual_only:
                             tags = set(tags) | self._pdf_page_base_tags(item.path)
                         self.write_results(item.path, tags, urls)
-                        ledger.record(item, "matched", sources)
+                        item.ledger.record(item.path.name, item.size, item.mtime,
+                                            item.md5, "matched", sources)
                         _bump_hit(sources)
                         disp.finish_file(
                             "perceptual", f"{'+'.join(sources)}  ({len(tags)} tags)")
                     else:
-                        ledger.record(item, "nomatch", [])
+                        item.ledger.record(item.path.name, item.size, item.mtime,
+                                            item.md5, "nomatch", [])
                         _bump_miss()
                         disp.finish_file("perceptual", "— no match")
-                    ledger.maybe_save()
+                    _maybe_save_ledgers()
                 except Exception as e:
                     notify(f"❌ perceptual worker error on {item.path.name}: {e}")
                 finally:
                     perceptual_q.task_done()
 
         try:
+            hash_interval = max(
+                (self.pace[s].interval for s in self.enabled_hash_services()),
+                default=0.0)
             disp.begin_phase(
                 "hash", "Phase · hash lookups (e621·InkBunny·Danbooru·Gelbooru)",
-                len(hash_items))
+                len(hash_items), interval=hash_interval)
             disp.begin_phase(
                 "perceptual", "Phase · perceptual (Fluffle → SauceNAO)",
                 seed_count, growing=True)
@@ -1922,7 +2505,8 @@ class TagIntegrator:
                     tags, urls, sources = self.hash_tier(item, disp, ex)
                     if tags or urls:
                         self.write_results(item.path, tags, urls)
-                        ledger.record(item, "matched", sources)
+                        item.ledger.record(item.path.name, item.size, item.mtime,
+                                            item.md5, "matched", sources)
                         _bump_hit(sources)
                         disp.finish_file("hash", f"{'+'.join(sources)}  ({len(tags)} tags)")
                     elif item.kind == "image":
@@ -1930,18 +2514,51 @@ class TagIntegrator:
                         disp.grow("perceptual")
                         disp.finish_file("hash", "no hash match → perceptual")
                     else:                                  # video: hash-only
-                        ledger.record(item, "nomatch", [])
+                        item.ledger.record(item.path.name, item.size, item.mtime,
+                                            item.md5, "nomatch", [])
                         _bump_miss()
                         disp.finish_file("hash", "— no match")
-                    ledger.maybe_save()
+                    _maybe_save_ledgers()
+
+            # Let the ordinary perceptual queue settle before reading ledgers
+            # for PDF deduplication; the worker remains alive for new pages.
+            perceptual_q.join()
+
+            # PDF rendering has overlapped the ordinary hash/perceptual work
+            # above. Once complete, only fully-written pages are indexed,
+            # locally hashed/deduplicated, and appended to the live perceptual
+            # queue. They never enter the booru hash tier.
+            if pdf_future is not None:
+                try:
+                    rendered_paths = pdf_future.result()
+                except Exception as e:
+                    notify(f"⚠️  Background PDF rendering failed: {e}")
+                    rendered_paths = []
+                pdf_items = self.index_rendered_pdf_pages(
+                    rendered_paths, root, ledger_mgr)
+                self.hash_all(pdf_items)
+                pdf_items, pdf_duplicates = self.deduplicate(
+                    root, pdf_items, ledger_mgr, canonical_items=items)
+                if pdf_duplicates:
+                    duplicates += pdf_duplicates
+                    notify(f"♊ {pdf_duplicates} duplicate PDF page(s) skipped; "
+                           f"see {DUPLICATES_FILE}.")
+                for item in pdf_items:
+                    candidate_dirs.add(item.path.parent)
+                    perceptual_q.put(item)
+                    disp.grow("perceptual")
+                items.extend(pdf_items)
 
             disp.freeze_total("perceptual")
             perceptual_q.put(_PERCEPTUAL_DONE)
             perc_thread.join()
         finally:
+            if pdf_executor is not None:
+                pdf_executor.shutdown(wait=True)
             disp.close()
             _display = None
-            ledger.save()
+            self.finalize_dir_fingerprints(candidate_dirs, pdf_page_dirs, ledger_mgr)
+            ledger_mgr.save_all()
 
         # ── Summary ──────────────────────────────────────────────────────────
         total = len(items)
@@ -1954,7 +2571,8 @@ class TagIntegrator:
         print(f"  ├─ Fluffle hits:   {counts['fluffle']}")
         print(f"  ├─ SauceNAO hits:  {counts['saucenao']}")
         print(f"  └─ No match:       {nomatch}")
-        print(f"🗒️  Session ledger updated: {ledger.path.name}")
+        print(f"🗒️  Session ledgers updated across the scanned tree "
+              f"({LEDGER_FILE} per folder)")
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
@@ -1977,21 +2595,150 @@ def _unescape_path(raw: str) -> str:
 
 
 QUIT_WORDS = {"q", "quit", "exit"}
+NUKE_COMMAND = "NUKE!"
+
+
+def _is_furtag_sidecar(path: Path) -> bool:
+    """True only for FurTag's media-extension-preserving sidecar names."""
+    name = path.name.lower()
+    media_exts = IMG_EXTS | VIDEO_EXTS
+    return any(name.endswith(ext + ".txt") or
+               name.endswith(ext + ".urls.txt") for ext in media_exts)
+
+
+def _nuke_candidates(root: Path) -> Tuple[List[Path], List[Path]]:
+    """Find generated ledgers and sidecars below root without following links."""
+    ledgers: List[Path] = []
+    sidecars: List[Path] = []
+    ledger_names = {LEDGER_FILE, LEDGER_FILE + ".tmp", DUPLICATES_FILE,
+                    DUPLICATES_FILE + ".tmp"}
+    for dp, dirs, files in os.walk(root, followlinks=False):
+        dirs.sort()
+        for fn in sorted(files):
+            path = Path(dp) / fn
+            if fn in ledger_names:
+                ledgers.append(path)
+            elif _is_furtag_sidecar(path):
+                sidecars.append(path)
+    return ledgers, sidecars
+
+
+def _pdf_render_candidates(root: Path) -> Tuple[List[Path], Set[Path]]:
+    """Find only PNG pages whose names exactly match a sibling source PDF."""
+    pages: List[Path] = []
+    page_dirs: Set[Path] = set()
+    pdfs: List[Path] = []
+    for dp, dirs, files in os.walk(root, followlinks=False):
+        dirs.sort()
+        for fn in sorted(files):
+            if not fn.startswith(".") and Path(fn).suffix.lower() in PDF_EXTS:
+                pdfs.append(Path(dp) / fn)
+    for pdf in pdfs:
+        out_dir = pdf.parent / pdf.stem
+        if not out_dir.is_dir():
+            continue
+        pattern = re.compile(rf"^{re.escape(pdf.stem)} PAGE\d+\.PNG$", re.I)
+        try:
+            matches = [p for p in out_dir.iterdir()
+                       if p.is_file() and pattern.match(p.name)]
+        except OSError:
+            continue
+        if matches:
+            pages.extend(sorted(matches, key=lambda p: _natural_key(p.name)))
+            page_dirs.add(out_dir)
+    return pages, page_dirs
+
+
+def _prompt_for_nuke() -> Optional[Path]:
+    """Confirm and remove FurTag-generated state, returning the folder to scan.
+
+    Blank input and cancellation return to the normal folder prompt. The
+    filesystem root is deliberately refused even with confirmation.
+    """
+    print("\n💣 NUKE mode — remove FurTag ledgers and sidecars, then rescan.")
+    try:
+        raw = input("Folder to reset (drag it here, blank = cancel): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n↩️  Nuke cancelled.")
+        return None
+    if not raw:
+        print("↩️  Nuke cancelled.")
+        return None
+
+    root = Path(_unescape_path(raw)).expanduser().resolve()
+    if not root.is_dir():
+        print(f"‼️  '{root}' is not a valid directory. Nuke cancelled.")
+        return None
+    if root == Path(root.anchor):
+        print("⛔ Refusing to nuke an entire filesystem root.")
+        return None
+
+    ledgers, sidecars = _nuke_candidates(root)
+    pdf_pages, pdf_page_dirs = _pdf_render_candidates(root)
+    print(f"\nTarget:   {root}")
+    print(f"Ledgers/reports: {len(ledgers)}")
+    print(f"Sidecars: {len(sidecars)}")
+    print(f"Rendered PDF pages: {len(pdf_pages)} (optional second question)")
+    try:
+        answer = input("\nARE YOU SURE? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer != "y":
+        print("↩️  Nuke cancelled; nothing was deleted.\n")
+        return None
+
+    reexport_pdfs = False
+    if pdf_pages:
+        try:
+            answer = input(
+                f"Also delete {len(pdf_pages)} rendered PDF page(s) so they "
+                "are re-exported? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        reexport_pdfs = answer == "y"
+
+    removed = 0
+    failed = 0
+    targets = ledgers + sidecars + (pdf_pages if reexport_pdfs else [])
+    for path in targets:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError as e:
+            failed += 1
+            print(f"⚠️  Could not delete {path}: {e}")
+    if reexport_pdfs:
+        for out_dir in sorted(pdf_page_dirs, key=lambda p: len(p.parts), reverse=True):
+            try:
+                out_dir.rmdir()  # succeeds only when no unrelated content remains
+            except OSError:
+                pass
+    print(f"\n💥 Reset complete — removed {removed} generated file(s).")
+    if failed:
+        print(f"⚠️  {failed} file(s) could not be removed and may still be skipped.")
+    print("🔄 Starting a fresh scan of that folder…\n")
+    return root
 
 
 def prompt_for_folder() -> Path:
     """Ask for a folder, re-prompting until a real directory is given.
 
-    Blank defaults to the current directory. Typing q/quit/exit — or Ctrl+C /
-    Ctrl+D — quits cleanly. An invalid path re-prompts instead of exiting.
+    Blank defaults to the current directory. Typing NUKE! enters the confirmed
+    recursive reset flow. Typing q/quit/exit — or Ctrl+C / Ctrl+D — quits
+    cleanly. An invalid path re-prompts instead of exiting.
     """
     while True:
         try:
-            raw = input("Folder to scan (blank = current dir, q to quit): ").strip()
+            raw = input("Folder to scan (blank = current dir, NUKE! = reset): ").strip()
         except (EOFError, KeyboardInterrupt):
             sys.exit("\n👋 Bye.")
         if raw.lower() in QUIT_WORDS:
             sys.exit("👋 Bye.")
+        if raw.upper() == NUKE_COMMAND:
+            nuked_root = _prompt_for_nuke()
+            if nuked_root is not None:
+                return nuked_root
+            continue
         root = Path(_unescape_path(raw) if raw else ".").expanduser().resolve()
         if root.is_dir():
             return root
