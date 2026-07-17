@@ -50,6 +50,10 @@ hydrus_api_url       hydrus_access_key
 hydrus_tag_service   (= "downloader tags" by default)
 hydrus_import        (true/false, default true)
 hydrus_also_sidecars (true/false, default false)
+hydrus_results_page       (name/on/off, default on — master toggle for the two result pages below)
+hydrus_new_imports_page   (= "FurTag New Imports" — brand-new imports this run)
+hydrus_newly_tagged_page  (= "FurTag Newly Tagged" — files already in Hydrus, newly tagged)
+hydrus_already_tagged_page(= "Already Tagged" — ledger-history review page; false disables)
 ```
 
 For InkBunny, enable API access **and** adult ratings in account settings, or explicit results stay hidden. `load_credentials()` reads the file once into a dict and the `_init_<source>` helpers each pull their keys. `_init_hydrus()` verifies the access key and resolves the tag service name → `service_key`; on failure FurTag keeps writing sidecars.
@@ -60,9 +64,14 @@ When `has_hydrus` is true, `write_results()` calls `_hydrus_push()` instead of (
 
 1. `POST /add_files/add_file` with `{path}` when `hydrus_import` (status 1/2 → hash)
 2. `POST /add_tags/add_tags` with `service_keys_to_tags` and `override_previously_deleted_mappings: false` (downloader-like)
-3. `POST /add_urls/associate_url` with `urls_to_add`
+3. `POST /add_urls/associate_url` with `urls_to_add` — **only when the access key holds Hydrus permission 0 ("Import and Edit URLs")**, checked once at startup (`hydrus_can_edit_urls`) and warned about if missing. A URL-association failure is caught and warned per file; it never aborts the tag push, the results-page add, or hash caching.
+4. `_hydrus_add_to_page(kind, hash)` files it onto one of two review pages by **import status**: status 1 (brand-new import) → **New Imports** page, status 2 / tag-only mode (already in Hydrus, just tagged) → **Newly Tagged** page. Pages are created lazily on first file, cached by page key in `self.hydrus_result_pages`, and any per-page failure disables just that page for the run.
 
 Pushes are serialised with `_hydrus_lock` because the hash tier and perceptual worker can both call `write_results`. PDF pages still get `comic:`/`page:` via `_pdf_page_base_tags()` even when convert sidecars are skipped.
+
+### Already Tagged review page
+
+`_hydrus_populate_already_tagged_page(ledger_mgr, limit)` builds an unfocused page from unchanged `matched` ledger records (files skipped this run). At the start of `run()`, `prompt_for_already_tagged()` asks whether to build it and how many to show: **None** = skip, **0** = all, **N** = the N most recently tagged. "Most recently tagged" sorts on each record's `tagged_at` wall-clock stamp (written by `Ledger.record()` for matched files; records predating the field sort oldest). A non-TTY stdin skips the prompt and builds the full page (prior behavior).
 
 ## Pipeline (the core architecture)
 
@@ -96,6 +105,7 @@ The key pattern: a perceptual hit identifies *which* booru post the image is, so
 
 When no booru-ID match clears the gate, `_extract_saucenao_tags()` is used. SauceNAO's per-index `data` is inconsistent, so:
 - **URLs are gathered from all qualifying results, but tags come from only the single highest-similarity result** (`_saucenao_result_tags()`) — merging tags across results produced Frankenstein tag sets (multiple creators, character-as-series).
+- **If the qualifying results yield no URL at all, the bare `site:` tag is dropped** — SauceNAO often returns an e-hentai/exhentai index match with an empty `ext_urls`, and a `site:e-hentai` tag you can't follow up on is just noise. Standalone `creator:`/`title:`/`character:` tags are kept.
 - `source` is **excluded** from series-fields (for e-hentai etc. it's the gallery title or a URL, not a series).
 - Characters split on **commas/semicolons only**, never `and`/`/` (those live inside disambiguators like `calvin (calvin and hobbes)`).
 - `_clean_tag_text()` converts underscores → spaces (Hydrus style), the opposite of its original behavior.

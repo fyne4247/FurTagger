@@ -72,7 +72,9 @@ Credentials live in a single credentials.txt alongside this script
         hydrus_tag_service   = downloader tags
         hydrus_import        = true    # import file then tag (false = tag-only)
         hydrus_also_sidecars = false   # also write .txt sidecars when API is on
-        hydrus_results_page  = FurTag Results  # blank/false disables background page
+        hydrus_results_page  = on      # blank/false disables both result pages below
+        hydrus_new_imports_page = FurTag New Imports   # brand-new imports this run
+        hydrus_newly_tagged_page = FurTag Newly Tagged # files already in Hydrus, newly tagged
         hydrus_already_tagged_page = Already Tagged  # matched ledger history; false disables
 
     Note: Danbooru requires a verified-email account for API auth; if the key
@@ -526,7 +528,8 @@ class Ledger:
                 self._dirty += 1
 
     def record(self, name: str, size: int, mtime: float, md5: Optional[str],
-               status: str, sources: List[str], duplicate_of: str = "") -> None:
+               status: str, sources: List[str], duplicate_of: str = "",
+               sha256: Optional[str] = None) -> None:
         with self._lock:
             record = {
                 "size": size,
@@ -535,6 +538,14 @@ class Ledger:
                 "status": status,
                 "sources": sources,
             }
+            if sha256:
+                # Persist the SHA-256 Hydrus already handed us on import, so the
+                # Already Tagged page never has to recompute it on a later run.
+                record["sha256"] = sha256
+            if status == "matched":
+                # Wall-clock stamp so the Already Tagged page can be limited to
+                # the N most recently tagged files on a later run.
+                record["tagged_at"] = time.time()
             if duplicate_of:
                 record["duplicate_of"] = duplicate_of
             self.records[name] = record
@@ -742,9 +753,14 @@ class TagIntegrator:
         self.hydrus_tag_service_key = ""
         self.hydrus_import = True
         self.hydrus_also_sidecars = False
-        self.hydrus_results_page_name = "FurTag Results"
-        self.hydrus_results_page_enabled = False
-        self._hydrus_results_page_key = ""
+        self.hydrus_can_edit_urls = False   # access key has "Import and Edit URLs"
+        # Two result pages this run writes to: genuinely new imports vs. files
+        # already in Hydrus that merely gained tags this run. Each is a separate
+        # Hydrus page, created lazily on first file and cached by page key.
+        self.hydrus_result_pages: Dict[str, Dict] = {
+            "new":     {"name": "FurTag New Imports",  "enabled": False, "key": ""},
+            "updated": {"name": "FurTag Newly Tagged", "enabled": False, "key": ""},
+        }
         self.hydrus_already_tagged_page_name = "Already Tagged"
         self.hydrus_already_tagged_page_enabled = False
         self.has_hydrus = False
@@ -842,9 +858,14 @@ class TagIntegrator:
         self.hydrus_import = _truthy(cfg.get("hydrus_import", "true"), default=True)
         self.hydrus_also_sidecars = _truthy(
             cfg.get("hydrus_also_sidecars", "false"), default=False)
-        page_setting = cfg.get("hydrus_results_page", "FurTag Results").strip()
-        self.hydrus_results_page_name = page_setting or "FurTag Results"
+        page_setting = cfg.get("hydrus_results_page", "on").strip()
         page_requested = page_setting.lower() not in {"", "0", "false", "no", "off"}
+        new_name = cfg.get("hydrus_new_imports_page", "").strip()
+        upd_name = cfg.get("hydrus_newly_tagged_page", "").strip()
+        if new_name:
+            self.hydrus_result_pages["new"]["name"] = new_name
+        if upd_name:
+            self.hydrus_result_pages["updated"]["name"] = upd_name
         old_page_setting = cfg.get(
             "hydrus_already_tagged_page", "Already Tagged").strip()
         self.hydrus_already_tagged_page_name = old_page_setting or "Already Tagged"
@@ -863,8 +884,16 @@ class TagIntegrator:
                 return
             access = r.json()
             permissions = access.get("basic_permissions") or []
-            can_manage_pages = access.get("permits_everything", False) or 4 in permissions
-            self.hydrus_results_page_enabled = page_requested and can_manage_pages
+            everything = access.get("permits_everything", False)
+            can_manage_pages = everything or 4 in permissions
+            # Hydrus permission 0 = "Import and Edit URLs"; associate_url 403s
+            # without it, so know up front rather than failing per file.
+            self.hydrus_can_edit_urls = everything or 0 in permissions
+            if not self.hydrus_can_edit_urls:
+                print("⚠️  Hydrus URLs disabled – access key needs the "
+                      "'Import and Edit URLs' permission; tags still work.")
+            for page in self.hydrus_result_pages.values():
+                page["enabled"] = page_requested and can_manage_pages
             self.hydrus_already_tagged_page_enabled = (
                 old_page_requested and can_manage_pages)
             if (page_requested or old_page_requested) and not can_manage_pages:
@@ -1534,6 +1563,11 @@ class TagIntegrator:
                     urls.add(url.strip())
 
         tags = self._saucenao_result_tags(max(results, key=self._sim)) if results else set()
+        if not urls:
+            # A lone site: tag with no link (e.g. an exhentai gallery SauceNAO
+            # gives no ext_urls for) is dead weight — you can't follow it up.
+            # Drop it, but keep any creator:/title:/character: that stand alone.
+            tags = {t for t in tags if not t.startswith("site:")}
         return tags, urls
 
     def _saucenao_result_tags(self, result: Dict) -> Set[str]:
@@ -1669,25 +1703,34 @@ class TagIntegrator:
             tags.add(f"page:{int(m.group(1))}")
         return tags
 
-    def write_results(self, media: Path, tags: Set[str], urls: Set[str]) -> None:
+    def write_results(self, media: Path, tags: Set[str],
+                      urls: Set[str]) -> Optional[str]:
+        """Push to Hydrus and/or write sidecars. Returns the file's SHA-256 when
+        it was pushed to Hydrus (so the caller can cache it), else None."""
         # Drop "artist unknown / anonymous" placeholder tags from every source
         # before writing — they're noise in a Hydrus library.
         tags = {t for t in tags if not _is_junk_tag(t)}
         urls = {u for u in urls if u}
 
         if self.has_hydrus and (tags or urls):
-            self._hydrus_push(media, tags, urls)
+            return self._hydrus_push(media, tags, urls)
 
         if self.write_sidecars:
             if tags:
                 self._append_lines(self.tag_sidecar_path(media), tags)
             if urls:
                 self._append_lines(self.url_sidecar_path(media), urls)
+        return None
 
     # ── Hydrus Client API push ───────────────────────────────────────────────
 
-    def _hydrus_push(self, media: Path, tags: Set[str], urls: Set[str]) -> None:
+    def _hydrus_push(self, media: Path, tags: Set[str],
+                     urls: Set[str]) -> Optional[str]:
         """Import (optional) + tag + associate URLs for one file. Thread-safe.
+
+        Returns the file's SHA-256 (from Hydrus's import response, or computed
+        locally in tag-only mode) so the caller can cache it in the ledger and
+        avoid recomputing it later. Returns None if the push was aborted.
 
         Safety: only *adds* content (never deletes files/tags/URLs). If import
         is on and the import is refused (previously deleted, vetoed, error),
@@ -1697,23 +1740,36 @@ class TagIntegrator:
             try:
                 if self.hydrus_import:
                     # Must get an accepted import (status 1/2). No hash → stop.
-                    file_hash = self._hydrus_add_file(media)
-                    if not file_hash:
-                        return
+                    added = self._hydrus_add_file(media)
+                    if not added:
+                        return None
+                    file_hash, import_status = added
                 else:
-                    # Tag-only mode: file must already live in Hydrus under this hash.
+                    # Tag-only mode: file must already live in Hydrus under this
+                    # hash — so it's an existing file, never a fresh import.
                     file_hash = self._sha256_local(media)
                     if not file_hash:
                         notify(f"❌ Hydrus: no hash for {media.name}; skipped push.")
-                        return
+                        return None
+                    import_status = 2
 
                 if tags:
                     self._hydrus_add_tags(file_hash, tags)
-                if urls:
-                    self._hydrus_associate_urls(file_hash, urls)
-                self._hydrus_add_to_results_page(file_hash)
+                if urls and self.hydrus_can_edit_urls:
+                    # Isolate URL failures: a bad/forbidden associate_url must not
+                    # abort the tag push, the results-page add, or hash caching.
+                    try:
+                        self._hydrus_associate_urls(file_hash, urls)
+                    except Exception as e:
+                        notify(f"⚠️  Hydrus URL association failed for "
+                               f"{media.name}: {e}")
+                # status 1 = brand-new import; 2 = already in Hydrus, just tagged.
+                self._hydrus_add_to_page(
+                    "new" if import_status == 1 else "updated", file_hash)
+                return file_hash
             except Exception as e:
                 notify(f"❌ Hydrus push failed for {media.name}: {e}")
+                return None
 
     def _hydrus_post(self, endpoint: str, body: dict, timeout: int) -> requests.Response:
         """POST to a Hydrus Client API endpoint with the standard headers."""
@@ -1724,8 +1780,9 @@ class TagIntegrator:
             timeout=timeout,
         )
 
-    def _hydrus_add_file(self, media: Path) -> Optional[str]:
-        """POST /add_files/add_file by path. Returns SHA-256 hex on success/already-in."""
+    def _hydrus_add_file(self, media: Path) -> Optional[Tuple[str, int]]:
+        """POST /add_files/add_file by path. Returns (SHA-256 hex, import status)
+        on success — status 1 = newly imported, 2 = already in the db."""
         try:
             r = self._hydrus_post("add_files/add_file", {"path": str(media.resolve())}, 120)
         except requests.RequestException as e:
@@ -1748,7 +1805,7 @@ class TagIntegrator:
         note = (data.get("note") or "").strip()
         # 1 = imported, 2 = already in db — both give us a usable hash
         if status in (1, 2) and h:
-            return h
+            return h, status
         if status == 3:
             notify(f"⚠️  Hydrus: {media.name} previously deleted"
                    + (f" ({note})" if note else "") + " — not tagging.")
@@ -1782,55 +1839,68 @@ class TagIntegrator:
         if r.status_code != 200:
             raise RuntimeError(f"associate_url HTTP {r.status_code}: {r.text[:200]}")
 
-    def _hydrus_add_to_results_page(self, file_hash: str) -> None:
-        """Silently append a known file to this run's Hydrus results page."""
-        if not self.hydrus_results_page_enabled:
-            return
+    def _hydrus_add_to_page(self, kind: str, file_hash: str) -> None:
+        """Silently append a file to one of this run's result pages.
 
-        if not self._hydrus_results_page_key:
+        `kind` is "new" (freshly imported) or "updated" (already in Hydrus,
+        just tagged). Each page is created lazily on its first file and cached
+        by page key; any failure disables just that page for the rest of the run.
+        """
+        page = self.hydrus_result_pages.get(kind)
+        if not page or not page["enabled"]:
+            return
+        name = page["name"]
+
+        if not page["key"]:
             body = {
                 "page_type": 6,
-                "page_name": self.hydrus_results_page_name,
+                "page_name": name,
                 "hashes": [file_hash],
                 "system_hash_locked": True,
                 "focus_page": False,
             }
             r = self._hydrus_post("manage_pages/new_page", body, 30)
             if r.status_code != 200:
-                self.hydrus_results_page_enabled = False
-                notify(f"⚠️  Hydrus results page unavailable (HTTP {r.status_code}); "
+                page["enabled"] = False
+                notify(f"⚠️  Hydrus '{name}' page unavailable (HTTP {r.status_code}); "
                        "continuing without it.")
                 return
             try:
-                self._hydrus_results_page_key = r.json()["page_key"]
+                page["key"] = r.json()["page_key"]
             except (ValueError, KeyError, TypeError):
-                self.hydrus_results_page_enabled = False
-                notify("⚠️  Hydrus results page returned no page key; "
+                page["enabled"] = False
+                notify(f"⚠️  Hydrus '{name}' page returned no page key; "
                        "continuing without it.")
             return
 
         body = {
-            "page_key": self._hydrus_results_page_key,
+            "page_key": page["key"],
             "hashes": [file_hash],
         }
         r = self._hydrus_post("manage_pages/add_files", body, 30)
         if r.status_code != 200:
-            self.hydrus_results_page_enabled = False
-            notify(f"⚠️  Hydrus could not update the results page "
+            page["enabled"] = False
+            notify(f"⚠️  Hydrus could not update the '{name}' page "
                    f"(HTTP {r.status_code}); continuing without it.")
 
-    def _hydrus_populate_already_tagged_page(self, ledger_mgr: LedgerManager) -> int:
+    def _hydrus_populate_already_tagged_page(
+            self, ledger_mgr: LedgerManager, limit: Optional[int]) -> int:
         """Create an unfocused page from unchanged `matched` ledger records.
+
+        `limit` is None to skip the page entirely, 0 for every matched file, or
+        N (>0) for the N most recently tagged (by each record's `tagged_at`).
 
         Old ledgers only contain MD5, while Hydrus page APIs require SHA-256.
         Missing SHA-256 values are calculated in parallel once and cached back
         into their ledger records. Unknown/non-local hashes are harmlessly
         omitted by Hydrus's local file-search page.
         """
+        if limit is None:
+            return 0
         if not (self.has_hydrus and self.hydrus_already_tagged_page_enabled):
             return 0
 
-        entries: List[Tuple[Path, Ledger, str, int, float, Optional[str]]] = []
+        entries: List[Tuple[Path, Ledger, str, int, float, Optional[str], float]] = []
         for ledger in ledger_mgr.touched():
             for name, rec in ledger.records.items():
                 if not isinstance(rec, dict) or rec.get("status") != "matched":
@@ -1842,11 +1912,19 @@ class TagIntegrator:
                     continue
                 if ledger.status_for(name, st.st_size, st.st_mtime) != "matched":
                     continue
+                # Records predating tagged_at sort oldest (fall to the tail).
+                tagged_at = rec.get("tagged_at") or 0.0
                 entries.append((path, ledger, name, st.st_size, st.st_mtime,
-                                ledger.sha256_for(name, st.st_size, st.st_mtime)))
+                                ledger.sha256_for(name, st.st_size, st.st_mtime),
+                                tagged_at))
 
         if not entries:
             return 0
+
+        # Keep only the N most recently tagged before we hash anything.
+        if limit > 0 and len(entries) > limit:
+            entries.sort(key=lambda e: e[6], reverse=True)
+            entries = entries[:limit]
 
         missing = [entry for entry in entries if not entry[5]]
         if missing:
@@ -1857,7 +1935,7 @@ class TagIntegrator:
                 futures = {ex.submit(self._sha256_local, entry[0]): entry
                            for entry in missing}
                 for future in cf.as_completed(futures):
-                    path, ledger, name, size, mtime, _ = futures[future]
+                    path, ledger, name, size, mtime, _, _ = futures[future]
                     try:
                         sha256 = future.result()
                     except Exception as e:
@@ -1868,7 +1946,7 @@ class TagIntegrator:
 
         hashes: List[str] = []
         seen_hashes: Set[str] = set()
-        for path, ledger, name, size, mtime, cached in entries:
+        for path, ledger, name, size, mtime, cached, _ in entries:
             sha256 = cached or ledger.sha256_for(name, size, mtime)
             if sha256 and sha256 not in seen_hashes:
                 hashes.append(sha256)
@@ -1952,8 +2030,7 @@ class TagIntegrator:
         out_dir = pdf.parent / pdf.stem
         if not out_dir.is_dir():
             return
-        pattern = re.compile(
-            rf"^{re.escape(pdf.stem)} PAGE\d+\.PNG(?:\.txt)?$", re.I)
+        pattern = _pdf_page_pattern(pdf, include_txt=True)
         try:
             targets = [p for p in out_dir.iterdir()
                        if p.is_file() and pattern.match(p.name)]
@@ -2100,12 +2177,10 @@ class TagIntegrator:
         # stable, resumable runs.
         items.sort(key=lambda it: (0 if it.kind == "video" else 1,
                                    _natural_key(it.relpath)))
-        if skipped_dirs:
-            if sys.stdout.isatty():
-                sys.stdout.write("\r\033[2K")
-            print(f"⏭️  {skipped_dirs} folder(s) skipped wholesale (unchanged since last run)")
-        elif sys.stdout.isatty():
+        if sys.stdout.isatty():
             sys.stdout.write("\r\033[2K")
+        if skipped_dirs:
+            print(f"⏭️  {skipped_dirs} folder(s) skipped wholesale (unchanged since last run)")
 
         print(f"📊 {media} media files · {tagged} already tagged · "
               f"{seen} previously checked · {len(items)} to process")
@@ -2434,7 +2509,11 @@ class TagIntegrator:
 
         items, candidate_dirs = self.index(
             root, ledger_mgr, pdf_page_dirs, excluded_dirs=pending_pdf_dirs)
-        already_tagged = self._hydrus_populate_already_tagged_page(ledger_mgr)
+        at_limit = (prompt_for_already_tagged()
+                    if self.has_hydrus and self.hydrus_already_tagged_page_enabled
+                    else None)
+        already_tagged = self._hydrus_populate_already_tagged_page(
+            ledger_mgr, at_limit)
         if already_tagged:
             ledger_mgr.save_all()
             print(f"✅ Already Tagged page → {already_tagged} ledger-matched file(s)")
@@ -2517,9 +2596,10 @@ class TagIntegrator:
                     if tags or urls:
                         if item.perceptual_only:
                             tags = set(tags) | self._pdf_page_base_tags(item.path)
-                        self.write_results(item.path, tags, urls)
+                        sha = self.write_results(item.path, tags, urls)
                         item.ledger.record(item.path.name, item.size, item.mtime,
-                                            item.md5, "matched", sources)
+                                            item.md5, "matched", sources,
+                                            sha256=sha)
                         _bump_hit(sources)
                         disp.finish_file(
                             "perceptual", f"{'+'.join(sources)}  ({len(tags)} tags)")
@@ -2561,9 +2641,10 @@ class TagIntegrator:
 
                     tags, urls, sources = self.hash_tier(item, disp, ex)
                     if tags or urls:
-                        self.write_results(item.path, tags, urls)
+                        sha = self.write_results(item.path, tags, urls)
                         item.ledger.record(item.path.name, item.size, item.mtime,
-                                            item.md5, "matched", sources)
+                                            item.md5, "matched", sources,
+                                            sha256=sha)
                         _bump_hit(sources)
                         disp.finish_file("hash", f"{'+'.join(sources)}  ({len(tags)} tags)")
                     elif item.kind == "image":
@@ -2698,6 +2779,12 @@ def _nuke_candidates(root: Path) -> Tuple[List[Path], List[Path]]:
     return ledgers, sidecars
 
 
+def _pdf_page_pattern(pdf: Path, include_txt: bool = False) -> "re.Pattern":
+    """Regex matching this PDF's rendered page files (optionally their sidecars)."""
+    suffix = r"(?:\.txt)?" if include_txt else ""
+    return re.compile(rf"^{re.escape(pdf.stem)} PAGE\d+\.PNG{suffix}$", re.I)
+
+
 def _pdf_render_candidates(root: Path) -> Tuple[List[Path], Set[Path]]:
     """Find only PNG pages whose names exactly match a sibling source PDF."""
     pages: List[Path] = []
@@ -2712,7 +2799,7 @@ def _pdf_render_candidates(root: Path) -> Tuple[List[Path], Set[Path]]:
         out_dir = pdf.parent / pdf.stem
         if not out_dir.is_dir():
             continue
-        pattern = re.compile(rf"^{re.escape(pdf.stem)} PAGE\d+\.PNG$", re.I)
+        pattern = _pdf_page_pattern(pdf)
         try:
             matches = [p for p in out_dir.iterdir()
                        if p.is_file() and pattern.match(p.name)]
@@ -2793,6 +2880,43 @@ def _prompt_for_nuke() -> Optional[Path]:
         print(f"⚠️  {failed} file(s) could not be removed and may still be skipped.")
     print("🔄 Starting a fresh scan of that folder…\n")
     return root
+
+
+def prompt_for_already_tagged() -> Optional[int]:
+    """Ask whether to build the Already Tagged review page, and how large.
+
+    Returns None to skip the page, 0 for every matched file, or N (>0) for the
+    N most recently tagged. A non-interactive stdin skips the prompt and builds
+    the full page (preserving the previous always-on behavior).
+    """
+    if not sys.stdin.isatty():
+        return 0
+    try:
+        ans = input(
+            "\n👀 Build an 'Already Tagged' page in Hydrus from files skipped "
+            "this run? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if ans not in {"y", "yes"}:
+        return None
+    while True:
+        try:
+            howmany = input(
+                "   How many? ('all', or a number = most recently tagged) "
+                "[all]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if howmany in {"", "all", "a"}:
+            return 0
+        try:
+            n = int(howmany.replace(",", ""))
+        except ValueError:
+            print("   Please enter a whole number or 'all'.")
+            continue
+        if n <= 0:
+            print("   Enter a positive number, or 'all'.")
+            continue
+        return n
 
 
 def prompt_for_folder() -> Path:
