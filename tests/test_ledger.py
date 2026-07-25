@@ -102,6 +102,47 @@ class TestReviewQueue(unittest.TestCase):
             self.assertEqual(len(rq2), 0)
 
 
+class TestLedgerSha256(unittest.TestCase):
+    """A cached Hydrus SHA-256 must survive a later record() that has no hash
+    of its own (sidecar-only mode / unmatched with importing off), but must
+    never be inherited by a file whose bytes changed."""
+
+    def test_sha256_preserved_when_record_passes_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            led = Ledger(Path(td))
+            led.record("a.jpg", 100, 1.0, "md5a", "matched", ["e621"])
+            led.cache_sha256("a.jpg", 100, 1.0, "sha-aaa")
+            self.assertEqual(led.sha256_for("a.jpg", 100, 1.0), "sha-aaa")
+            # Same file recorded again with no fresh hash (write_results → None)
+            led.record("a.jpg", 100, 1.0, "md5a", "matched", ["e621", "danbooru"])
+            self.assertEqual(led.sha256_for("a.jpg", 100, 1.0), "sha-aaa")
+            self.assertEqual(led.records["a.jpg"]["sha256"], "sha-aaa")
+
+    def test_fresh_sha256_still_wins(self):
+        with tempfile.TemporaryDirectory() as td:
+            led = Ledger(Path(td))
+            led.record("a.jpg", 100, 1.0, "md5a", "matched", [], sha256="sha-old")
+            led.record("a.jpg", 100, 1.0, "md5a", "matched", [], sha256="sha-new")
+            self.assertEqual(led.records["a.jpg"]["sha256"], "sha-new")
+
+    def test_sha256_dropped_when_size_changed(self):
+        with tempfile.TemporaryDirectory() as td:
+            led = Ledger(Path(td))
+            led.record("a.jpg", 100, 1.0, "md5a", "matched", [], sha256="sha-aaa")
+            # File was replaced: different size → the old hash describes other bytes
+            led.record("a.jpg", 250, 1.0, "md5b", "nomatch", [])
+            self.assertNotIn("sha256", led.records["a.jpg"])
+            self.assertIsNone(led.sha256_for("a.jpg", 250, 1.0))
+
+    def test_sha256_dropped_when_mtime_changed(self):
+        with tempfile.TemporaryDirectory() as td:
+            led = Ledger(Path(td))
+            led.record("a.jpg", 100, 1.0, "md5a", "matched", [], sha256="sha-aaa")
+            led.record("a.jpg", 100, 99.0, "md5b", "nomatch", [])
+            self.assertNotIn("sha256", led.records["a.jpg"])
+            self.assertIsNone(led.sha256_for("a.jpg", 100, 99.0))
+
+
 class TestDedup(unittest.TestCase):
     def test_exact_dedup(self):
         with tempfile.TemporaryDirectory() as td:

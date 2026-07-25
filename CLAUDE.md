@@ -25,7 +25,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ### Terminal display
 
-`LiveDisplay` renders an in-place panel (previous / current / next file, a **phase label**, and a bottom progress bar with elapsed/ETA). The current line carries a live sub-status: during the hash tier it shows each site ticking off (`hash ▸ e621 ✓  ib ·  dan ✓  gel …` — ✓ hit, ✗/· miss, … in-flight); during perceptual it names the engine and any enrichment step. It is **thread-safe** (a lock guards every write) because the hash tier renders from a worker pool. All warnings/errors go through the module-level **`notify()`** (not `print`), which routes them *above* the live panel via `_display.log()`. When stdout isn't a TTY it degrades to one line per file. **Use `notify()` for any user-facing status message inside the processing loop** — a raw `print` would corrupt the panel.
+`LiveDisplay` renders an in-place panel (previous / current / next file, a **phase label**, and a bottom progress bar with elapsed/ETA). The current line carries a live sub-status: during the hash tier it shows each site ticking off (`hash ▸ e621 ✓  ib ·  dan ✓  gel …` — ✓ hit, ✗/· miss, … in-flight); during perceptual it names the engine and any enrichment step. It is **thread-safe** (a lock guards every write) because the hash tier renders from a worker pool. All warnings/errors go through the module-level **`notify()`** (not `print`), which emits an `issue` event to the active observer. The engine itself never calls a `LiveDisplay` method: every progress point is a `RunEvent` on the run's single observer, and `TerminalObserver` is what drives the panel (a GUI installs `QtObserver` instead). `notify()` emits an `issue` event to the **active observer** (`furtag.set_active_observer()`), so the same call sites feed the CLI panel's rolling **Recent issues** history and the GUI's issue pane. When stdout isn't a TTY it degrades to one line per file. **Use `notify()` for any user-facing status message inside the processing loop** — a raw `print` would corrupt the panel.
 
 ## Output
 
@@ -54,11 +54,15 @@ hydrus_api_url       hydrus_access_key
 hydrus_tag_service   (= "downloader tags" by default)
 hydrus_import        (true/false, default true)
 hydrus_also_sidecars (true/false, default false)
-hydrus_results_page       (name/on/off, default on — master toggle for the two result pages below)
+hydrus_results_page       (name/on/off, default on — master toggle for the result pages below)
 hydrus_new_imports_page   (= "FurTag New Imports" — brand-new imports this run)
 hydrus_newly_tagged_page  (= "FurTag Newly Tagged" — files already in Hydrus, newly tagged)
+hydrus_duplicate_tagged_page (= "FurTag Duplicate Tagged" — current duplicate-group members
+                           tagged on behalf of a previously-deleted file)
 hydrus_already_tagged_page(= "Already Tagged" — ledger-history review page; false disables)
 ```
+
+**Non-secret keys only apply on the explicit `load_credentials(creds=<path>)` path.** The preferred keyring/store path (`load_credentials_from_store()`, which the GUI uses) merges **only** the secret/identity fields in `furtag_credentials.ALL_FIELDS` from a legacy `credentials.txt`; every non-secret preference above (`hydrus_import`, `hydrus_tag_service`, the page names, `hydrus_results_page`, …) then comes from `Settings`, and ignored keys are reported once at startup. This is deliberate: a stale `credentials.txt` used to silently override what the user had just set in the Settings tab.
 
 For InkBunny, enable API access **and** adult ratings in account settings, or explicit results stay hidden. `load_credentials()` reads the file once into a dict and the `_init_<source>` helpers each pull their keys. `_init_hydrus()` verifies the access key and resolves the tag service name → `service_key`; on failure FurTag keeps writing sidecars.
 
@@ -69,9 +73,11 @@ When `has_hydrus` is true, `write_results()` calls `_hydrus_push()` instead of (
 1. `POST /add_files/add_file` with `{path}` when `hydrus_import` (status 1/2 → hash)
 2. `POST /add_tags/add_tags` with `service_keys_to_tags` and `override_previously_deleted_mappings: false` (downloader-like)
 3. `POST /add_urls/associate_url` with `urls_to_add` — **only when the access key holds Hydrus permission 0 ("Import and Edit URLs")**, checked once at startup (`hydrus_can_edit_urls`) and warned about if missing. A URL-association failure is caught and warned per file; it never aborts the tag push, the results-page add, or hash caching.
-4. `_hydrus_add_to_page(kind, hash)` files it onto one of two review pages by **import status**: status 1 (brand-new import) → **New Imports** page, status 2 / tag-only mode (already in Hydrus, just tagged) → **Newly Tagged** page. Pages are created lazily on first file, cached by page key in `self.hydrus_result_pages`, and any per-page failure disables just that page for the run.
+4. `_hydrus_add_to_page(kind, hash)` files it onto one of **three** review pages: status 1 (brand-new import) → **New Imports**, status 2 / tag-only mode (already in Hydrus, just tagged) → **Newly Tagged**, and a current duplicate-group member tagged for a known-deleted file (status 3, via `_hydrus_push_to_deleted_duplicates()`) → **Duplicate Tagged**. Each entry is a rolling newest-N list in `self.hydrus_result_pages` (`hydrus_results_page_limit`); `_hydrus_flush_result_pages()` creates every non-empty page once at end of run through the shared `_hydrus_create_hash_page()`, and any per-page failure disables just that page for the run. All three obey the `hydrus_results_page` master toggle and the Manage Pages permission check.
 
-Pushes are serialised with `_hydrus_lock` because the hash tier and perceptual worker can both call `write_results`. PDF pages still get `comic:`/`page:` via `_pdf_page_base_tags()` even when convert sidecars are skipped.
+A duplicate-group member is added **only after its `add_tags` call succeeded** — a member whose tag push failed aborts the loop and never appears on the page. *Local* byte-identical duplicates (`_propagate_duplicate_results()`) are a different notion of duplicate: those copies share one Hydrus hash record, so they are not added here (that would only re-add the canonical hash).
+
+Pushes are serialised with `_hydrus_lock` because the hash tier and perceptual worker can both call `write_results`. `_hydrus_add_to_page()` is a plain list mutation performed while that lock is already held; only `_hydrus_create_hash_page()` (called from the end-of-run flush, outside the push path) takes the lock itself. PDF pages still get `comic:`/`page:` via `_pdf_page_base_tags()` even when convert sidecars are skipped.
 
 ### Already Tagged review page
 

@@ -41,6 +41,29 @@ class TestSidecarPatterns(unittest.TestCase):
         with self.assertRaises(SidecarPatternError):
             validate_sidecar_pattern("")
 
+    def test_unknown_placeholder_rejected(self):
+        with self.assertRaises(SidecarPatternError):
+            validate_sidecar_pattern("{name}{ext}.{foo}.txt")
+
+    def test_bad_patterns_fall_back_on_load(self):
+        """CLI never calls the preflight, so load() itself must sanitize."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "settings.json"
+            path.write_text(json.dumps({"output": {
+                "sidecar_tag_filename": "{name}{ext}.{foo}",
+                "sidecar_url_filename": "../{name}{ext}.urls.txt",
+                "sidecar_json_filename": "",
+            }}), encoding="utf-8")
+            s = SettingsStore(path).load()
+            self.assertEqual(s.output.sidecar_tag_filename, "{name}{ext}.txt")
+            self.assertEqual(s.output.sidecar_url_filename,
+                             "{name}{ext}.urls.txt")
+            self.assertEqual(s.output.sidecar_json_filename, "{name}{ext}.json")
+            # And rendering with the sanitized pattern cannot raise/escape.
+            self.assertEqual(
+                render_sidecar_name(s.output.sidecar_tag_filename,
+                                    Path("/tmp/cat.jpg")), "cat.jpg.txt")
+
     def test_render(self):
         p = Path("/tmp/cat.jpg")
         self.assertEqual(
@@ -62,6 +85,8 @@ class TestSettingsStore(unittest.TestCase):
         self.assertFalse(s.output.sidecars_enabled)
         self.assertTrue(s.output.hydrus_enabled)
         self.assertEqual(s.output.sidecar_format, "txt")
+        self.assertEqual(s.hydrus.duplicate_tagged_page_name,
+                         "FurTag Duplicate Tagged")
 
     def test_roundtrip(self):
         with tempfile.TemporaryDirectory() as td:
@@ -70,10 +95,13 @@ class TestSettingsStore(unittest.TestCase):
             s = Settings()
             s.matching.saucenao_min_similarity = 75.0
             s.sources.e621_enabled = False
+            s.hydrus.duplicate_tagged_page_name = "Dupe Review"
             store.save(s)
             loaded = store.load()
             self.assertEqual(loaded.matching.saucenao_min_similarity, 75.0)
             self.assertFalse(loaded.sources.e621_enabled)
+            self.assertEqual(loaded.hydrus.duplicate_tagged_page_name,
+                             "Dupe Review")
 
     def test_forward_compat_unknown_keys(self):
         with tempfile.TemporaryDirectory() as td:

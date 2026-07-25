@@ -263,7 +263,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ### Terminal display
 
-`LiveDisplay` renders an in-place panel (previous / current / next file, a **phase label**, and a bottom progress bar with elapsed/ETA). The current line carries a live sub-status: during the hash tier it shows each site ticking off (`hash ▸ e621 ✓  ib ·  dan ✓  gel …` — ✓ hit, ✗/· miss, … in-flight); during perceptual it names the engine and any enrichment step. It is **thread-safe** (a lock guards every write) because the hash tier renders from a worker pool. All warnings/errors go through the module-level **`notify()`** (not `print`), which routes them into a three-item rolling **Recent issues** history inside the live panel; redirected/non-TTY output still retains every issue as a normal line. When stdout isn't a TTY it degrades to one line per file. **Use `notify()` for any user-facing status message inside the processing loop** — a raw `print` would corrupt the panel.
+`LiveDisplay` renders an in-place panel (previous / current / next file, a **phase label**, and a bottom progress bar with elapsed/ETA). The current line carries a live sub-status: during the hash tier it shows each site ticking off (`hash ▸ e621 ✓  ib ·  dan ✓  gel …` — ✓ hit, ✗/· miss, … in-flight); during perceptual it names the engine and any enrichment step. It is **thread-safe** (a lock guards every write) because the hash tier renders from a worker pool. All warnings/errors go through the module-level **`notify()`** (not `print`), which routes them into a three-item rolling **Recent issues** history inside the live panel; redirected/non-TTY output still retains every issue as a normal line. The engine itself never calls a `LiveDisplay` method: every progress point is a `RunEvent` on the run's single observer, and `TerminalObserver` is what drives the panel (a GUI installs `QtObserver` instead). `notify()` emits an `issue` event to the **active observer** (`furtag.set_active_observer()`), so the same call sites feed the CLI panel's rolling **Recent issues** history and the GUI's issue pane. When stdout isn't a TTY it degrades to one line per file. **Use `notify()` for any user-facing status message inside the processing loop** — a raw `print` would corrupt the panel.
 
 ## Output
 
@@ -292,9 +292,15 @@ hydrus_api_url       hydrus_access_key
 hydrus_tag_service   (= "downloader tags" by default)
 hydrus_import        (true/false, default true)
 hydrus_also_sidecars (true/false, default false)
-hydrus_results_page  (page name, default "FurTag Results"; false disables)
-hydrus_already_tagged_page (page name, default "Already Tagged"; false disables)
+hydrus_results_page  (name/on/off, default on — master toggle for the result pages below)
+hydrus_new_imports_page      (= "FurTag New Imports" — brand-new imports this run)
+hydrus_newly_tagged_page     (= "FurTag Newly Tagged" — already in Hydrus, newly tagged)
+hydrus_duplicate_tagged_page (= "FurTag Duplicate Tagged" — current duplicate-group
+                              members tagged for a previously-deleted file)
+hydrus_already_tagged_page   (= "Already Tagged" — ledger-history review page; false disables)
 ```
+
+**Non-secret keys only apply on the explicit `load_credentials(creds=<path>)` path.** The preferred keyring/store path (`load_credentials_from_store()`, which the GUI uses) merges **only** the secret/identity fields in `furtag_credentials.ALL_FIELDS` from a legacy `credentials.txt`; every non-secret preference above (`hydrus_import`, `hydrus_tag_service`, the page names, `hydrus_results_page`, …) then comes from `Settings`, and ignored keys are reported once at startup. This is deliberate: a stale `credentials.txt` used to silently override what the user had just set in the Settings tab.
 
 For InkBunny, enable API access **and** adult ratings in account settings, or explicit results stay hidden. `load_credentials()` reads the file once into a dict and the `_init_<source>` helpers each pull their keys. `_init_hydrus()` verifies the access key and resolves the tag service name → `service_key`; on failure FurTag keeps writing sidecars.
 
@@ -305,7 +311,7 @@ When `has_hydrus` is true, `write_results()` calls `_hydrus_push()` instead of (
 1. `POST /add_files/add_file` with `{path}` when `hydrus_import` (status 1/2 → hash)
 2. `POST /add_tags/add_tags` with `service_keys_to_tags` and `override_previously_deleted_mappings: false` (downloader-like)
 3. `POST /add_urls/associate_url` with `urls_to_add`
-4. Silently create an unfocused hash-locked results page, then append each accepted hash via `/manage_pages/add_files`
+4. `_hydrus_add_to_page(kind, hash)` records the hash on one of three rolling newest-N lists in `self.hydrus_result_pages` — `new` (import status 1), `updated` (status 2 / tag-only), `duplicates` (a current duplicate-group member tagged by `_hydrus_push_to_deleted_duplicates()` for a known-deleted file, added only after its `add_tags` succeeded). At end of run `_hydrus_flush_result_pages()` builds each non-empty page once through the shared `_hydrus_create_hash_page()` (unfocused, `system_hash_locked`, filled in `HYDRUS_PAGE_BATCH` chunks). All three share the `hydrus_results_page` master toggle and the Manage Pages permission check; a per-page failure disables just that page.
 
 The interactive `hydrus_import_unmatched` run choice calls `write_unmatched()` for final perceptual misses and hash-only video misses. It also imports unchanged prior `nomatch` records lacking cached SHA-256, then caches Hydrus's returned hash so subsequent runs do not repeat the import.
 

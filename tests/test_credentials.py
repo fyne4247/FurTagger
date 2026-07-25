@@ -45,6 +45,51 @@ class TestEnvCredentials(unittest.TestCase):
             redact_secrets(text, ["supersecretkey123"]))
 
 
+class TestLegacyPlaintextMerge(unittest.TestCase):
+    """A leftover credentials.txt may still supply secrets, but must never
+    override non-secret preferences the user set in Settings."""
+
+    def _load(self, legacy_text: str, tag_service: str = "my gui tags"):
+        from furtag import TagIntegrator
+        from furtag_settings import Settings
+
+        with tempfile.TemporaryDirectory() as td:
+            legacy = Path(td) / "credentials.txt"
+            legacy.write_text(legacy_text, encoding="utf-8")
+            s = Settings()
+            s.output.hydrus_enabled = True
+            s.output.hydrus_tag_service = tag_service
+            ti = TagIntegrator(settings=s)
+            seen = {}
+            with patch.object(TagIntegrator, "_init_hydrus",
+                              lambda self, cfg: seen.update(cfg)), \
+                 patch.dict(os.environ, {}, clear=True):
+                ti.load_credentials_from_store(
+                    store=CredentialStore(service="org.furtag.FurTag.test.none"),
+                    legacy_path=legacy)
+            return seen
+
+    def test_non_secret_key_does_not_override_settings(self):
+        cfg = self._load(
+            "hydrus_tag_service = stale file tags\n"
+            "hydrus_import = false\n"
+            "hydrus_results_page = off\n")
+        self.assertEqual(cfg.get("hydrus_tag_service"), "my gui tags")
+        self.assertEqual(cfg.get("hydrus_import"), "true")
+        self.assertEqual(cfg.get("hydrus_results_page"), "on")
+
+    def test_secret_key_still_picked_up(self):
+        cfg = self._load(
+            "hydrus_access_key = deadbeef\n"
+            "hydrus_api_url = http://127.0.0.1:45869\n"
+            "e621_api_key = legacy-secret\n"
+            "hydrus_tag_service = stale file tags\n")
+        self.assertEqual(cfg.get("hydrus_access_key"), "deadbeef")
+        self.assertEqual(cfg.get("hydrus_api_url"), "http://127.0.0.1:45869")
+        self.assertEqual(cfg.get("e621_api_key"), "legacy-secret")
+        self.assertEqual(cfg.get("hydrus_tag_service"), "my gui tags")
+
+
 class TestFieldMap(unittest.TestCase):
     def test_all_env_names(self):
         for field, (env, _) in FIELD_MAP.items():

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -79,6 +80,8 @@ class HydrusSettings:
     results_pages_enabled: bool = True
     new_imports_page_name: str = "FurTag New Imports"
     newly_tagged_page_name: str = "FurTag Newly Tagged"
+    # Current duplicate-group members tagged on behalf of a deleted file.
+    duplicate_tagged_page_name: str = "FurTag Duplicate Tagged"
     already_tagged_page_name: str = "Already Tagged"
     build_already_tagged_page: bool = False
     result_page_limit: int = 0  # 0 = unlimited
@@ -193,6 +196,16 @@ def _normalize_settings(s: Settings) -> None:
         m.fluffle_review_mode = "off"
     fmt = (s.output.sidecar_format or "txt").lower()
     s.output.sidecar_format = "json" if fmt == "json" else "txt"
+    # Sidecar name patterns are user-editable text that later feeds str.format
+    # and a filesystem path, so normalize them here — the single place every
+    # consumer (CLI included, not just the GUI's preflight) passes through.
+    s.output.sidecar_tag_filename = safe_sidecar_pattern(
+        s.output.sidecar_tag_filename, DEFAULT_TAG_PATTERN, label="tag sidecar")
+    s.output.sidecar_url_filename = safe_sidecar_pattern(
+        s.output.sidecar_url_filename, DEFAULT_URL_PATTERN, label="URL sidecar")
+    s.output.sidecar_json_filename = safe_sidecar_pattern(
+        s.output.sidecar_json_filename, DEFAULT_JSON_PATTERN,
+        for_json=True, label="JSON sidecar")
     try:
         s.pdf.pdf_dpi = max(72, min(2400, int(s.pdf.pdf_dpi)))
     except (TypeError, ValueError):
@@ -234,7 +247,10 @@ class RunOptions:
             result_page_limit=settings.hydrus.result_page_limit,
             build_already_tagged_page=settings.hydrus.build_already_tagged_page,
             sync_sidecars=False,
-            pdf_dpi=settings.pdf.pdf_dpi,
+            # pdf_dpi deliberately left None: the engine resolves it (settings →
+            # interactive prompt). Pinning it here would make the CLI's DPI
+            # question unreachable. Callers that must never block on input()
+            # (the GUI) set it explicitly.
         )
 
 
@@ -270,8 +286,11 @@ def validate_sidecar_pattern(pattern: str, *, for_json: bool = False) -> str:
     - Must be non-empty
     - No path separators
     - Must contain ``{ext}`` (avoids cat.jpg / cat.png collision)
+    - Only ``{name}`` / ``{ext}`` placeholders (anything else would blow up
+      ``str.format`` deep inside the write path)
     - Must not resolve to the media file itself (must have extra suffix beyond
       ``{name}{ext}``)
+    - Must not walk out of the media directory (``..``)
     """
     if not pattern or not str(pattern).strip():
         raise SidecarPatternError("Sidecar filename pattern cannot be empty.")
@@ -284,7 +303,17 @@ def validate_sidecar_pattern(pattern: str, *, for_json: bool = False) -> str:
             "Sidecar filename pattern must contain {ext} so files that share a "
             "stem but differ by extension (cat.jpg / cat.png) do not collide.")
     # Reject patterns that equal the media file name itself.
-    resolved = pattern.format(name="file", ext=".jpg")
+    try:
+        resolved = pattern.format(name="file", ext=".jpg")
+    except (KeyError, IndexError, ValueError) as e:
+        raise SidecarPatternError(
+            "Sidecar filename pattern may only use the {name} and {ext} "
+            f"placeholders ({e}).") from e
+    if _PATH_SEP_RE.search(resolved) or resolved in {".", ".."} or \
+            resolved.startswith("..") or resolved.endswith(".."):
+        raise SidecarPatternError(
+            "Sidecar filename pattern must stay inside the media folder "
+            "(no '..' or path separators).")
     if resolved == "file.jpg":
         raise SidecarPatternError(
             "Sidecar filename pattern must not resolve to the media file itself.")
@@ -297,6 +326,22 @@ def validate_sidecar_pattern(pattern: str, *, for_json: bool = False) -> str:
 def render_sidecar_name(pattern: str, media: Path) -> str:
     """Render a sidecar filename for *media* from a validated pattern."""
     return pattern.format(name=media.stem, ext=media.suffix)
+
+
+def safe_sidecar_pattern(pattern: Any, default: str, *,
+                         for_json: bool = False, label: str = "sidecar") -> str:
+    """Validated pattern, or *default* with a warning — never raises.
+
+    Settings can be hand-edited, so an invalid pattern must degrade to the
+    documented default instead of raising ``KeyError`` deep in the write path
+    (or escaping the media folder via ``../``).
+    """
+    try:
+        return validate_sidecar_pattern(pattern, for_json=for_json)
+    except SidecarPatternError as e:
+        print(f"⚠️  Invalid {label} filename pattern {pattern!r}: {e} "
+              f"Using default {default!r}.", file=sys.stderr)
+        return default
 
 
 def resolve_settings_path(explicit: Optional[Path] = None) -> Path:

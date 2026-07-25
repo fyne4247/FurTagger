@@ -89,7 +89,7 @@ def _wrap_scroll(widget: QWidget) -> QScrollArea:
 from furtag import (
     TagIntegrator, prompt_for_pdf_dpi, _nuke_candidates, _pdf_render_candidates,
     _is_furtag_sidecar, LEDGER_FILE, DUPLICATES_FILE,
-    is_filesystem_root, perform_nuke,
+    is_filesystem_root, perform_nuke, set_active_observer,
 )
 from furtag_settings import (
     Settings, SettingsStore, RunOptions, ScanSummary, validate_run_preflight,
@@ -244,8 +244,11 @@ class CredentialsDialog(QDialog):
 # ── Reset dialog ─────────────────────────────────────────────────────────────
 
 class ResetDialog(QDialog):
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, settings: Optional[Settings] = None) -> None:
         super().__init__(parent)
+        # Sidecar name patterns decide which .json files count as FurTag's, so
+        # the dialog's preview and its delete must use the live settings.
+        self.settings = settings
         self.setWindowTitle("Reset folder (NUKE!)")
         self.root: Optional[Path] = None
         layout = QVBoxLayout(self)
@@ -291,7 +294,7 @@ class ResetDialog(QDialog):
         if is_filesystem_root(p):
             self.preview.setText("Refusing filesystem root.")
             return
-        ledgers, sidecars = _nuke_candidates(p)
+        ledgers, sidecars = _nuke_candidates(p, self.settings)
         pages, _ = _pdf_render_candidates(p)
         self.preview.setText(
             f"Would remove:\n"
@@ -326,7 +329,8 @@ class ResetDialog(QDialog):
         if self.root is None:
             return 0, []
         return perform_nuke(
-            self.root, include_pdf_pages=self.include_pdf_pages.isChecked())
+            self.root, include_pdf_pages=self.include_pdf_pages.isChecked(),
+            settings=self.settings)
 
 
 # ── Review dialog ────────────────────────────────────────────────────────────
@@ -486,6 +490,7 @@ class SettingsPanel(QWidget):
         self.results_pages = QCheckBox("Enable result pages")
         self.new_imports_name = QLineEdit()
         self.newly_tagged_name = QLineEdit()
+        self.duplicate_tagged_name = QLineEdit()
         self.already_tagged_name = QLineEdit()
         self.build_already = QCheckBox("Build Already Tagged page")
         self.page_limit = QSpinBox()
@@ -494,6 +499,7 @@ class SettingsPanel(QWidget):
         hf.addRow(self.results_pages)
         hf.addRow("New Imports name", self.new_imports_name)
         hf.addRow("Newly Tagged name", self.newly_tagged_name)
+        hf.addRow("Duplicate Tagged name", self.duplicate_tagged_name)
         hf.addRow("Already Tagged name", self.already_tagged_name)
         hf.addRow(self.build_already)
         hf.addRow("Page limit (0=all)", self.page_limit)
@@ -599,6 +605,7 @@ class SettingsPanel(QWidget):
         self.results_pages.setChecked(h.results_pages_enabled)
         self.new_imports_name.setText(h.new_imports_page_name)
         self.newly_tagged_name.setText(h.newly_tagged_page_name)
+        self.duplicate_tagged_name.setText(h.duplicate_tagged_page_name)
         self.already_tagged_name.setText(h.already_tagged_page_name)
         self.build_already.setChecked(h.build_already_tagged_page)
         self.page_limit.setValue(h.result_page_limit)
@@ -634,6 +641,7 @@ class SettingsPanel(QWidget):
         s.hydrus.results_pages_enabled = self.results_pages.isChecked()
         s.hydrus.new_imports_page_name = self.new_imports_name.text().strip()
         s.hydrus.newly_tagged_page_name = self.newly_tagged_name.text().strip()
+        s.hydrus.duplicate_tagged_page_name = self.duplicate_tagged_name.text().strip()
         s.hydrus.already_tagged_page_name = self.already_tagged_name.text().strip()
         s.hydrus.build_already_tagged_page = self.build_already.isChecked()
         s.hydrus.result_page_limit = self.page_limit.value()
@@ -708,7 +716,6 @@ class MainWindow(QMainWindow):
         self.settings = self.settings_store.load()
         self.cred_store = CredentialStore()
         self.integrator = TagIntegrator(settings=self.settings)
-        self.integrator.load_credentials_from_store(self.cred_store)
 
         self.folder: Optional[Path] = None
         self.inventory: Optional[dict] = None
@@ -725,6 +732,13 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         _fit_window_to_screen(self, prefer_w=900, prefer_h=640)
+        # Route engine warnings (notify()) into the issue pane for the whole
+        # session, not just during a scan — credential / Hydrus problems are
+        # reported while loading credentials, well before any run starts. The
+        # UI must exist first, since the bridge delivers in-thread signals
+        # synchronously when emitted from the GUI thread.
+        set_active_observer(QtObserver(self.bridge))
+        self.integrator.load_credentials_from_store(self.cred_store)
         self._refresh_source_status()
 
     def _build_ui(self) -> None:
@@ -1039,7 +1053,7 @@ class MainWindow(QMainWindow):
                 elapsed = time.monotonic() - card["start"]
                 card["eta"].setText(f"elapsed {int(elapsed)}s · {card['done']}/{card['total']}")
         elif event.kind == "grow":
-            card["total"] = card["total"] + 1
+            card["total"] = card["total"] + int(event.extra.get("by") or 1)
             card["bar"].setRange(0, max(1, card["total"]))
         elif event.kind == "freeze_total":
             pass
@@ -1115,7 +1129,7 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.folder)))
 
     def _reset(self) -> None:
-        dlg = ResetDialog(self)
+        dlg = ResetDialog(self, settings=self.settings)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             n, failures = dlg.perform_reset()
             msg = f"Removed {n} file(s)."
