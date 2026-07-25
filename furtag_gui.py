@@ -12,7 +12,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Ensure project root is importable when launched as a script.
 _ROOT = Path(__file__).resolve().parent
@@ -89,6 +89,7 @@ def _wrap_scroll(widget: QWidget) -> QScrollArea:
 from furtag import (
     TagIntegrator, prompt_for_pdf_dpi, _nuke_candidates, _pdf_render_candidates,
     _is_furtag_sidecar, LEDGER_FILE, DUPLICATES_FILE,
+    is_filesystem_root, perform_nuke,
 )
 from furtag_settings import (
     Settings, SettingsStore, RunOptions, ScanSummary, validate_run_preflight,
@@ -269,7 +270,13 @@ class ResetDialog(QDialog):
         buttons.accepted.connect(self._confirm)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        self.path_edit.textChanged.connect(self._update_preview)
+        # Scanning the tree costs a full os.walk, so coalesce keystrokes
+        # instead of walking once per typed character.
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(300)
+        self._preview_timer.timeout.connect(self._update_preview)
+        self.path_edit.textChanged.connect(self._preview_timer.start)
 
     def _browse(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Folder to reset")
@@ -281,7 +288,7 @@ class ResetDialog(QDialog):
         if not p.is_dir():
             self.preview.setText("Not a valid directory.")
             return
-        if p.resolve() == p.resolve().anchor or str(p.resolve()) in ("/", "C:\\"):
+        if is_filesystem_root(p):
             self.preview.setText("Refusing filesystem root.")
             return
         ledgers, sidecars = _nuke_candidates(p)
@@ -297,7 +304,7 @@ class ResetDialog(QDialog):
         if not p.is_dir():
             QMessageBox.warning(self, "Reset", "Not a valid directory.")
             return
-        if str(p) in ("/", "C:\\") or p == p.anchor:
+        if is_filesystem_root(p):
             QMessageBox.warning(self, "Reset", "Refusing filesystem root.")
             return
         # Two confirmations, second typed
@@ -314,31 +321,12 @@ class ResetDialog(QDialog):
         self.root = p
         self.accept()
 
-    def perform_reset(self) -> int:
+    def perform_reset(self) -> Tuple[int, List[Tuple[Path, OSError]]]:
+        """Delete via the engine's shared nuke, so CLI and GUI stay identical."""
         if self.root is None:
-            return 0
-        root = self.root
-        ledgers, sidecars = _nuke_candidates(root)
-        targets = list(ledgers) + list(sidecars)
-        if self.include_pdf_pages.isChecked():
-            pages, page_dirs = _pdf_render_candidates(root)
-            targets.extend(pages)
-        else:
-            page_dirs = set()
-        removed = 0
-        for path in targets:
-            try:
-                path.unlink()
-                removed += 1
-            except OSError:
-                pass
-        for d in page_dirs:
-            try:
-                if d.is_dir() and not any(d.iterdir()):
-                    d.rmdir()
-            except OSError:
-                pass
-        return removed
+            return 0, []
+        return perform_nuke(
+            self.root, include_pdf_pages=self.include_pdf_pages.isChecked())
 
 
 # ── Review dialog ────────────────────────────────────────────────────────────
@@ -736,6 +724,7 @@ class MainWindow(QMainWindow):
         self.bridge.failed.connect(self._on_failed)
         self.bridge.inventory_ready.connect(self._on_inventory)
         self._closing = False
+        self._review_count = 0
 
         self._build_ui()
         _fit_window_to_screen(self, prefer_w=900, prefer_h=640)
@@ -845,6 +834,8 @@ class MainWindow(QMainWindow):
         lw.addWidget(QLabel("Run log"))
         self.log = QTextEdit()
         self.log.setReadOnly(True)
+        # Bound the document so a long scan can't grow it without limit.
+        self.log.document().setMaximumBlockCount(2000)
         self.log.setMinimumHeight(40)
         self.log.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -921,6 +912,7 @@ class MainWindow(QMainWindow):
     def _set_folder(self, path: str) -> None:
         self.folder = Path(path).expanduser().resolve()
         self.drop.setText(str(self.folder))
+        self._refresh_review_badge()
         self.inventory_label.setText("Indexing…")
         self.start_btn.setEnabled(False)
         # Honor current Settings-tab toggles (e.g. PDF off) during discovery.
@@ -1055,11 +1047,12 @@ class MainWindow(QMainWindow):
             card["bar"].setRange(0, max(1, card["total"]))
         elif event.kind == "freeze_total":
             pass
-        # Update review badge from queue file
-        if self.folder:
-            rq = ReviewQueue(self.folder)
-            rq.load()
-            self.review_badge.setText(f"Needs review — {len(rq)}")
+        # The engine already tells us when a file was queued for review, so
+        # count from the event stream rather than re-reading the queue file
+        # on the UI thread for every progress tick.
+        if event.extra.get("pending_review"):
+            self._review_count += 1
+            self._set_review_badge(self._review_count)
 
     @Slot(object)
     def _on_finished(self, summary: ScanSummary) -> None:
@@ -1069,7 +1062,9 @@ class MainWindow(QMainWindow):
             f"{label}: tagged {summary.tagged} · unmatched {summary.unmatched} · "
             f"duplicates {summary.duplicates} · pending review {summary.pending_review}")
         self._log(self.summary_label.text())
-        self.review_badge.setText(f"Needs review — {summary.pending_review}")
+        # Authoritative count at end of run — reconcile the event-driven tally.
+        self._review_count = summary.pending_review
+        self._set_review_badge(self._review_count)
         if self._closing:
             self.close()
 
@@ -1090,18 +1085,30 @@ class MainWindow(QMainWindow):
     def _log(self, msg: str) -> None:
         self.log.append(msg)
 
+    def _set_review_badge(self, count: int) -> None:
+        self.review_badge.setText(f"Needs review — {count}")
+
+    def _refresh_review_badge(self) -> None:
+        """Re-read the queue file. Only for folder changes and dialog close."""
+        if not self.folder:
+            self._review_count = 0
+        else:
+            rq = ReviewQueue(self.folder)
+            rq.load()
+            self._review_count = len(rq)
+        self._set_review_badge(self._review_count)
+
     def _open_review(self) -> None:
         if not self.folder:
             return
         dlg = ReviewDialog(self.integrator, self.folder, self)
         dlg.exec()
-        rq = ReviewQueue(self.folder)
-        rq.load()
-        self.review_badge.setText(f"Needs review — {len(rq)}")
+        self._refresh_review_badge()
 
     def _scan_another(self) -> None:
         self.folder = None
         self.inventory = None
+        self._refresh_review_badge()
         self.drop.setText("Drop a folder here, or use Browse…")
         self.inventory_label.setText("Choose a folder to scan.")
         self.summary_label.setText("")
@@ -1114,8 +1121,13 @@ class MainWindow(QMainWindow):
     def _reset(self) -> None:
         dlg = ResetDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            n = dlg.perform_reset()
-            QMessageBox.information(self, "Reset", f"Removed {n} file(s).")
+            n, failures = dlg.perform_reset()
+            msg = f"Removed {n} file(s)."
+            if failures:
+                msg += (f"\n\n{len(failures)} file(s) could not be removed and "
+                        "may still be skipped:\n"
+                        + "\n".join(f"· {p}: {e}" for p, e in failures[:10]))
+            QMessageBox.information(self, "Reset", msg)
             if dlg.root:
                 self._set_folder(str(dlg.root))
 

@@ -104,7 +104,7 @@ import time
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import requests
 from PIL import Image, ImageFile
@@ -113,15 +113,11 @@ import regex  # for emoji stripping
 from furtag_settings import (
     DEFAULT_PDF_ARCHIVAL_DPI,
     DEFAULT_PDF_DPI,
-    DEFAULT_SAUCENAO_AUTH_SIMILARITY,
-    DEFAULT_SAUCENAO_MIN_SIMILARITY,
     RunOptions,
     ScanSummary,
     Settings,
     SettingsStore,
-    effective_settings,
     render_sidecar_name,
-    validate_run_preflight,
 )
 from furtag_events import NullObserver, RunEvent, RunObserver, TerminalObserver
 from furtag_review import PendingReview, ReviewQueue
@@ -147,16 +143,10 @@ SAUCENAO_INTERVAL = 6.0   # ~6 requests / 30s short limit (+ daily cap via heade
 # Gelbooru tag "type" → Hydrus namespace prefix ("" = unnamespaced)
 GELBOORU_TYPE = {0: "", 1: "creator:", 3: "series:", 4: "character:", 5: ""}
 
-# Shipped defaults — also defined in furtag_settings. Call sites must read
-# instance settings (TagIntegrator.saucenao_min_similarity etc.) so the GUI can
-# change them at runtime. These module constants remain the shipped defaults.
-MIN_SIMILARITY = DEFAULT_SAUCENAO_MIN_SIMILARITY
-SAUCENAO_AUTH_SIMILARITY = DEFAULT_SAUCENAO_AUTH_SIMILARITY
-
-# Fluffle: always trust "exact". Also accept "tossUp" BUT only when it resolves
-# to e621 — there we re-query the post by ID for the authoritative tag set, so a
-# near-miss stays low-risk. Set False to require exact matches only.
-FLUFFLE_TOSSUP_E621 = True
+# Matching thresholds and the Fluffle tossUp-only-on-e621 rule live in
+# furtag_settings (DEFAULT_SAUCENAO_*, MatchingSettings) and are read per
+# instance (TagIntegrator.saucenao_min_similarity etc.) so the GUI can change
+# them at runtime. There are deliberately no module-level copies here.
 
 IMG_EXTS   = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"}
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv"}
@@ -167,6 +157,11 @@ PDF_ARCHIVAL_DPI = DEFAULT_PDF_ARCHIVAL_DPI
 # Ledger statuses treated as "resolved" for skip / fingerprint sealing.
 # pending_review is intentionally absent — those files stay eligible.
 RESOLVED_LEDGER_STATUSES = frozenset({"matched", "nomatch", "duplicate"})
+
+# Exact-hash (MD5) sources, then every search source. One ordered definition so
+# the toggle lookups and the per-tier service lists can't drift apart.
+HASH_SOURCES = ("e621", "inkbunny", "danbooru", "gelbooru")
+SEARCH_SOURCES = HASH_SOURCES + ("fluffle", "saucenao")
 
 CREDENTIALS_FILE = "credentials.txt"
 LEDGER_FILE      = ".furtag_ledger.json"
@@ -205,6 +200,12 @@ def _truthy(val: str, default: bool = False) -> bool:
         return default
     return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
+
+def _bool_str(val: bool) -> str:
+    """Render a bool in the credentials.txt spelling `_truthy` parses back."""
+    return "true" if val else "false"
+
+
 EMOJI_PATTERN = regex.compile(
     r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF'
     r'\U0001F1E0-\U0001F1FF\U00002700-\U000027BF\U0001F900-\U0001F9FF'
@@ -222,8 +223,14 @@ class Pacer:
     different threads. Different services use different Pacers and never block
     each other."""
 
-    def __init__(self, interval: float) -> None:
+    def __init__(self, interval: float,
+                 cancel: Optional[threading.Event] = None) -> None:
         self.interval = interval
+        # Sleeping on this event instead of time.sleep() makes a paced wait
+        # abort the instant a cancel arrives. SauceNAO paces at 6s and backs
+        # off to 30s+, so an uninterruptible sleep is what made cancelling
+        # look like it hung.
+        self.cancel = cancel
         self._lock = threading.Lock()
         self._next = 0.0
 
@@ -233,7 +240,11 @@ class Pacer:
             slot = self._next if self._next > now else now
             self._next = slot + self.interval
         delay = slot - time.monotonic()
-        if delay > 0:
+        if delay <= 0:
+            return
+        if self.cancel is not None:
+            self.cancel.wait(delay)   # returns early when cancelled
+        else:
             time.sleep(delay)
 
     def backoff(self, seconds: float) -> None:
@@ -690,12 +701,16 @@ def convert_pdf(pdf_path: Path, output_root: Path, dpi: int = PDF_DPI,
                 write_sidecars: bool = True,
                 sidecar_format: str = "txt",
                 tag_pattern: str = "{name}{ext}.txt",
-                json_pattern: str = "{name}{ext}.json") -> List[Path]:
+                json_pattern: str = "{name}{ext}.json",
+                should_cancel: Optional[Callable[[], bool]] = None) -> List[Path]:
     """Render every page of ``pdf_path`` to a PNG under ``output_root/<stem>/``.
 
     Returns the list of PNG paths written. When ``write_sidecars`` is True each
     PNG also gets a ``comic:``/``page:`` base-tag sidecar (txt or json per
     *sidecar_format*) so perceptual tags append to the same file later.
+
+    *should_cancel* is polled between pages so a cancel doesn't have to wait out
+    a whole multi-hundred-page render.
     """
     fitz = _import_fitz()
     stem = pdf_path.stem
@@ -711,6 +726,8 @@ def convert_pdf(pdf_path: Path, output_root: Path, dpi: int = PDF_DPI,
     generated: List[Path] = []
     try:
         for i, page in enumerate(doc, start=1):
+            if should_cancel is not None and should_cancel():
+                break
             base_name = f"{stem} PAGE{i}.PNG"
             png_path = out_dir / base_name
 
@@ -785,24 +802,11 @@ class TagIntegrator:
         self._review_queue: Optional[ReviewQueue] = None
         self._run_lock = threading.Lock()  # one scan at a time
 
-        # Matching thresholds (instance — GUI/settings can change them)
-        m = self.settings.matching
-        self.saucenao_min_similarity = float(m.saucenao_min_similarity)
-        self.saucenao_auth_similarity = float(m.saucenao_auth_similarity)
-        self.fluffle_tossup_e621 = bool(m.fluffle_tossup_e621_only)
-        self.fluffle_accepted_matches = list(m.fluffle_accepted_matches or ["exact"])
-        self.fluffle_review_mode = m.fluffle_review_mode or "off"
-
-        # Per-service pacers (intervals from settings)
-        perf = self.settings.performance
-        self.pace = {
-            "e621":     Pacer(perf.e621_interval),
-            "inkbunny": Pacer(perf.inkbunny_interval),
-            "danbooru": Pacer(perf.danbooru_interval),
-            "gelbooru": Pacer(perf.gelbooru_interval),
-            "fluffle":  Pacer(perf.fluffle_interval),
-            "saucenao": Pacer(perf.saucenao_interval),
-        }
+        # Per-service pacers — intervals are filled in by apply_settings() below,
+        # which is the single place settings → instance attrs is wired.
+        self.pace = {name: Pacer(0.0) for name in
+                     ("e621", "inkbunny", "danbooru", "gelbooru",
+                      "fluffle", "saucenao")}
 
         # Fluffle
         self.fluffle_api  = "https://api.fluffle.xyz/v1/search"
@@ -850,31 +854,26 @@ class TagIntegrator:
         # Hydrus Client API (optional output sink — skip sidecars when on)
         self.hydrus_api_url = ""
         self.hydrus_access_key = ""
-        self.hydrus_tag_service_name = "downloader tags"
         self.hydrus_tag_service_key = ""
-        self.hydrus_import = True
-        self.hydrus_import_unmatched = False  # launcher-session interactive choice
-        self.hydrus_also_sidecars = False
         self.hydrus_can_edit_urls = False   # access key has "Import and Edit URLs"
         self.hydrus_can_search_files = False  # MD5 → current SHA-256 lookup
-        self.hydrus_tag_deleted_duplicates = True
         self.hydrus_can_manage_relationships = False
-        self.hydrus_results_page_limit = 0  # 0 = unlimited, newest N per page
         # Two result pages: genuinely new imports vs. files already in Hydrus
         # that merely gained tags. Hashes are retained as rolling newest-N
         # lists, then each page is created once when the scan finishes.
+        # Page names come from settings via apply_settings().
         self.hydrus_result_pages: Dict[str, Dict] = {
-            "new":     {"name": "FurTag New Imports",  "enabled": False, "hashes": []},
-            "updated": {"name": "FurTag Newly Tagged", "enabled": False, "hashes": []},
+            "new":     {"name": "", "enabled": False, "hashes": []},
+            "updated": {"name": "", "enabled": False, "hashes": []},
         }
-        self.hydrus_already_tagged_page_name = "Already Tagged"
+        self.hydrus_already_tagged_page_name = ""
         self.hydrus_already_tagged_page_enabled = False
         # Set once from the startup Hydrus menu. None means do not build an
         # Already Tagged page this session; 0 means include every match.
         self.hydrus_already_tagged_page_limit: Optional[int] = None
         self.has_hydrus = False
         self._hydrus_lock = threading.Lock()  # serialise API writes (hash + perc)
-        self._apply_source_toggles()
+        self.apply_settings(self.settings)
 
     def apply_settings(self, settings: Settings) -> None:
         """Re-apply non-secret settings (thresholds, toggles, pacers)."""
@@ -886,12 +885,9 @@ class TagIntegrator:
         self.fluffle_accepted_matches = list(m.fluffle_accepted_matches or ["exact"])
         self.fluffle_review_mode = m.fluffle_review_mode or "off"
         perf = self.settings.performance
-        self.pace["e621"].interval = perf.e621_interval
-        self.pace["inkbunny"].interval = perf.inkbunny_interval
-        self.pace["danbooru"].interval = perf.danbooru_interval
-        self.pace["gelbooru"].interval = perf.gelbooru_interval
-        self.pace["fluffle"].interval = perf.fluffle_interval
-        self.pace["saucenao"].interval = perf.saucenao_interval
+        for name in self.pace:
+            self.pace[name].interval = getattr(perf, f"{name}_interval")
+        self._bind_cancel_to_pacers()
         out = self.settings.output
         self.hydrus_import = out.hydrus_import
         self.hydrus_also_sidecars = out.sidecars_enabled
@@ -913,6 +909,11 @@ class TagIntegrator:
         self.enabled_gelbooru = bool(src.gelbooru_enabled)
         self.enabled_fluffle = bool(src.fluffle_enabled)
         self.enabled_saucenao = bool(src.saucenao_enabled)
+
+    def _bind_cancel_to_pacers(self) -> None:
+        """Point every Pacer at the live cancel event so paced sleeps abort."""
+        for pacer in self.pace.values():
+            pacer.cancel = self.cancel_event
 
     def cancelled(self) -> bool:
         return self.cancel_event.is_set()
@@ -960,37 +961,23 @@ class TagIntegrator:
         else:
             print("🔑 Loading credentials from secure store / environment")
 
-        # Apply non-secret Hydrus prefs from settings before init
+        # Non-secret Hydrus prefs default from settings; anything already in cfg
+        # (i.e. explicitly set in credentials.txt) wins.
         out = self.settings.output
         hy = self.settings.hydrus
-        if "hydrus_tag_service" not in cfg and out.hydrus_tag_service:
-            cfg = dict(cfg)
-            cfg["hydrus_tag_service"] = out.hydrus_tag_service
-        if "hydrus_import" not in cfg:
-            cfg = dict(cfg)
-            cfg["hydrus_import"] = "true" if out.hydrus_import else "false"
-        if "hydrus_also_sidecars" not in cfg:
-            cfg = dict(cfg)
-            cfg["hydrus_also_sidecars"] = "true" if out.sidecars_enabled else "false"
-        if "hydrus_tag_deleted_duplicates" not in cfg:
-            cfg = dict(cfg)
-            cfg["hydrus_tag_deleted_duplicates"] = (
-                "true" if out.hydrus_tag_deleted_duplicates else "false")
-        if "hydrus_results_page_limit" not in cfg:
-            cfg = dict(cfg)
-            cfg["hydrus_results_page_limit"] = str(hy.result_page_limit)
-        if "hydrus_new_imports_page" not in cfg:
-            cfg = dict(cfg)
-            cfg["hydrus_new_imports_page"] = hy.new_imports_page_name
-        if "hydrus_newly_tagged_page" not in cfg:
-            cfg = dict(cfg)
-            cfg["hydrus_newly_tagged_page"] = hy.newly_tagged_page_name
-        if "hydrus_already_tagged_page" not in cfg:
-            cfg = dict(cfg)
-            cfg["hydrus_already_tagged_page"] = hy.already_tagged_page_name
-        if "hydrus_results_page" not in cfg:
-            cfg = dict(cfg)
-            cfg["hydrus_results_page"] = "on" if hy.results_pages_enabled else "off"
+        defaults = {
+            "hydrus_import": _bool_str(out.hydrus_import),
+            "hydrus_also_sidecars": _bool_str(out.sidecars_enabled),
+            "hydrus_tag_deleted_duplicates": _bool_str(out.hydrus_tag_deleted_duplicates),
+            "hydrus_results_page_limit": str(hy.result_page_limit),
+            "hydrus_new_imports_page": hy.new_imports_page_name,
+            "hydrus_newly_tagged_page": hy.newly_tagged_page_name,
+            "hydrus_already_tagged_page": hy.already_tagged_page_name,
+            "hydrus_results_page": "on" if hy.results_pages_enabled else "off",
+        }
+        if out.hydrus_tag_service:
+            defaults["hydrus_tag_service"] = out.hydrus_tag_service
+        cfg = {**defaults, **cfg}
 
         self._init_e621(cfg)
         self._init_inkbunny(cfg)
@@ -1267,32 +1254,23 @@ class TagIntegrator:
     def write_sidecars(self) -> bool:
         """Sidecars when Hydrus API is off, or when sidecars_enabled / also_sidecars."""
         if self.has_hydrus:
-            return bool(self.hydrus_also_sidecars or
-                        self.settings.output.sidecars_enabled)
+            # apply_settings() mirrors settings.output.sidecars_enabled onto this
+            # attribute, so it is the single holder — don't OR it with its source.
+            return bool(self.hydrus_also_sidecars)
         # Classic fallback: always write when Hydrus is unavailable, unless the
         # user explicitly disabled sidecars while also disabling Hydrus (blocked
         # by preflight). Prefer writing over silent data loss.
         return True
 
     def source_available(self, name: str) -> bool:
-        return {
-            "e621": self.has_e621,
-            "inkbunny": self.has_inkbunny,
-            "danbooru": self.has_danbooru,
-            "gelbooru": self.has_gelbooru,
-            "fluffle": self.has_fluffle,
-            "saucenao": self.has_saucenao and not self.saucenao_exhausted,
-        }.get(name, False)
+        """Credentials present. Called per file per service — no dict building."""
+        if name == "saucenao":
+            return self.has_saucenao and not self.saucenao_exhausted
+        return name in SEARCH_SOURCES and getattr(self, f"has_{name}", False)
 
     def source_enabled(self, name: str) -> bool:
-        return {
-            "e621": self.enabled_e621,
-            "inkbunny": self.enabled_inkbunny,
-            "danbooru": self.enabled_danbooru,
-            "gelbooru": self.enabled_gelbooru,
-            "fluffle": self.enabled_fluffle,
-            "saucenao": self.enabled_saucenao,
-        }.get(name, False)
+        """User toggle. Called per file per service — no dict building."""
+        return name in SEARCH_SOURCES and getattr(self, f"enabled_{name}", False)
 
     def source_active(self, name: str) -> bool:
         """Available credentials AND user-enabled."""
@@ -1300,18 +1278,13 @@ class TagIntegrator:
 
     def any_source(self) -> bool:
         """True if any search source is active (available + enabled)."""
-        return any(self.source_active(s) for s in
-                   ("e621", "inkbunny", "danbooru", "gelbooru",
-                    "fluffle", "saucenao"))
+        return any(self.source_active(s) for s in SEARCH_SOURCES)
 
     def any_source_available(self) -> bool:
-        return any(self.source_available(s) for s in
-                   ("e621", "inkbunny", "danbooru", "gelbooru",
-                    "fluffle", "saucenao"))
+        return any(self.source_available(s) for s in SEARCH_SOURCES)
 
     def enabled_hash_services(self) -> List[str]:
-        return [s for s in ("e621", "inkbunny", "danbooru", "gelbooru")
-                if self.source_active(s)]
+        return [s for s in HASH_SOURCES if self.source_active(s)]
 
     def source_status_map(self) -> Dict[str, str]:
         """Map service → 'active' | 'disabled' | 'unavailable' for UI."""
@@ -2100,35 +2073,47 @@ class TagIntegrator:
     def legacy_url_sidecar_path(media: Path) -> Path:
         return media.with_suffix(media.suffix + ".urls.txt")
 
+    def _tag_sidecar_candidates(self, media: Path) -> List[Path]:
+        """Configured + legacy tag sidecar names, de-duplicated, in read order."""
+        return list(dict.fromkeys((self.tag_sidecar_path(media),
+                                   self.legacy_tag_sidecar_path(media))))
+
+    def _url_sidecar_candidates(self, media: Path) -> List[Path]:
+        """Configured + legacy URL sidecar names, de-duplicated, in read order."""
+        return list(dict.fromkeys((self.url_sidecar_path(media),
+                                   self.legacy_url_sidecar_path(media))))
+
+    def _json_sidecar_candidates(self, media: Path) -> List[Path]:
+        """Configured + common alternate JSON sidecar names, de-duplicated."""
+        return list(dict.fromkeys((self.json_sidecar_path(media),
+                                   media.with_suffix(media.suffix + ".json"))))
+
+    def _sidecar_candidates(self, media: Path) -> List[Path]:
+        """Every name that counts as a sidecar for *media*, de-duplicated.
+
+        Single source of truth for the `index()` skip rule and for reading a
+        payload back, so the two can never disagree. With the default patterns
+        the configured and legacy names coincide, so this collapses to three
+        paths rather than six.
+        """
+        return list(dict.fromkeys(self._tag_sidecar_candidates(media)
+                                  + self._url_sidecar_candidates(media)
+                                  + self._json_sidecar_candidates(media)))
+
     def has_sidecar(self, media: Path) -> bool:
         """True if any recognized sidecar exists (configured + legacy .txt).
 
         Legacy ``.txt`` sidecars are always recognized even when the format
         setting is JSON, so switching formats never re-scans a library.
         """
-        if self.legacy_tag_sidecar_path(media).exists():
-            return True
-        if self.legacy_url_sidecar_path(media).exists():
-            return True
-        if self.tag_sidecar_path(media).exists():
-            return True
-        if self.url_sidecar_path(media).exists():
-            return True
-        if self.json_sidecar_path(media).exists():
-            return True
-        # Common alternate JSON name
-        alt_json = media.with_suffix(media.suffix + ".json")
-        if alt_json.exists():
-            return True
-        return False
+        return any(p.exists() for p in self._sidecar_candidates(media))
 
     def read_sidecar_payload(self, media: Path) -> Tuple[Set[str], Set[str]]:
         """Read tags and URLs from any supported sidecar shape beside *media*."""
         tags: Set[str] = set()
         urls: Set[str] = set()
         # JSON first (single file with both)
-        for jp in (self.json_sidecar_path(media),
-                   media.with_suffix(media.suffix + ".json")):
+        for jp in self._json_sidecar_candidates(media):
             if jp.is_file():
                 try:
                     data = json.loads(jp.read_text("utf-8"))
@@ -2146,10 +2131,10 @@ class TagIntegrator:
                 except (OSError, ValueError, TypeError):
                     pass
         # Text sidecars (configured + legacy)
-        for tp in {self.tag_sidecar_path(media), self.legacy_tag_sidecar_path(media)}:
+        for tp in self._tag_sidecar_candidates(media):
             if tp.is_file():
                 tags |= {t for t in self._read_result_sidecar(tp) if t}
-        for up in {self.url_sidecar_path(media), self.legacy_url_sidecar_path(media)}:
+        for up in self._url_sidecar_candidates(media):
             if up.is_file():
                 urls |= {u for u in self._read_result_sidecar(up) if u}
         return tags, urls
@@ -2212,6 +2197,8 @@ class TagIntegrator:
         candidates: List[Path] = []
         for dp, dirs, files in os.walk(root):
             dirs.sort()
+            if self.cancelled():
+                break
             for name in sorted(files):
                 if name.startswith(".") or not self._media_kind(name):
                     continue
@@ -2224,8 +2211,18 @@ class TagIntegrator:
 
         print(f"📤 Syncing sidecars to Hydrus for {len(candidates)} file(s)…")
         processed = 0
+        # Reading a sidecar is disk-bound and independent per file, so prefetch
+        # payloads on a pool while the serialised Hydrus pushes proceed —
+        # otherwise every push waits on a fresh read first.
+        workers = min(8, max(1, os.cpu_count() or 1))
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            payloads = dict(zip(
+                candidates, ex.map(self.read_sidecar_payload, candidates)))
         for index, media in enumerate(candidates, start=1):
-            tags, urls = self.read_sidecar_payload(media)
+            if self.cancelled():
+                print("\n⏹️  Sidecar sync cancelled.")
+                break
+            tags, urls = payloads.get(media, (set(), set()))
             tags = {tag for tag in tags if not _is_junk_tag(tag)}
             if not tags and not urls:
                 continue
@@ -2740,12 +2737,12 @@ class TagIntegrator:
 
     # ── PDF pre-pass ───────────────────────────────────────────────────────────
 
-    def plan_pdf_renders(self, root: Path) -> Tuple[Set[Path], List[Path]]:
-        """Discover PDF page folders and return the PDFs that still need rendering.
+    @staticmethod
+    def _find_pdfs(root: Path) -> List[Path]:
+        """Every non-dotfile PDF under *root*, in natural walk order.
 
-        The caller launches `render_pdf_jobs` in a background worker, while
-        excluding those jobs' output folders from its initial index so a
-        half-written page can never enter the pipeline.
+        One definition, so the render planner and the "PDF rendering disabled"
+        path agree on which PDFs exist (and both skip macOS `._` shadow files).
         """
         pdfs: List[Path] = []
         for dp, dirs, files in os.walk(root):
@@ -2755,6 +2752,20 @@ class TagIntegrator:
                     continue
                 if Path(fn).suffix.lower() in PDF_EXTS:
                     pdfs.append(Path(dp) / fn)
+        return pdfs
+
+    def pdf_page_dirs_for(self, root: Path) -> Set[Path]:
+        """Page-output folder for every PDF under *root* (no rendering)."""
+        return {pdf.parent / pdf.stem for pdf in self._find_pdfs(root)}
+
+    def plan_pdf_renders(self, root: Path) -> Tuple[Set[Path], List[Path]]:
+        """Discover PDF page folders and return the PDFs that still need rendering.
+
+        The caller launches `render_pdf_jobs` in a background worker, while
+        excluding those jobs' output folders from its initial index so a
+        half-written page can never enter the pipeline.
+        """
+        pdfs = self._find_pdfs(root)
         if not pdfs:
             return set(), []
 
@@ -2800,6 +2811,8 @@ class TagIntegrator:
         """Render planned PDFs serially with adaptive oversized-page fallback."""
         generated: List[Path] = []
         for pdf in pdfs:
+            if self.cancelled():
+                break
             attempt_dpi = dpi
             pdf_generated: List[Path] = []
             while True:
@@ -2811,7 +2824,8 @@ class TagIntegrator:
                                         self.settings.pdf.pdf_write_sidecars),
                         sidecar_format=out.sidecar_format,
                         tag_pattern=out.sidecar_tag_filename,
-                        json_pattern=out.sidecar_json_filename)
+                        json_pattern=out.sidecar_json_filename,
+                        should_cancel=self.cancelled)
                     break
                 except Exception as e:
                     oversized = "overly large image" in str(e).lower()
@@ -3174,7 +3188,7 @@ class TagIntegrator:
             return self.gelbooru_lookup_by_md5(md5)
         return set(), set()
 
-    def hash_tier(self, item: FileItem, disp: LiveDisplay, ex: cf.Executor
+    def hash_tier(self, item: FileItem, disp: Optional[LiveDisplay], ex: cf.Executor
                   ) -> Tuple[Set[str], Set[str], List[str]]:
         """Query every enabled booru for this file's MD5 concurrently and merge.
         MD5 identity is byte-exact, so there is zero false-positive risk and the
@@ -3186,9 +3200,14 @@ class TagIntegrator:
         if not item.md5 or not services:
             return tags, urls, []
 
+        def _tick(state: Dict[str, str]) -> None:
+            # No panel (GUI/headless) → nothing to render; never allocate one.
+            if disp is not None:
+                disp.status("hash", disp.hash_line(state))
+
         state = {s: "run" for s in services}
         futs = {ex.submit(self._hash_lookup, s, item.md5): s for s in services}
-        disp.status("hash", disp.hash_line(state))
+        _tick(state)
         for fut in cf.as_completed(futs):
             s = futs[fut]
             try:
@@ -3198,7 +3217,7 @@ class TagIntegrator:
                 # so surface it as ⚠ rather than ✗ (the file may still exist there).
                 notify(f"❌ {s} failed on {item.path.name}: {e}")
                 state[s] = "err"
-                disp.status("hash", disp.hash_line(state))
+                _tick(state)
                 continue
             if t or u:
                 tags |= t
@@ -3207,7 +3226,7 @@ class TagIntegrator:
                 state[s] = "hit"
             else:
                 state[s] = "miss"
-            disp.status("hash", disp.hash_line(state))
+            _tick(state)
 
         sources = [s for s in services if s in hit]   # deterministic order
         return tags, urls, sources
@@ -3252,7 +3271,10 @@ class TagIntegrator:
                     sources.append("fluffle")
                     review_raw = None  # auto-accepted; no review needed
 
-        if not (tags or urls) and review_raw is None and self.source_active("saucenao"):
+        # SauceNAO is the slowest stage (6s pace, longer after a quota backoff),
+        # so don't start it for a file the user has already cancelled out of.
+        if (not (tags or urls) and review_raw is None
+                and not self.cancelled() and self.source_active("saucenao")):
             _status("SauceNAO…")
             service, rid, s_tags, s_urls = self.saucenao_search(fp)
             if service and rid:
@@ -3373,12 +3395,8 @@ class TagIntegrator:
         if self.settings.pdf.pdf_enabled:
             pdf_page_dirs, pdf_jobs = self.plan_pdf_renders(root)
         else:
-            pdf_page_dirs, pdf_jobs = set(), []
             # Still collect existing page dirs so perceptual_only flags work
-            for dp, dirs, files in os.walk(root):
-                for fn in files:
-                    if Path(fn).suffix.lower() in PDF_EXTS:
-                        pdf_page_dirs.add(Path(dp) / Path(fn).stem)
+            pdf_page_dirs, pdf_jobs = self.pdf_page_dirs_for(root), []
         pending_pdf_dirs = {pdf.parent / pdf.stem for pdf in pdf_jobs}
         items, candidate_dirs = self.index(
             root, ledger_mgr, pdf_page_dirs, excluded_dirs=pending_pdf_dirs)
@@ -3419,6 +3437,7 @@ class TagIntegrator:
             self.apply_settings(options.settings_override)
         self.cancel_event = cancel_event or threading.Event()
         self.cancel_event.clear()
+        self._bind_cancel_to_pacers()
         summary = ScanSummary(
             source_hits={k: 0 for k in
                          ("e621", "inkbunny", "danbooru",
@@ -3687,10 +3706,7 @@ class TagIntegrator:
                         kind="start_file", track="hash", index=i + 1,
                         current=item.path.name, nxt=nxt or ""))
 
-                    # When running without a terminal panel, still pass a LiveDisplay
-                    # so hash_tier can call status(); non-TTY mode stays quiet enough.
-                    _hash_disp = disp if disp is not None else LiveDisplay()
-                    tags, urls, sources = self.hash_tier(item, _hash_disp, ex)
+                    tags, urls, sources = self.hash_tier(item, disp, ex)
                     if tags or urls:
                         sha = self.write_results(
                             item.path, tags, urls, item.sha256)
@@ -3914,6 +3930,41 @@ def _pdf_render_candidates(root: Path) -> Tuple[List[Path], Set[Path]]:
     return pages, page_dirs
 
 
+def is_filesystem_root(path: Path) -> bool:
+    """True for a filesystem root, which is never a legal reset target."""
+    resolved = path.expanduser().resolve()
+    return resolved == Path(resolved.anchor)
+
+
+def perform_nuke(root: Path, include_pdf_pages: bool = False
+                 ) -> Tuple[int, List[Tuple[Path, OSError]]]:
+    """Delete FurTag-generated state under *root*.
+
+    The single implementation behind both the CLI ``NUKE!`` prompt and the GUI
+    Reset dialog, so the two can't drift. Returns ``(removed, failures)``;
+    callers own how failures are reported.
+    """
+    ledgers, sidecars = _nuke_candidates(root)
+    pdf_pages, pdf_page_dirs = _pdf_render_candidates(root)
+
+    removed = 0
+    failures: List[Tuple[Path, OSError]] = []
+    for path in ledgers + sidecars + (pdf_pages if include_pdf_pages else []):
+        try:
+            path.unlink()
+            removed += 1
+        except OSError as e:
+            failures.append((path, e))
+    if include_pdf_pages:
+        # Deepest-first, so nested page folders empty out before their parents.
+        for out_dir in sorted(pdf_page_dirs, key=lambda p: len(p.parts), reverse=True):
+            try:
+                out_dir.rmdir()  # succeeds only when no unrelated content remains
+            except OSError:
+                pass
+    return removed, failures
+
+
 def _prompt_for_nuke() -> Optional[Path]:
     """Confirm and remove FurTag-generated state, returning the folder to scan.
 
@@ -3934,7 +3985,7 @@ def _prompt_for_nuke() -> Optional[Path]:
     if not root.is_dir():
         print(f"‼️  '{root}' is not a valid directory. Nuke cancelled.")
         return None
-    if root == Path(root.anchor):
+    if is_filesystem_root(root):
         print("⛔ Refusing to nuke an entire filesystem root.")
         return None
 
@@ -3962,25 +4013,13 @@ def _prompt_for_nuke() -> Optional[Path]:
             answer = ""
         reexport_pdfs = answer == "y"
 
-    removed = 0
-    failed = 0
-    targets = ledgers + sidecars + (pdf_pages if reexport_pdfs else [])
-    for path in targets:
-        try:
-            path.unlink()
-            removed += 1
-        except OSError as e:
-            failed += 1
-            print(f"⚠️  Could not delete {path}: {e}")
-    if reexport_pdfs:
-        for out_dir in sorted(pdf_page_dirs, key=lambda p: len(p.parts), reverse=True):
-            try:
-                out_dir.rmdir()  # succeeds only when no unrelated content remains
-            except OSError:
-                pass
+    removed, failures = perform_nuke(root, include_pdf_pages=reexport_pdfs)
+    for path, err in failures:
+        print(f"⚠️  Could not delete {path}: {err}")
     print(f"\n💥 Reset complete — removed {removed} generated file(s).")
-    if failed:
-        print(f"⚠️  {failed} file(s) could not be removed and may still be skipped.")
+    if failures:
+        print(f"⚠️  {len(failures)} file(s) could not be removed "
+              "and may still be skipped.")
     print("🔄 Starting a fresh scan of that folder…\n")
     return root
 
