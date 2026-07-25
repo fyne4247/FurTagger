@@ -487,6 +487,13 @@ class SettingsPanel(QWidget):
         # Hydrus pages
         hy = QWidget()
         hf = QFormLayout(hy)
+        self.exact_url_enrichment = QCheckBox(
+            "Enrich exact matches through Hydrus downloaders")
+        self.exact_url_enrichment.setToolTip(
+            "For byte-exact booru matches, queue parseable Post URLs so Hydrus "
+            "can import notes, descriptions, and other parser metadata. "
+            "Unparseable URLs are associated normally.")
+        self.exact_url_enrichment_page_name = QLineEdit()
         self.results_pages = QCheckBox("Enable result pages")
         self.new_imports_name = QLineEdit()
         self.newly_tagged_name = QLineEdit()
@@ -496,6 +503,9 @@ class SettingsPanel(QWidget):
         self.page_limit = QSpinBox()
         self.page_limit.setRange(0, 1_000_000)
         self.page_limit.setSpecialValueText("Unlimited")
+        hf.addRow(self.exact_url_enrichment)
+        hf.addRow("Metadata downloader page",
+                  self.exact_url_enrichment_page_name)
         hf.addRow(self.results_pages)
         hf.addRow("New Imports name", self.new_imports_name)
         hf.addRow("Newly Tagged name", self.newly_tagged_name)
@@ -603,6 +613,9 @@ class SettingsPanel(QWidget):
         self.sidecar_url_fn.setText(o.sidecar_url_filename)
         self.sidecar_json_fn.setText(o.sidecar_json_filename)
         self.results_pages.setChecked(h.results_pages_enabled)
+        self.exact_url_enrichment.setChecked(h.exact_url_enrichment)
+        self.exact_url_enrichment_page_name.setText(
+            h.exact_url_enrichment_page_name)
         self.new_imports_name.setText(h.new_imports_page_name)
         self.newly_tagged_name.setText(h.newly_tagged_page_name)
         self.duplicate_tagged_name.setText(h.duplicate_tagged_page_name)
@@ -638,6 +651,11 @@ class SettingsPanel(QWidget):
         s.output.sidecar_tag_filename = self.sidecar_tag_fn.text().strip()
         s.output.sidecar_url_filename = self.sidecar_url_fn.text().strip()
         s.output.sidecar_json_filename = self.sidecar_json_fn.text().strip()
+        s.hydrus.exact_url_enrichment = (
+            self.exact_url_enrichment.isChecked())
+        s.hydrus.exact_url_enrichment_page_name = (
+            self.exact_url_enrichment_page_name.text().strip()
+            or "FurTag Metadata")
         s.hydrus.results_pages_enabled = self.results_pages.isChecked()
         s.hydrus.new_imports_page_name = self.new_imports_name.text().strip()
         s.hydrus.newly_tagged_page_name = self.newly_tagged_name.text().strip()

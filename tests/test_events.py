@@ -254,5 +254,51 @@ class TestHashTickerReachesObserver(unittest.TestCase):
         self.assertIn("e621 ✓", statuses[-1].sub)
 
 
+class TestUrlEnrichmentBoundary(unittest.TestCase):
+    """Only byte-exact hash-tier results may enter Hydrus's downloader."""
+
+    def _capture_writes(self, ti):
+        exact_flags = []
+
+        def capture(media, tags, urls, known_sha256=None, exact_match=False):
+            exact_flags.append(exact_match)
+            return "a" * 64
+
+        ti.write_results = capture
+        return exact_flags
+
+    def test_hash_tier_write_is_marked_exact(self):
+        d = _make_pngs(1)
+        self.addCleanup(shutil.rmtree, d, True)
+        s = _offline_settings()
+        s.sources.e621_enabled = True
+        ti = TagIntegrator(settings=s)
+        ti.has_e621 = True
+        ti._hash_lookup = lambda service, md5: (
+            {"creator:exact"}, {"https://e621.net/posts/1"})
+        exact_flags = self._capture_writes(ti)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ti.run(d, options=_run_options(), observer=RecordingObserver(),
+                   use_terminal_display=False)
+
+        self.assertEqual(exact_flags, [True])
+
+    def test_perceptual_write_is_not_marked_exact(self):
+        d = _make_pngs(1)
+        self.addCleanup(shutil.rmtree, d, True)
+        ti = TagIntegrator(settings=_offline_settings())
+        ti.perceptual_tier = lambda item: (
+            {"creator:fuzzy"}, {"https://www.furaffinity.net/view/1"},
+            ["fluffle"], None)
+        exact_flags = self._capture_writes(ti)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ti.run(d, options=_run_options(), observer=RecordingObserver(),
+                   use_terminal_display=False)
+
+        self.assertEqual(exact_flags, [False])
+
+
 if __name__ == "__main__":
     unittest.main()

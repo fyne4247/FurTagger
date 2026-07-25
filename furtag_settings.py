@@ -77,6 +77,11 @@ class OutputSettings:
 
 @dataclass
 class HydrusSettings:
+    # Send byte-exact booru Post URLs through Hydrus's URL downloader so its
+    # installed parsers can add notes/descriptions/timestamps without importing
+    # a second file. Unparseable URLs fall back to plain URL association.
+    exact_url_enrichment: bool = True
+    exact_url_enrichment_page_name: str = "FurTag Metadata"
     results_pages_enabled: bool = True
     new_imports_page_name: str = "FurTag New Imports"
     newly_tagged_page_name: str = "FurTag Newly Tagged"
@@ -214,6 +219,10 @@ def _normalize_settings(s: Settings) -> None:
         s.hydrus.result_page_limit = max(0, int(s.hydrus.result_page_limit))
     except (TypeError, ValueError):
         s.hydrus.result_page_limit = 0
+    enrichment_page = s.hydrus.exact_url_enrichment_page_name
+    if not isinstance(enrichment_page, str) or not enrichment_page.strip():
+        enrichment_page = "FurTag Metadata"
+    s.hydrus.exact_url_enrichment_page_name = enrichment_page.strip()
     # Pace floors
     for name, floor in PACE_FLOORS.items():
         attr = f"{name}_interval"

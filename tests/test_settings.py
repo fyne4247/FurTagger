@@ -87,6 +87,9 @@ class TestSettingsStore(unittest.TestCase):
         self.assertEqual(s.output.sidecar_format, "txt")
         self.assertEqual(s.hydrus.duplicate_tagged_page_name,
                          "FurTag Duplicate Tagged")
+        self.assertTrue(s.hydrus.exact_url_enrichment)
+        self.assertEqual(s.hydrus.exact_url_enrichment_page_name,
+                         "FurTag Metadata")
 
     def test_roundtrip(self):
         with tempfile.TemporaryDirectory() as td:
@@ -96,12 +99,17 @@ class TestSettingsStore(unittest.TestCase):
             s.matching.saucenao_min_similarity = 75.0
             s.sources.e621_enabled = False
             s.hydrus.duplicate_tagged_page_name = "Dupe Review"
+            s.hydrus.exact_url_enrichment = False
+            s.hydrus.exact_url_enrichment_page_name = "Source Metadata"
             store.save(s)
             loaded = store.load()
             self.assertEqual(loaded.matching.saucenao_min_similarity, 75.0)
             self.assertFalse(loaded.sources.e621_enabled)
             self.assertEqual(loaded.hydrus.duplicate_tagged_page_name,
                              "Dupe Review")
+            self.assertFalse(loaded.hydrus.exact_url_enrichment)
+            self.assertEqual(loaded.hydrus.exact_url_enrichment_page_name,
+                             "Source Metadata")
 
     def test_forward_compat_unknown_keys(self):
         with tempfile.TemporaryDirectory() as td:

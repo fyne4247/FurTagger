@@ -145,6 +145,142 @@ def _deleted_dup_routes(targets, failing=()):
     ]
 
 
+class TestHydrusExactUrlEnrichment(unittest.TestCase):
+    URL = "https://e621.net/posts/123"
+    HASH = "a" * 64
+
+    def _push(self, routes, *, exact_match=True, settings=None):
+        session = FakeSession([
+            ("POST", "add_files/add_file", FakeResponse(200, {
+                "status": 2, "hash": self.HASH,
+            })),
+            ("POST", "add_tags/add_tags", FakeResponse(200, {})),
+        ] + list(routes))
+        ti = _hydrus_ti(session, settings=settings)
+        ti.hydrus_can_edit_urls = True
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "exact.jpg"
+            media.write_bytes(b"exact bytes")
+            result = ti._hydrus_push(
+                media, {"creator:test"}, {self.URL},
+                exact_match=exact_match)
+        return ti, session, result
+
+    @staticmethod
+    def _matching_calls(session, suffix):
+        return [call for call in session.calls if suffix in call[1]]
+
+    def test_parseable_exact_post_is_enqueued_not_associated(self):
+        ti, session, result = self._push([
+            ("GET", "add_urls/get_url_info", FakeResponse(200, {
+                "url_type": 0,
+                "url_type_string": "post url",
+                "can_parse": True,
+            })),
+            ("POST", "add_urls/add_url", FakeResponse(200, {
+                "human_result_text": "URL added successfully.",
+            })),
+        ])
+
+        self.assertEqual(result, self.HASH)
+        self.assertFalse(
+            self._matching_calls(session, "add_urls/associate_url"))
+        add_calls = self._matching_calls(session, "add_urls/add_url")
+        self.assertEqual(len(add_calls), 1)
+        body = add_calls[0][2]["json"]
+        self.assertEqual(body["url"], self.URL)
+        self.assertEqual(body["destination_page_name"], "FurTag Metadata")
+        self.assertFalse(body["show_destination_page"])
+
+        endpoints = [call[1] for call in session.calls]
+        self.assertLess(
+            next(i for i, value in enumerate(endpoints)
+                 if "add_files/add_file" in value),
+            next(i for i, value in enumerate(endpoints)
+                 if "add_urls/get_url_info" in value))
+
+    def test_unknown_url_is_only_associated(self):
+        _, session, _ = self._push([
+            ("GET", "add_urls/get_url_info", FakeResponse(200, {
+                "url_type": 5,
+                "url_type_string": "unknown url",
+                "can_parse": False,
+            })),
+            ("POST", "add_urls/associate_url", FakeResponse(200, {})),
+        ])
+        self.assertFalse(self._matching_calls(session, "add_urls/add_url"))
+        calls = self._matching_calls(session, "add_urls/associate_url")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][2]["json"]["urls_to_add"], [self.URL])
+
+    def test_external_source_url_is_never_enqueued(self):
+        source_url = "https://www.furaffinity.net/view/999"
+        session = FakeSession([
+            ("POST", "add_files/add_file", FakeResponse(200, {
+                "status": 2, "hash": self.HASH,
+            })),
+            ("POST", "add_tags/add_tags", FakeResponse(200, {})),
+            ("GET", "add_urls/get_url_info", FakeResponse(200, {
+                "url_type": 0, "can_parse": True,
+            })),
+            ("POST", "add_urls/add_url", FakeResponse(200, {})),
+            ("POST", "add_urls/associate_url", FakeResponse(200, {})),
+        ])
+        ti = _hydrus_ti(session)
+        ti.hydrus_can_edit_urls = True
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "exact.jpg"
+            media.write_bytes(b"exact bytes")
+            ti._hydrus_push(
+                media, {"creator:test"}, {self.URL, source_url},
+                exact_match=True)
+
+        add_calls = self._matching_calls(session, "add_urls/add_url")
+        self.assertEqual(len(add_calls), 1)
+        self.assertEqual(add_calls[0][2]["json"]["url"], self.URL)
+        info_calls = self._matching_calls(session, "add_urls/get_url_info")
+        self.assertEqual(len(info_calls), 1)
+        associated = self._matching_calls(
+            session, "add_urls/associate_url")
+        self.assertEqual(
+            associated[0][2]["json"]["urls_to_add"], [source_url])
+
+    def test_add_url_failure_falls_back_to_association(self):
+        _, session, _ = self._push([
+            ("GET", "add_urls/get_url_info", FakeResponse(200, {
+                "url_type": 0, "can_parse": True,
+            })),
+            ("POST", "add_urls/add_url", FakeResponse(
+                500, {}, text="queue unavailable")),
+            ("POST", "add_urls/associate_url", FakeResponse(200, {})),
+        ])
+        self.assertEqual(
+            len(self._matching_calls(session, "add_urls/add_url")), 1)
+        self.assertEqual(
+            len(self._matching_calls(session, "add_urls/associate_url")), 1)
+
+    def test_perceptual_url_never_enters_downloader(self):
+        _, session, _ = self._push([
+            ("POST", "add_urls/associate_url", FakeResponse(200, {})),
+        ], exact_match=False)
+        self.assertFalse(
+            self._matching_calls(session, "add_urls/get_url_info"))
+        self.assertFalse(self._matching_calls(session, "add_urls/add_url"))
+        self.assertEqual(
+            len(self._matching_calls(session, "add_urls/associate_url")), 1)
+
+    def test_setting_can_disable_enrichment(self):
+        settings = Settings()
+        settings.hydrus.exact_url_enrichment = False
+        _, session, _ = self._push([
+            ("POST", "add_urls/associate_url", FakeResponse(200, {})),
+        ], settings=settings)
+        self.assertFalse(
+            self._matching_calls(session, "add_urls/get_url_info"))
+        self.assertEqual(
+            len(self._matching_calls(session, "add_urls/associate_url")), 1)
+
+
 class TestHydrusDuplicateTaggedPage(unittest.TestCase):
     """Files tagged via a deleted file's duplicate group get their own page."""
 

@@ -888,6 +888,8 @@ class TagIntegrator:
         self.hydrus_can_edit_urls = False   # access key has "Import and Edit URLs"
         self.hydrus_can_search_files = False  # MD5 → current SHA-256 lookup
         self.hydrus_can_manage_relationships = False
+        self.hydrus_exact_url_enrichment = True
+        self.hydrus_exact_url_enrichment_page_name = "FurTag Metadata"
         # Three result pages: genuinely new imports, files already in Hydrus
         # that merely gained tags, and current duplicate-group members tagged
         # on behalf of a previously-deleted file. Hashes are retained as rolling
@@ -934,6 +936,9 @@ class TagIntegrator:
             self._reresolve_tag_service()
         self.hydrus_import_unmatched = out.hydrus_import_unmatched
         hy = self.settings.hydrus
+        self.hydrus_exact_url_enrichment = bool(hy.exact_url_enrichment)
+        self.hydrus_exact_url_enrichment_page_name = (
+            hy.exact_url_enrichment_page_name.strip() or "FurTag Metadata")
         self.hydrus_results_page_limit = hy.result_page_limit
         self.hydrus_result_pages["new"]["name"] = hy.new_imports_page_name
         self.hydrus_result_pages["updated"]["name"] = hy.newly_tagged_page_name
@@ -1210,6 +1215,9 @@ class TagIntegrator:
     def hydrus_mode_desc(self) -> str:
         """e.g. "import+tag" / "tag-only + sidecars" — used in startup banners."""
         mode = "import+tag" if self.hydrus_import else "tag-only"
+        if (self.hydrus_exact_url_enrichment
+                and self.hydrus_can_edit_urls):
+            mode += " + exact-URL enrichment"
         extra = " + sidecars" if self.hydrus_also_sidecars else ""
         return f"{mode}{extra}"
 
@@ -2368,16 +2376,23 @@ class TagIntegrator:
         return tags
 
     def write_results(self, media: Path, tags: Set[str], urls: Set[str],
-                      known_sha256: Optional[str] = None) -> Optional[str]:
+                      known_sha256: Optional[str] = None,
+                      exact_match: bool = False) -> Optional[str]:
         """Push to Hydrus and/or write sidecars. Returns the file's SHA-256 when
-        it was pushed to Hydrus (so the caller can cache it), else None."""
+        it was pushed to Hydrus (so the caller can cache it), else None.
+
+        ``exact_match`` means the source URLs came from the local file's MD5.
+        Only these URLs may be handed to Hydrus's downloader for metadata
+        enrichment; perceptual matches remain plain URL associations.
+        """
         # Drop "artist unknown / anonymous" placeholder tags from every source
         # before writing — they're noise in a Hydrus library.
         tags = {t for t in tags if not _is_junk_tag(t)}
         urls = {u for u in urls if u}
 
         if self.has_hydrus and (tags or urls):
-            sha256 = self._hydrus_push(media, tags, urls, known_sha256)
+            sha256 = self._hydrus_push(
+                media, tags, urls, known_sha256, exact_match=exact_match)
             if self.write_sidecars:
                 self._write_sidecar_results(media, tags, urls)
             return sha256
@@ -2475,12 +2490,18 @@ class TagIntegrator:
     # ── Hydrus Client API push ───────────────────────────────────────────────
 
     def _hydrus_push(self, media: Path, tags: Set[str], urls: Set[str],
-                     known_sha256: Optional[str] = None) -> Optional[str]:
-        """Import (optional) + tag + associate URLs for one file. Thread-safe.
+                     known_sha256: Optional[str] = None,
+                     exact_match: bool = False) -> Optional[str]:
+        """Import (optional) + tag + route URLs for one file. Thread-safe.
 
         Returns the file's SHA-256 (from Hydrus's import response, or computed
         locally in tag-only mode) so the caller can cache it in the ledger and
         avoid recomputing it later. Returns None if the push was aborted.
+
+        For a byte-exact booru hit, parseable Post URLs are queued through
+        Hydrus's URL downloader so installed parsers can add notes,
+        descriptions, timestamps, and other metadata. URLs not accepted for
+        enrichment are associated directly with this file as before.
 
         Safety: only *adds* content (never deletes files/tags/URLs). If import
         is on and the import is refused (previously deleted, vetoed, error),
@@ -2519,13 +2540,8 @@ class TagIntegrator:
                 if tags:
                     self._hydrus_add_tags(file_hash, tags)
                 if urls and self.hydrus_can_edit_urls:
-                    # Isolate URL failures: a bad/forbidden associate_url must not
-                    # abort the tag push, the results-page add, or hash caching.
-                    try:
-                        self._hydrus_associate_urls(file_hash, urls)
-                    except Exception as e:
-                        notify(f"⚠️  Hydrus URL association failed for "
-                               f"{media.name}: {e}")
+                    self._hydrus_route_urls(
+                        media, file_hash, urls, exact_match=exact_match)
                 # A no-match status-2 file gained no metadata, so do not
                 # mislabel it on the "Newly Tagged" page. Brand-new no-match
                 # imports still belong on New Imports.
@@ -2664,6 +2680,94 @@ class TagIntegrator:
         r = self._hydrus_post("add_tags/add_tags", body, 30)
         if r.status_code != 200:
             raise RuntimeError(f"add_tags HTTP {r.status_code}: {r.text[:200]}")
+
+    def _hydrus_route_urls(
+            self, media: Path, file_hash: str, urls: Set[str],
+            exact_match: bool = False) -> None:
+        """Enrich safe exact-match URLs; directly associate everything else.
+
+        A successful ``add_urls/add_url`` deliberately replaces
+        ``associate_url`` for that URL. Associating first can make Hydrus regard
+        the already-local file as fully handled and skip the page fetch that
+        supplies notes/descriptions.
+        """
+        remaining = set(urls)
+        if (exact_match and self.hydrus_exact_url_enrichment
+                and not self.cancelled()):
+            for url in sorted(urls):
+                # Danbooru/Gelbooru results may also contain the artist's
+                # external source URL. It is valuable provenance, but it may
+                # point to a higher-resolution or recompressed original. Only
+                # FurTag's canonical hash-source post URLs are byte-verified.
+                if not self._is_exact_hash_post_url(url):
+                    continue
+                try:
+                    info = self._hydrus_get_url_info(url)
+                    # Unknown/direct/gallery URLs are never queued here. Only a
+                    # recognised, parseable Post URL is safe for this feature.
+                    if info.get("url_type") != 0 or not info.get("can_parse"):
+                        continue
+                    self._hydrus_add_url_for_enrichment(url)
+                    remaining.discard(url)
+                except Exception as e:
+                    # Preserve the provenance URL even when URL-class
+                    # introspection or downloader queueing fails.
+                    notify(f"⚠️  Hydrus metadata enrichment failed for "
+                           f"{media.name}; associating URL normally ({e})")
+
+        if remaining:
+            # Isolate URL failures: a bad/forbidden associate_url must not abort
+            # the tag push, results-page add, or ledger SHA-256 caching.
+            try:
+                self._hydrus_associate_urls(file_hash, remaining)
+            except Exception as e:
+                notify(f"⚠️  Hydrus URL association failed for "
+                       f"{media.name}: {e}")
+
+    @staticmethod
+    def _is_exact_hash_post_url(url: str) -> bool:
+        """Whether *url* is one of FurTag's generated hash-source Post URLs."""
+        return bool(
+            re.fullmatch(r"https://e621\.net/posts/\d+", url)
+            or re.fullmatch(r"https://inkbunny\.net/s/\d+", url)
+            or re.fullmatch(
+                r"https://danbooru\.donmai\.us/posts/\d+", url)
+            or re.fullmatch(
+                r"https://gelbooru\.com/index\.php"
+                r"\?page=post&s=view&id=\d+", url)
+        )
+
+    def _hydrus_get_url_info(self, url: str) -> Dict:
+        """Return Hydrus's URL-class decision for one verified source URL."""
+        try:
+            r = self.session.get(
+                f"{self.hydrus_api_url}/add_urls/get_url_info",
+                headers=self._hydrus_headers(), params={"url": url}, timeout=30,
+            )
+        except requests.RequestException as e:
+            raise RuntimeError(f"get_url_info request failed: {e}") from e
+        if r.status_code != 200:
+            raise RuntimeError(f"get_url_info HTTP {r.status_code}: "
+                               f"{r.text[:200]}")
+        try:
+            info = r.json()
+        except ValueError as e:
+            raise RuntimeError("get_url_info returned non-JSON") from e
+        if not isinstance(info, dict):
+            raise RuntimeError("get_url_info returned an invalid payload")
+        return info
+
+    def _hydrus_add_url_for_enrichment(self, url: str) -> None:
+        """Queue a recognised exact-match Post URL in Hydrus's downloader."""
+        body = {
+            "url": url,
+            "destination_page_name":
+                self.hydrus_exact_url_enrichment_page_name,
+            "show_destination_page": False,
+        }
+        r = self._hydrus_post("add_urls/add_url", body, 30)
+        if r.status_code != 200:
+            raise RuntimeError(f"add_url HTTP {r.status_code}: {r.text[:200]}")
 
     def _hydrus_associate_urls(self, file_hash: str, urls: Set[str]) -> None:
         """POST /add_urls/associate_url."""
@@ -3867,7 +3971,8 @@ class TagIntegrator:
                     tags, urls, sources = self.hash_tier(item, ex)
                     if tags or urls:
                         sha = self.write_results(
-                            item.path, tags, urls, item.sha256)
+                            item.path, tags, urls, item.sha256,
+                            exact_match=True)
                         item.ledger.record(item.path.name, item.size, item.mtime,
                                             item.md5, "matched", sources,
                                             sha256=sha)
