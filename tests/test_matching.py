@@ -61,6 +61,35 @@ class TestFluffleMatching(unittest.TestCase):
         self.assertEqual(pid, "123")
         self.assertIsNone(review)
 
+    def test_non_e621_post_key_is_not_used_for_e621_enrichment(self):
+        ti = TagIntegrator(settings=Settings())
+        location = (
+            "https://bsky.app/profile/did:plc:example/"
+            "post/3m73uwpmv422d"
+        )
+        j = self._payload([{
+            "match": "exact",
+            "platform": "bluesky",
+            "location": location,
+            "credits": [],
+        }])
+        _tags, urls, _md5, pid, review = ti.find_best_exact_match(j)
+        self.assertIn(location, urls)
+        self.assertEqual(pid, "")
+        self.assertIsNone(review)
+
+    def test_e621_post_id_paths_still_parse(self):
+        ti = TagIntegrator(settings=Settings())
+        self.assertEqual(
+            ti._post_id_from_url("https://e621.net/posts/456?foo=bar"),
+            "456")
+        self.assertEqual(
+            ti._post_id_from_url("https://e621.net/post/show/789"),
+            "789")
+        self.assertEqual(
+            ti._post_id_from_url("https://danbooru.donmai.us/posts/456"),
+            "")
+
     def test_tossup_e621_auto(self):
         ti = TagIntegrator(settings=Settings())
         ti.fluffle_tossup_e621 = True
@@ -439,6 +468,38 @@ class TestSauceNAOQuota(unittest.TestCase):
         # Second call does not re-notify messily
         ti._saucenao_check_quota({"long_remaining": 0})
         self.assertTrue(ti.saucenao_exhausted)
+
+    def test_second_consecutive_429_disables_session(self):
+        ti = TagIntegrator(settings=Settings())
+        ti.has_saucenao = True
+        ti.enabled_saucenao = True
+        ti._prepare_thumb = MagicMock(return_value=MagicMock())
+        ti.pace["saucenao"].wait = MagicMock()
+        ti.pace["saucenao"].backoff = MagicMock()
+        first = MagicMock(status_code=429)
+        first.headers = {"Retry-After": "45"}
+        second = MagicMock(status_code=429)
+        second.headers = {}
+        ti.session.post = MagicMock(side_effect=[first, second])
+
+        with patch("furtag.notify") as notice:
+            ti.saucenao_search(Path("first.png"))
+            self.assertFalse(ti.saucenao_exhausted)
+            ti.pace["saucenao"].backoff.assert_called_once_with(45.0)
+
+            ti.saucenao_search(Path("second.png"))
+            self.assertTrue(ti.saucenao_exhausted)
+            self.assertEqual(ti.session.post.call_count, 2)
+
+            # Once disabled, later files never spend another API request.
+            ti.saucenao_search(Path("third.png"))
+            self.assertEqual(ti.session.post.call_count, 2)
+
+        messages = [call.args[0] for call in notice.call_args_list]
+        self.assertTrue(any("another 429 will disable it" in m
+                            for m in messages))
+        self.assertTrue(any("repeatedly returned HTTP 429" in m
+                            for m in messages))
 
 
 if __name__ == "__main__":

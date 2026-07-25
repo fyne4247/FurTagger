@@ -170,6 +170,7 @@ HASH_SOURCES = ("e621", "inkbunny", "danbooru", "gelbooru")
 SEARCH_SOURCES = HASH_SOURCES + ("fluffle", "saucenao")
 
 CREDENTIALS_FILE = "credentials.txt"
+_LEGACY_NONSECRET_WARNINGS: Set[Tuple[str, Tuple[str, ...]]] = set()
 LEDGER_FILE      = ".furtag_ledger.json"
 DUPLICATES_FILE  = "duplicates.log"
 HYDRUS_HASH_LOOKUP_BATCH = 256  # well below the Client API's 2 MB GET limit
@@ -947,6 +948,7 @@ class TagIntegrator:
         self.has_saucenao = False
         self.enabled_saucenao = True
         self.saucenao_exhausted = False   # set True when the daily quota runs out
+        self._saucenao_consecutive_429 = 0
 
         # Fluffle has no credentials — availability is always True when enabled
         self.has_fluffle = True
@@ -1140,8 +1142,13 @@ class TagIntegrator:
                 elif v:
                     ignored.append(k)
             if ignored:
-                notify(f"⚠️  Ignoring non-secret key(s) in {legacy.name}: "
-                       f"{', '.join(sorted(ignored))} — these now come from Settings.")
+                warning_key = (
+                    str(legacy.resolve()), tuple(sorted(set(ignored))))
+                if warning_key not in _LEGACY_NONSECRET_WARNINGS:
+                    _LEGACY_NONSECRET_WARNINGS.add(warning_key)
+                    notify(f"⚠️  Ignoring non-secret key(s) in {legacy.name}: "
+                           f"{', '.join(warning_key[1])} — these now come "
+                           "from Settings.")
         self.load_credentials(cfg=cfg)
 
     def _init_e621(self, cfg: Dict[str, str]) -> None:
@@ -1554,8 +1561,15 @@ class TagIntegrator:
 
     @staticmethod
     def _post_id_from_url(url: str) -> str:
-        # matches e621/danbooru "/posts/N" and e621's legacy "/post/show/N"
-        m = re.search(r"/posts?(?:/show)?/(\d+)", url or "")
+        """Extract an e621 post ID, never a numeric prefix from another site.
+
+        Bluesky record keys commonly begin with ``3`` (``/post/3m…``); the old
+        domain-agnostic regex mistook that prefix for e621 post 3.
+        """
+        m = re.match(
+            r"https?://(?:www\.)?e621\.net/"
+            r"(?:posts/|post/show/)([1-9]\d*)(?:[/?#]|$)",
+            url or "", flags=re.IGNORECASE)
         return m.group(1) if m else ""
 
     # ── e621 API ─────────────────────────────────────────────────────────────
@@ -2080,9 +2094,22 @@ class TagIntegrator:
                 timeout=30,
             )
             if r.status_code == 429:
-                notify("⚠️  SauceNAO rate limit (429) – backing off 30s")
-                self.pace["saucenao"].backoff(30)
+                self._saucenao_consecutive_429 += 1
+                if self._saucenao_consecutive_429 >= 2:
+                    self._disable_saucenao(
+                        "repeatedly returned HTTP 429")
+                    return None, None, set(), set()
+                try:
+                    retry_after = max(
+                        30.0, float(r.headers.get("Retry-After", 30)))
+                except (TypeError, ValueError):
+                    retry_after = 30.0
+                notify(
+                    f"⚠️  SauceNAO rate limit (429) – pausing "
+                    f"{int(retry_after)}s; another 429 will disable it.")
+                self.pace["saucenao"].backoff(retry_after)
                 return None, None, set(), set()
+            self._saucenao_consecutive_429 = 0
             if r.status_code != 200:
                 # SauceNAO normally puts quota state in a successful JSON
                 # response, but some deployments reply with a plain daily-limit

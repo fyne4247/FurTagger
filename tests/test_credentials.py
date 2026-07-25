@@ -89,6 +89,35 @@ class TestLegacyPlaintextMerge(unittest.TestCase):
         self.assertEqual(cfg.get("e621_api_key"), "legacy-secret")
         self.assertEqual(cfg.get("hydrus_tag_service"), "my gui tags")
 
+    def test_ignored_non_secret_warning_is_once_per_process(self):
+        from furtag import TagIntegrator
+        from furtag_settings import Settings
+
+        with tempfile.TemporaryDirectory() as td:
+            legacy = Path(td) / "credentials.txt"
+            legacy.write_text(
+                "hydrus_import = false\n"
+                "hydrus_tag_service = stale file tags\n",
+                encoding="utf-8")
+            settings = Settings()
+            settings.output.hydrus_enabled = True
+            first = TagIntegrator(settings=settings)
+            second = TagIntegrator(settings=settings)
+            store = CredentialStore(service="org.furtag.FurTag.test.none")
+            with patch.object(TagIntegrator, "_init_hydrus"), \
+                 patch.dict(os.environ, {}, clear=True), \
+                 patch("furtag.notify") as notice:
+                first.load_credentials_from_store(
+                    store=store, legacy_path=legacy)
+                second.load_credentials_from_store(
+                    store=store, legacy_path=legacy)
+
+        warnings = [
+            call.args[0] for call in notice.call_args_list
+            if "Ignoring non-secret key(s)" in call.args[0]
+        ]
+        self.assertEqual(len(warnings), 1)
+
 
 class TestFieldMap(unittest.TestCase):
     def test_all_env_names(self):
