@@ -289,6 +289,96 @@ class TestHashTickerReachesObserver(unittest.TestCase):
         self.assertEqual(final, {"e621": "hit", "danbooru": "miss"})
         self.assertIn("e621 ✓", statuses[-1].sub)
 
+    def test_source_exception_is_remembered_as_retryable(self):
+        s = _offline_settings()
+        s.sources.e621_enabled = True
+        ti = TagIntegrator(settings=s)
+        ti.has_e621 = True
+
+        def fail(_service, _md5):
+            raise OSError("temporary CA bundle failure")
+
+        ti._hash_lookup = fail
+        ti._observer = RecordingObserver()
+        item = FileItem(path=Path("/tmp/x.mp4"), relpath="x.mp4", size=1,
+                        mtime=0.0, kind="video", md5="0" * 32)
+        with cf.ThreadPoolExecutor(max_workers=1) as ex, \
+             mock.patch("furtag.notify"):
+            tags, urls, sources = ti.hash_tier(item, ex)
+        self.assertFalse(tags or urls or sources)
+        self.assertEqual(item.lookup_errors, {"e621"})
+
+    def test_missing_ca_bundle_stops_the_scan_once(self):
+        s = _offline_settings()
+        s.sources.e621_enabled = True
+        ti = TagIntegrator(settings=s)
+        ti.has_e621 = True
+
+        def fail(_service, _md5):
+            raise OSError(
+                "Could not find a suitable TLS CA certificate bundle, "
+                "invalid path: /moved/.venv/certifi/cacert.pem")
+
+        ti._hash_lookup = fail
+        ti._observer = RecordingObserver()
+        item = FileItem(path=Path("/tmp/x.mp4"), relpath="x.mp4", size=1,
+                        mtime=0.0, kind="video", md5="0" * 32)
+        with cf.ThreadPoolExecutor(max_workers=1) as ex, \
+             mock.patch("furtag.notify") as notice:
+            ti.hash_tier(item, ex)
+        self.assertTrue(ti.cancelled())
+        self.assertEqual(notice.call_count, 1)
+        self.assertIn("stopping safely", notice.call_args.args[0])
+
+
+class TestTransientLookupFailures(unittest.TestCase):
+    def _run_with_hash_failure(self, suffix):
+        d = Path(tempfile.mkdtemp(prefix="furtag-retry-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        media = d / f"media{suffix}"
+        media.write_bytes(b"not-real-media")
+        s = _offline_settings()
+        s.sources.e621_enabled = True
+        ti = TagIntegrator(settings=s)
+        ti.has_e621 = True
+
+        def fail(_service, _md5):
+            raise OSError("temporary CA bundle failure")
+
+        ti._hash_lookup = fail
+        if suffix == ".png":
+            ti.perceptual_tier = lambda _item: (
+                set(), set(), [], None)
+        rec = RecordingObserver()
+        with contextlib.redirect_stdout(io.StringIO()), \
+             mock.patch("furtag.notify"):
+            summary = ti.run(
+                d, options=_run_options(), observer=rec,
+                use_terminal_display=False)
+        ledger = furtag.Ledger(d)
+        ledger.load()
+        return media, ledger, rec, summary
+
+    def test_hash_only_video_failure_is_not_checkpointed_as_nomatch(self):
+        media, ledger, rec, summary = self._run_with_hash_failure(".mp4")
+        stat = media.stat()
+        self.assertEqual(
+            ledger.status_for(media.name, stat.st_size, stat.st_mtime),
+            "hashed")
+        self.assertEqual(summary.unmatched, 0)
+        events = rec.kinds("finish_file", "hash")
+        self.assertTrue(events[-1].extra["retryable"])
+
+    def test_image_with_hash_failure_and_perceptual_miss_stays_retryable(self):
+        media, ledger, rec, summary = self._run_with_hash_failure(".png")
+        stat = media.stat()
+        self.assertEqual(
+            ledger.status_for(media.name, stat.st_size, stat.st_mtime),
+            "hashed")
+        self.assertEqual(summary.unmatched, 0)
+        events = rec.kinds("finish_file", "perceptual")
+        self.assertTrue(events[-1].extra["retryable"])
+
 
 class TestUrlEnrichmentBoundary(unittest.TestCase):
     """Only byte-exact hash-tier results may enter Hydrus's downloader."""

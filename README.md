@@ -101,7 +101,7 @@ Run `./FurTag.command` (or `.venv/bin/python furtag.py`). FurTag prompts for a f
 - Type `q`, `quit`, or `exit` (or press Ctrl+C / Ctrl+D) to quit. An invalid path re-prompts rather than exiting.
 - Type **`NUKE!`** instead of a folder to enter reset mode. FurTag asks for the target folder, counts its generated ledgers/reports and media sidecars recursively, and requires `ARE YOU SURE? [y/N]` confirmation. A separate second `[y/N]` question then offers to remove precisely named rendered PDF pages so they are re-exported. Source PDFs, ordinary media, and unrelated output-folder contents are never selected; filesystem roots are refused. The reset then immediately scans that folder from scratch.
 
-- When Hydrus result pages are enabled, FurTag asks for a per-page newest-N limit before every scan. Enter `0` for unlimited; blank accepts the current value from `credentials.txt` (or the previous scan).
+- When Hydrus result pages are enabled, FurTag asks for a per-page newest-N limit before every scan. Enter `0` for unlimited; blank accepts the current value from Settings.
 - Hydrus review-page size, no-match importing, and optional **Already Tagged** pages are selected once at launch and remain in effect until FurTag closes. The no-match choice also catches unchanged prior `nomatch` ledger records once and caches their Hydrus SHA-256 so they are not repeatedly imported.
 - After choosing a folder, an optional sidecar sync pushes existing `<media>.txt` tags and `<media>.urls.txt` source URLs to Hydrus without re-running online searches. Successful files receive a separate `sidecar_sync` checkpoint in their per-directory ledger; unchanged media/sidecar payloads are skipped on later syncs, while matched/no-match scan status is left untouched. With Hydrus file-search permission, already-current SHA-256s also bypass the expensive re-import endpoint.
 - After every completed scan, FurTag asks `Scan another folder? [y/N]` instead of immediately exiting.
@@ -125,7 +125,7 @@ When it finishes, each media file that matched has two sidecars written next to 
 
 ## How it works
 
-The pipeline runs in stages (see `CLAUDE.md` for the full architecture):
+The pipeline runs in stages:
 
 1. **Index** — one walk of the folder tree. Dotfiles, macOS `._` metadata, non-media files, files that already have a tag sidecar, and files the ledger already recorded (unchanged) are skipped. Survivors are returned videos-first, then images, each in natural path order for stable, resumable runs.
 2. **Hash** — every candidate's local MD5 is computed in a thread pool.
@@ -136,7 +136,8 @@ The pipeline runs in stages (see `CLAUDE.md` for the full architecture):
 
 **PDFs** — each PDF is rendered to per-page, lossless PNGs in a subfolder beside it, each with a `comic:`/`page:` sidecar, then fed straight into the perceptual tier (their perceptual tags append to that same sidecar). When new PDFs are found, a numbered menu offers standard 300 DPI, archival 600 DPI, or a custom 72–2400 DPI value. Rendering runs on a dedicated background worker while ordinary files continue through indexing, hashing, and tagging; the index shows a live folder/media count on large trees. Each completed PDF joins the perceptual queue while later PDFs continue rendering. If PyMuPDF rejects an oversized page bitmap, that PDF automatically retries at half the DPI until it fits, remaining lossless PNG throughout. Already-rendered PDFs are skipped unless the optional PDF portion of `NUKE!` removes them for re-export.
 
-For the complete architecture — rate-limiting internals, perceptual→authoritative enrichment, per-source parsing quirks — see **[`CLAUDE.md`](./CLAUDE.md)**.
+The engine and settings modules contain the detailed contracts for rate
+limiting, perceptual→authoritative enrichment, and per-source parsing.
 
 ---
 

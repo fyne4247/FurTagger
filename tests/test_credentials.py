@@ -1,12 +1,12 @@
 """Credential store: env vars, keyring isolation, redaction."""
 
 import os
-import tempfile
 import unittest
-from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from furtag_credentials import CredentialStore, redact_secrets, FIELD_MAP
+from furtag_credentials import (
+    CredentialSnapshot, CredentialStore, FIELD_MAP, redact_secrets,
+)
 
 
 class TestEnvCredentials(unittest.TestCase):
@@ -24,20 +24,6 @@ class TestEnvCredentials(unittest.TestCase):
             val = store.get("gelbooru_api_key")
             self.assertIsInstance(val, str)
 
-    def test_plaintext_parse(self):
-        with tempfile.TemporaryDirectory() as td:
-            p = Path(td) / "credentials.txt"
-            p.write_text(
-                "e621_username = alice\n"
-                "e621_api_key = secret123\n"
-                "# comment\n"
-                "hydrus_api_url = http://127.0.0.1:45869\n",
-                encoding="utf-8")
-            store = CredentialStore()
-            cfg = store.load_from_plaintext(p)
-            self.assertEqual(cfg["e621_username"], "alice")
-            self.assertEqual(cfg["e621_api_key"], "secret123")
-
     def test_redact(self):
         text = "Authorization: Bearer supersecretkey123 and more"
         self.assertNotIn(
@@ -45,78 +31,39 @@ class TestEnvCredentials(unittest.TestCase):
             redact_secrets(text, ["supersecretkey123"]))
 
 
-class TestLegacyPlaintextMerge(unittest.TestCase):
-    """A leftover credentials.txt may still supply secrets, but must never
-    override non-secret preferences the user set in Settings."""
-
-    def _load(self, legacy_text: str, tag_service: str = "my gui tags"):
+class TestSecureStoreMerge(unittest.TestCase):
+    def _load(self, values, tag_service: str = "my gui tags"):
         from furtag import TagIntegrator
         from furtag_settings import Settings
 
-        with tempfile.TemporaryDirectory() as td:
-            legacy = Path(td) / "credentials.txt"
-            legacy.write_text(legacy_text, encoding="utf-8")
-            s = Settings()
-            s.output.hydrus_enabled = True
-            s.output.hydrus_tag_service = tag_service
-            ti = TagIntegrator(settings=s)
-            seen = {}
-            with patch.object(TagIntegrator, "_init_hydrus",
-                              lambda self, cfg: seen.update(cfg)), \
-                 patch.dict(os.environ, {}, clear=True):
-                ti.load_credentials_from_store(
-                    store=CredentialStore(service="org.furtag.FurTag.test.none"),
-                    legacy_path=legacy)
-            return seen
+        s = Settings()
+        s.output.hydrus_enabled = True
+        s.output.hydrus_tag_service = tag_service
+        ti = TagIntegrator(settings=s)
+        seen = {}
+        store = MagicMock()
+        store.load_all.return_value = CredentialSnapshot(values)
+        with patch.object(TagIntegrator, "_init_hydrus",
+                          lambda self, cfg: seen.update(cfg)):
+            ti.load_credentials_from_store(store=store)
+        return seen
 
-    def test_non_secret_key_does_not_override_settings(self):
-        cfg = self._load(
-            "hydrus_tag_service = stale file tags\n"
-            "hydrus_import = false\n"
-            "hydrus_results_page = off\n")
+    def test_non_secret_preferences_come_from_settings(self):
+        cfg = self._load({})
         self.assertEqual(cfg.get("hydrus_tag_service"), "my gui tags")
         self.assertEqual(cfg.get("hydrus_import"), "true")
         self.assertEqual(cfg.get("hydrus_results_page"), "on")
 
-    def test_secret_key_still_picked_up(self):
-        cfg = self._load(
-            "hydrus_access_key = deadbeef\n"
-            "hydrus_api_url = http://127.0.0.1:45869\n"
-            "e621_api_key = legacy-secret\n"
-            "hydrus_tag_service = stale file tags\n")
-        self.assertEqual(cfg.get("hydrus_access_key"), "deadbeef")
+    def test_secret_fields_are_loaded_from_secure_snapshot(self):
+        cfg = self._load({
+            "hydrus_access_key": "fake-test-access-key",
+            "hydrus_api_url": "http://127.0.0.1:45869",
+            "e621_api_key": "fake-test-e621-key",
+        })
+        self.assertEqual(cfg.get("hydrus_access_key"), "fake-test-access-key")
         self.assertEqual(cfg.get("hydrus_api_url"), "http://127.0.0.1:45869")
-        self.assertEqual(cfg.get("e621_api_key"), "legacy-secret")
+        self.assertEqual(cfg.get("e621_api_key"), "fake-test-e621-key")
         self.assertEqual(cfg.get("hydrus_tag_service"), "my gui tags")
-
-    def test_ignored_non_secret_warning_is_once_per_process(self):
-        from furtag import TagIntegrator
-        from furtag_settings import Settings
-
-        with tempfile.TemporaryDirectory() as td:
-            legacy = Path(td) / "credentials.txt"
-            legacy.write_text(
-                "hydrus_import = false\n"
-                "hydrus_tag_service = stale file tags\n",
-                encoding="utf-8")
-            settings = Settings()
-            settings.output.hydrus_enabled = True
-            first = TagIntegrator(settings=settings)
-            second = TagIntegrator(settings=settings)
-            store = CredentialStore(service="org.furtag.FurTag.test.none")
-            with patch.object(TagIntegrator, "_init_hydrus"), \
-                 patch.dict(os.environ, {}, clear=True), \
-                 patch("furtag.notify") as notice:
-                first.load_credentials_from_store(
-                    store=store, legacy_path=legacy)
-                second.load_credentials_from_store(
-                    store=store, legacy_path=legacy)
-
-        warnings = [
-            call.args[0] for call in notice.call_args_list
-            if "Ignoring non-secret key(s)" in call.args[0]
-        ]
-        self.assertEqual(len(warnings), 1)
 
 
 class TestFieldMap(unittest.TestCase):

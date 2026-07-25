@@ -37,7 +37,7 @@ so an unchanged folder can be skipped wholesale on the next run without
 checking any individual file. A file/folder is only re-checked if something
 in it actually changed (size, mtime, or membership).
 
-Output — pick one (or both) via credentials.txt:
+Output — choose one or both in Settings:
 
   A) Hydrus Client API (preferred when configured):
         import file → add tags → associate source URLs
@@ -48,49 +48,9 @@ Output — pick one (or both) via credentials.txt:
         <file>.<ext>.txt       → tags (one per line)
         <file>.<ext>.urls.txt  → source URLs (one per line)
 
-Python 3.7+ compatible.
-
-Dependencies:
-    pip install pillow requests regex
-    (+ PyMuPDF for PDFs; optional)
-
-Credentials live in a single credentials.txt alongside this script
-(any missing/incomplete key just disables that source instead of crashing):
-
-    credentials.txt
-        e621_username     = your_e621_username
-        e621_api_key      = your_64char_api_key
-        inkbunny_username = your_inkbunny_username
-        inkbunny_password = your_inkbunny_password
-        danbooru_username = your_danbooru_username
-        danbooru_api_key  = your_danbooru_api_key
-        gelbooru_user_id  = your_gelbooru_user_id
-        gelbooru_api_key  = your_gelbooru_api_key
-        sauce_nao_api_key = your_saucenao_api_key
-
-        # Optional — push straight into a running Hydrus client (no sidecars):
-        hydrus_api_url       = http://127.0.0.1:45869
-        hydrus_access_key    = your_64char_client_api_access_key
-        hydrus_tag_service   = downloader tags
-        hydrus_import        = true    # import file then tag (false = tag-only)
-        hydrus_also_sidecars = false   # also write .txt sidecars when API is on
-        hydrus_tag_deleted_duplicates = true  # tag current duplicate-group members
-        hydrus_results_page  = on      # blank/false disables the result pages below
-        hydrus_results_page_limit = 0  # newest N files per result page; 0 = unlimited
-        hydrus_new_imports_page = FurTag New Imports   # brand-new imports this run
-        hydrus_newly_tagged_page = FurTag Newly Tagged # files already in Hydrus, newly tagged
-        hydrus_duplicate_tagged_page = FurTag Duplicate Tagged  # duplicate-group members
-                                       # tagged for a previously-deleted file
-        hydrus_already_tagged_page = Already Tagged  # matched ledger history; false disables
-
-    Note: Danbooru requires a verified-email account for API auth; if the key
-    is rejected (403) the script falls back to anonymous Danbooru access.
-    Hydrus Client API needs permissions: import files, edit tags, edit URLs,
-    and manage pages for the optional unfocused results page. Adding Search for
-    and Fetch Files lets FurTag batch-check its MD5s against Hydrus and skip
-    redundant import checks for files already there. To send tags for a
-    previously-deleted import to its current duplicate-group members, also add
-    Manage File Relationships.
+Secrets resolve from ``FURTAG_*`` environment variables and the operating
+system keyring. Non-secret preferences live in platform-specific Settings.
+Missing credentials disable only the affected source.
 """
 
 import concurrent.futures as cf
@@ -127,7 +87,7 @@ from furtag_settings import (
 )
 from furtag_events import NullObserver, RunEvent, RunObserver, TerminalObserver
 from furtag_review import PendingReview, ReviewQueue
-from furtag_credentials import ALL_FIELDS as CREDENTIAL_FIELDS, CredentialStore
+from furtag_credentials import CredentialStore
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # don't crash on slightly-truncated files
 
@@ -169,8 +129,6 @@ RESOLVED_LEDGER_STATUSES = frozenset({"matched", "nomatch", "duplicate"})
 HASH_SOURCES = ("e621", "inkbunny", "danbooru", "gelbooru")
 SEARCH_SOURCES = HASH_SOURCES + ("fluffle", "saucenao")
 
-CREDENTIALS_FILE = "credentials.txt"
-_LEGACY_NONSECRET_WARNINGS: Set[Tuple[str, Tuple[str, ...]]] = set()
 LEDGER_FILE      = ".furtag_ledger.json"
 DUPLICATES_FILE  = "duplicates.log"
 HYDRUS_HASH_LOOKUP_BATCH = 256  # well below the Client API's 2 MB GET limit
@@ -203,14 +161,14 @@ def _is_junk_tag(tag: str) -> bool:
 
 
 def _truthy(val: str, default: bool = False) -> bool:
-    """Parse a credentials.txt boolean (true/yes/1/on). Empty → default."""
+    """Parse a serialized boolean (true/yes/1/on). Empty → default."""
     if val is None or str(val).strip() == "":
         return default
     return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _bool_str(val: bool) -> str:
-    """Render a bool in the credentials.txt spelling `_truthy` parses back."""
+    """Render a bool in the spelling `_truthy` parses back."""
     return "true" if val else "false"
 
 
@@ -542,6 +500,9 @@ class FileItem:
     md5: Optional[str] = None
     sha256: Optional[str] = None      # current Hydrus match found this run
     perceptual_only: bool = False   # PDF-derived page: skip hash tier, go perceptual
+    lookup_errors: Set[str] = field(default_factory=set)
+    # A transient source failure is not a clean miss. Keep this file's ledger
+    # at ``hashed`` so a later run retries the network work without re-hashing.
 
 
 # ── Session ledger ───────────────────────────────────────────────────────────
@@ -903,6 +864,8 @@ class TagIntegrator:
         self._display_detached = True
         self._review_queue: Optional[ReviewQueue] = None
         self._run_lock = threading.Lock()  # one scan at a time
+        self._fatal_network_lock = threading.Lock()
+        self._fatal_network_error = False
 
         # Per-service pacers — intervals are filled in by apply_settings() below,
         # which is the single place settings → instance attrs is wired.
@@ -1057,43 +1020,35 @@ class TagIntegrator:
     def request_cancel(self) -> None:
         self.cancel_event.set()
 
+    def _stop_for_broken_ca_bundle(self, error: Exception) -> bool:
+        """Cancel safely when Requests can no longer access its trust store."""
+        message = str(error)
+        if ("TLS CA certificate bundle" not in message
+                or "invalid path" not in message):
+            return False
+        with self._fatal_network_lock:
+            first = not self._fatal_network_error
+            self._fatal_network_error = True
+        self.request_cancel()
+        if first:
+            notify(
+                "❌ HTTPS certificate bundle became unavailable; stopping "
+                "safely. Restart FurTag from its current folder.")
+        return True
+
     # ── Credential loading ───────────────────────────────────────────────────
 
-    @staticmethod
-    def _read_kv(creds: Path) -> Dict[str, str]:
-        """Parse a legacy credentials.txt. One parser for this file format."""
-        return CredentialStore().load_from_plaintext(creds)
+    def load_credentials(self, cfg: Optional[Dict[str, str]] = None) -> None:
+        """Load credentials from keyring/environment or an in-memory mapping.
 
-    def load_credentials(self, creds: Optional[Path] = None,
-                         cfg: Optional[Dict[str, str]] = None) -> None:
-        """Load credentials from a dict, CredentialStore, or legacy credentials.txt.
-
-        Any missing/incomplete set just marks that source unavailable.
+        Any missing/incomplete set just marks that source unavailable. Secret
+        material is never read from a project file.
         """
         if cfg is None:
-            if creds is None:
-                creds = Path(__file__).with_name(CREDENTIALS_FILE)
-            print(f"🔑 Loading credentials from {creds.name}")
-            if not creds.exists():
-                notify("‼️  Missing credentials.txt – all API sources disabled.")
-                # Still try env/keyring
-                store = CredentialStore()
-                cfg = store.load_all().as_cfg()
-                if not any(cfg.values()):
-                    return
-            else:
-                cfg = self._read_kv(creds)
-                # Overlay env vars (env wins)
-                store = CredentialStore()
-                env_cfg = store.load_all().as_cfg()
-                for k, v in env_cfg.items():
-                    if v:
-                        cfg[k] = v
-        else:
-            print("🔑 Loading credentials from secure store / environment")
+            cfg = CredentialStore().load_all().as_cfg()
+        print("🔑 Loading credentials from secure store / environment")
 
-        # Non-secret Hydrus prefs default from settings; anything already in cfg
-        # (i.e. explicitly set in credentials.txt) wins.
+        # Non-secret Hydrus preferences always come from Settings.
         out = self.settings.output
         hy = self.settings.hydrus
         defaults = {
@@ -1122,34 +1077,11 @@ class TagIntegrator:
             self.has_hydrus = False
         self._apply_source_toggles()
 
-    def load_credentials_from_store(self, store: Optional[CredentialStore] = None,
-                                    legacy_path: Optional[Path] = None) -> None:
-        """Preferred path: keyring + env vars (no plaintext file required)."""
+    def load_credentials_from_store(
+            self, store: Optional[CredentialStore] = None) -> None:
+        """Load only from environment variables and the OS-backed keyring."""
         store = store or CredentialStore()
-        snap = store.load_all()
-        cfg = snap.as_cfg()
-        # Also merge legacy credentials.txt if present (private migration window),
-        # but ONLY its secret/identity fields. Non-secret preferences (tag
-        # service, page names, hydrus_import, …) must always come from Settings —
-        # a leftover line in this file used to silently beat the Settings tab.
-        legacy = legacy_path or Path(__file__).with_name(CREDENTIALS_FILE)
-        if legacy.exists():
-            allowed = set(CREDENTIAL_FIELDS) | {"hydrus_url", "hydrus_api_key"}
-            ignored: List[str] = []
-            for k, v in self._read_kv(legacy).items():
-                if k in allowed:
-                    cfg.setdefault(k, v)
-                elif v:
-                    ignored.append(k)
-            if ignored:
-                warning_key = (
-                    str(legacy.resolve()), tuple(sorted(set(ignored))))
-                if warning_key not in _LEGACY_NONSECRET_WARNINGS:
-                    _LEGACY_NONSECRET_WARNINGS.add(warning_key)
-                    notify(f"⚠️  Ignoring non-secret key(s) in {legacy.name}: "
-                           f"{', '.join(warning_key[1])} — these now come "
-                           "from Settings.")
-        self.load_credentials(cfg=cfg)
+        self.load_credentials(cfg=store.load_all().as_cfg())
 
     def _init_e621(self, cfg: Dict[str, str]) -> None:
         self.e621_username = cfg.get("e621_username", "")
@@ -3762,6 +3694,7 @@ class TagIntegrator:
         tags: Set[str] = set()
         urls: Set[str] = set()
         hit: Set[str] = set()
+        item.lookup_errors.clear()
         if not item.md5 or not services:
             return tags, urls, []
 
@@ -3783,7 +3716,9 @@ class TagIntegrator:
             except Exception as e:
                 # Network/HTTP failure — distinct from a clean "not found" miss,
                 # so surface it as ⚠ rather than ✗ (the file may still exist there).
-                notify(f"❌ {s} failed on {item.path.name}: {e}")
+                if not self._stop_for_broken_ca_bundle(e):
+                    notify(f"❌ {s} failed on {item.path.name}: {e}")
+                item.lookup_errors.add(s)
                 state[s] = "err"
                 _tick(state)
                 continue
@@ -4039,6 +3974,7 @@ class TagIntegrator:
             self.apply_settings(options.settings_override)
         self.cancel_event = cancel_event or threading.Event()
         self.cancel_event.clear()
+        self._fatal_network_error = False
         self._bind_cancel_to_pacers()
         summary = ScanSummary(
             source_hits={k: 0 for k in
@@ -4244,15 +4180,28 @@ class TagIntegrator:
                         self._emit("finish_file", track="perceptual",
                                    result=result, source_hits=source_totals)
                     else:
-                        sha = self.write_unmatched(item.path, item.sha256)
-                        item.ledger.record(item.path.name, item.size, item.mtime,
-                                            item.md5, "nomatch", [], sha256=sha)
-                        _bump_miss()
-                        self._emit("finish_file", track="perceptual",
-                                   result="— no match")
+                        if item.lookup_errors:
+                            failed = "+".join(sorted(item.lookup_errors))
+                            self._emit(
+                                "finish_file", track="perceptual",
+                                result=f"retry later — {failed} error",
+                                extra={"retryable": True,
+                                       "failed_sources":
+                                           sorted(item.lookup_errors)})
+                        else:
+                            sha = self.write_unmatched(item.path, item.sha256)
+                            item.ledger.record(
+                                item.path.name, item.size, item.mtime,
+                                item.md5, "nomatch", [], sha256=sha)
+                            _bump_miss()
+                            self._emit("finish_file", track="perceptual",
+                                       result="— no match")
                     _maybe_save_ledgers()
                 except Exception as e:
-                    notify(f"❌ perceptual worker error on {item.path.name}: {e}")
+                    if not self._stop_for_broken_ca_bundle(e):
+                        notify(
+                            f"❌ perceptual worker error on "
+                            f"{item.path.name}: {e}")
                 finally:
                     perceptual_q.task_done()
 
@@ -4303,12 +4252,22 @@ class TagIntegrator:
                         self._emit("finish_file", track="hash",
                                    result="no hash match → perceptual")
                     else:                                  # video: hash-only
-                        sha = self.write_unmatched(item.path, item.sha256)
-                        item.ledger.record(item.path.name, item.size, item.mtime,
-                                            item.md5, "nomatch", [], sha256=sha)
-                        _bump_miss()
-                        self._emit("finish_file", track="hash",
-                                   result="— no match")
+                        if item.lookup_errors:
+                            failed = "+".join(sorted(item.lookup_errors))
+                            self._emit(
+                                "finish_file", track="hash",
+                                result=f"retry later — {failed} error",
+                                extra={"retryable": True,
+                                       "failed_sources":
+                                           sorted(item.lookup_errors)})
+                        else:
+                            sha = self.write_unmatched(item.path, item.sha256)
+                            item.ledger.record(
+                                item.path.name, item.size, item.mtime,
+                                item.md5, "nomatch", [], sha256=sha)
+                            _bump_miss()
+                            self._emit("finish_file", track="hash",
+                                       result="— no match")
                     _maybe_save_ledgers()
 
             perceptual_q.join()

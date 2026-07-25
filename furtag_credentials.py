@@ -3,7 +3,6 @@
 Resolution order for each secret field:
 1. Environment variable ``FURTAG_<KEY>`` (uppercase, e.g. FURTAG_E621_API_KEY)
 2. OS keyring item under service ``org.furtag.FurTag``
-3. (Development only) legacy plaintext credentials.txt — temporary migration path
 
 Secrets never enter settings.json, progress events, or logs.
 """
@@ -12,12 +11,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 KEYRING_SERVICE = "org.furtag.FurTag"
 
-# Logical field name → (env var, keyring username key, credentials.txt key)
+# Logical field name → (environment variable, keyring item name)
 # keyring stores one secret per (service, username) pair; username is the field id.
 FIELD_MAP = {
     "e621_username": ("FURTAG_E621_USERNAME", "e621_username"),
@@ -52,7 +50,7 @@ class CredentialSnapshot:
         return self.values.get(key, default) or default
 
     def as_cfg(self) -> Dict[str, str]:
-        """Lower-case keys matching legacy credentials.txt for TagIntegrator."""
+        """Lower-case keys consumed by TagIntegrator."""
         return {k.lower(): v for k, v in self.values.items() if v}
 
 
@@ -130,40 +128,6 @@ class CredentialStore:
             except Exception as e:
                 errors.append(f"{field}: {e}")
         return errors
-
-    def load_from_plaintext(self, path: Path) -> Dict[str, str]:
-        """Read a legacy credentials.txt (private migration helper only)."""
-        cfg: Dict[str, str] = {}
-        if not path.exists():
-            return cfg
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, v = map(str.strip, line.split("=", 1))
-                cfg[k.lower()] = v
-        return cfg
-
-    @staticmethod
-    def resolve_plaintext_updates(cfg: Dict[str, str]) -> Dict[str, str]:
-        """Known fields (plus legacy aliases) to import from a credentials dict.
-
-        Exposed so a --dry-run preview shows exactly what a real migration would
-        write, instead of re-deriving the field filter and aliases separately.
-        """
-        updates = {field: cfg[field] for field in ALL_FIELDS if cfg.get(field)}
-        # Legacy alias names for the two Hydrus connection fields.
-        for alias, field in (("hydrus_url", "hydrus_api_url"),
-                             ("hydrus_api_key", "hydrus_access_key")):
-            if not updates.get(field) and cfg.get(alias):
-                updates[field] = cfg[alias]
-        return updates
-
-    def migrate_from_plaintext(self, path: Path) -> Tuple[int, List[str]]:
-        """Import known fields from credentials.txt into keyring. Returns (n, errs)."""
-        updates = self.resolve_plaintext_updates(self.load_from_plaintext(path))
-        errors = self.save_fields(updates)
-        return len(updates) - len(errors), errors
-
 
 def redact_secrets(text: str, secrets: Optional[List[str]] = None) -> str:
     """Best-effort redaction of known secret substrings from log text."""

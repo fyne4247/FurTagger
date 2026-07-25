@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Shipped defaults (= today's module constants / credentials.txt defaults).
+# Shipped defaults used by both frontends.
 # Keep these identical to furtag.py module constants so an untouched install
 # matches the current CLI baseline.
 

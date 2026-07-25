@@ -27,6 +27,22 @@ setup_venv() {
         touch ".venv/.deps-stamp"
         echo "✅ Dependencies ready."
     fi
+
+    # Requests needs certifi's bundled CA file for every HTTPS source. Package
+    # metadata can survive a partial/corrupt install even when cacert.pem does
+    # not, so verify the actual data file on every launch and repair just that
+    # lightweight dependency when necessary.
+    if ! ./.venv/bin/python -c \
+        'import certifi, pathlib, sys; sys.exit(not pathlib.Path(certifi.where()).is_file())'
+    then
+        echo "🔧 Repairing HTTPS certificate bundle…"
+        ./.venv/bin/python -m pip install --quiet --upgrade --force-reinstall certifi || {
+            echo "❌ Could not repair the HTTPS certificate bundle."
+            read -r -n1 -s
+            exit 1
+        }
+        echo "✅ HTTPS certificate bundle ready."
+    fi
 }
 
 setup_venv

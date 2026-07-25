@@ -10,7 +10,8 @@ credentials.txt
 .env.*
 
 # Signing / certificates / private keys (packaging)
-certs/
+certs/*
+!certs/README.md
 certificates/
 signing/
 *.p12
