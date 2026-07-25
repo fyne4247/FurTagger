@@ -31,10 +31,12 @@ It's built for tagging a large personal media archive with as little manual work
 
 ### Running it
 
-The intended entry point is the double-clickable **`FurTag.command`**. On first run it creates a `.venv`, installs the dependencies, and launches the tool. It re-installs deps automatically whenever `requirements.txt` changes, so you never have to delete the venv by hand.
+**CLI** — double-clickable **`FurTag.command`**. On first run it creates a `.venv`, installs the dependencies, and launches the tool. It re-installs deps automatically whenever `requirements.txt` changes.
+
+**GUI** — cross-platform desktop app (PySide6):
 
 ```bash
-./FurTag.command
+.venv/bin/python furtag_gui.py
 ```
 
 Or set it up and run manually:
@@ -42,63 +44,55 @@ Or set it up and run manually:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python furtag.py
+.venv/bin/python furtag.py      # CLI
+.venv/bin/python furtag_gui.py  # GUI
 ```
 
 > The project venv is required — your system `python3` won't have the dependencies.
+
+Packaged builds (Phase 4): see `packaging/build.sh` and `packaging/furtag.spec`. Build natively on each OS; sign/notarize before validating keyring persistence.
 
 ---
 
 ## Setup: credentials
 
-Create a single **`credentials.txt`** alongside the script, one `key = value` per line. **Any missing or incomplete key simply disables that source** instead of crashing — so you can fill in only the services you have accounts for.
+Secrets live in the **OS credential store** (macOS Keychain / Windows Credential Locker / Linux Secret Service) via the GUI **Credentials** window, or as **`FURTAG_*` environment variables** for headless/NAS installs. Never put API keys in `settings.json`.
 
-```ini
-# credentials.txt — one key = value per line
-e621_username     = your_e621_username
-e621_api_key      = your_e621_api_key_here
-inkbunny_username = your_inkbunny_username
-inkbunny_password = your_inkbunny_password
-danbooru_username = your_danbooru_username
-danbooru_api_key  = your_danbooru_api_key_here
-gelbooru_user_id  = your_gelbooru_user_id
-gelbooru_api_key  = your_gelbooru_api_key_here
-sauce_nao_api_key = your_saucenao_api_key_here
+| Field | Environment variable |
+| ----- | -------------------- |
+| e621 username / API key | `FURTAG_E621_USERNAME` / `FURTAG_E621_API_KEY` |
+| InkBunny username / password | `FURTAG_INKBUNNY_USERNAME` / `FURTAG_INKBUNNY_PASSWORD` |
+| Danbooru username / API key | `FURTAG_DANBOORU_USERNAME` / `FURTAG_DANBOORU_API_KEY` |
+| Gelbooru user id / API key | `FURTAG_GELBOORU_USER_ID` / `FURTAG_GELBOORU_API_KEY` |
+| SauceNAO API key | `FURTAG_SAUCE_NAO_API_KEY` |
+| Hydrus API URL / access key | `FURTAG_HYDRUS_API_URL` / `FURTAG_HYDRUS_ACCESS_KEY` |
 
-# Optional — push straight into Hydrus (Client API). No sidecars needed.
-hydrus_api_url       = http://127.0.0.1:45869
-hydrus_access_key    = your_64char_client_api_access_key
-hydrus_tag_service   = downloader tags
-hydrus_import        = true    # import the file then tag it (false = tag-only by hash)
-hydrus_also_sidecars = false   # also write .txt sidecars when the API is on
-hydrus_results_page  = FurTag Results  # silently collect accepted files; false disables
-hydrus_already_tagged_page = Already Tagged  # matched ledger history; false disables
-```
+Resolution order per field: **environment variable → OS keyring**. Empty / missing simply disables that source.
+
+Non-secret preferences (thresholds, source toggles, page names, sidecar format, rate limits, etc.) live in a platform-specific `settings.json` via `platformdirs`. In the GUI, every settings tab has **Save as default** and **Restore defaults**.
+
+Default matching thresholds (unchanged from the previous CLI baseline): SauceNAO min **80%**, SauceNAO auth **88%**, Fluffle auto-accepts `exact` (+ e621 `tossUp` re-query). Optional **Fluffle review mode** queues uncertain matches for human approval without stalling the pipeline.
 
 **InkBunny note:** in your InkBunny account settings you must enable **API access** *and* **adult ratings**, or explicit results stay hidden from the API.
 
 **Danbooru note:** API auth requires a verified-email account; if the key is rejected FurTag falls back to anonymous Danbooru access (which still allows MD5 lookups).
 
-**Hydrus Client API note:** enable the API under *services → manage services*, then create an access key under *review services* with permissions to **import files**, **edit tags**, **edit URLs**, and **manage pages**. FurTag verifies the key and resolves `hydrus_tag_service` (name or service key) on startup; if the client is offline it falls back to sidecars. Successfully imported/already-present files collect on a new, unfocused `hydrus_results_page` each run. Files marked `matched` by existing ledgers collect on a separate, unfocused `hydrus_already_tagged_page`; their SHA-256 values are cached into the ledgers after the first page load. Set either page option to `false` to disable it.
+**Hydrus Client API note:** enable the API under *services → manage services*, then create an access key under *review services* with permissions to **import files**, **edit tags**, **edit URLs**, and **manage pages**. Add **Search for and Fetch Files** for MD5→SHA-256 caching. Add **Manage File Relationships** if deleted-duplicate tagging is on: metadata goes only to relationship type **duplicate**—never alternates.
 
 ---
 
-## ⚠️ Security warning — read this
+## ⚠️ Security
 
-`credentials.txt` stores API keys **and account passwords in plaintext**. Treat the file as a secret.
-
-- **It's git-ignored by default.** This repo's `.gitignore` already excludes `credentials.txt`, so it won't be committed. **If you fork or push your own copy, verify it's still ignored before you push** (`git status` should never list it).
-- **Lock down its permissions.** Restrict it to owner read/write only:
-  ```bash
-  chmod 600 credentials.txt
-  ```
-- **Some fields are real account passwords** (InkBunny), which makes a leak worse than exposing a mere API key. Where a service supports it, prefer app-specific or throwaway credentials, and **rotate anything that ever gets exposed**.
-- **"Should I just delete the file after each run?"** You *can* — but the tool needs it again on every run, so deleting and recreating it each time is more hassle than it's worth. In practice, locking it down (`chmod 600` + gitignore) is the more useful protection than deleting it.
-- **Future enhancement:** secrets could be stored in the macOS Keychain (via the `keyring` library) instead of plaintext, for anyone who wants that. **This is not implemented yet.**
+- Secrets belong in the OS keyring or environment variables — **not** in a project file and **not** in logs or progress events.
+- The GUI does **not** offer a `credentials.txt` import for end users. Fresh installs enter credentials in the Credentials window or via `FURTAG_*` env vars.
+- Headless machines without a Secret Service can rely entirely on environment variables.
+- Do not screenshot credential dialogs or include keys in support bundles.
 
 ---
 
 ## Usage
+
+### CLI
 
 Run `./FurTag.command` (or `.venv/bin/python furtag.py`). FurTag prompts for a folder to scan:
 
@@ -107,7 +101,12 @@ Run `./FurTag.command` (or `.venv/bin/python furtag.py`). FurTag prompts for a f
 - Type `q`, `quit`, or `exit` (or press Ctrl+C / Ctrl+D) to quit. An invalid path re-prompts rather than exiting.
 - Type **`NUKE!`** instead of a folder to enter reset mode. FurTag asks for the target folder, counts its generated ledgers/reports and media sidecars recursively, and requires `ARE YOU SURE? [y/N]` confirmation. A separate second `[y/N]` question then offers to remove precisely named rendered PDF pages so they are re-exported. Source PDFs, ordinary media, and unrelated output-folder contents are never selected; filesystem roots are refused. The reset then immediately scans that folder from scratch.
 
-After local hashing, FurTag detects byte-identical files by MD5 before making any network requests. One deterministic canonical path is searched; the other copies are recorded as `duplicate` in their ledgers and skipped on later runs. A readable `duplicates.log` in the scanned folder lists each exact hash, the selected canonical file, and every skipped location. An unchanged file already represented by a matched/no-match ledger takes precedence over a new copy.
+- When Hydrus result pages are enabled, FurTag asks for a per-page newest-N limit before every scan. Enter `0` for unlimited; blank accepts the current value from `credentials.txt` (or the previous scan).
+- Hydrus review-page size, no-match importing, and optional **Already Tagged** pages are selected once at launch and remain in effect until FurTag closes. The no-match choice also catches unchanged prior `nomatch` ledger records once and caches their Hydrus SHA-256 so they are not repeatedly imported.
+- After choosing a folder, an optional sidecar sync pushes existing `<media>.txt` tags and `<media>.urls.txt` source URLs to Hydrus without changing any ledgers or re-running searches.
+- After every completed scan, FurTag asks `Scan another folder? [y/N]` instead of immediately exiting.
+
+After local hashing, FurTag detects byte-identical files by MD5 before making any network requests. One deterministic canonical path is searched; its results are then copied to every duplicate filesystem path (including sidecars when enabled), so those copies receive matching ledger records without repeating the lookup. Hydrus already represents byte-identical copies as the same hash, so this does not make duplicate library records. A readable `duplicates.log` in the scanned folder lists each exact hash, the selected canonical file, and every duplicate location. An unchanged file already represented by a matched/no-match ledger takes precedence over a new copy.
 
 It then walks the folder tree and processes files, showing the **two-track live display** — one panel for the hash tier, one for the perceptual tier — each with a previous/current/next file view, a phase label, and a progress bar with elapsed time and ETA. The current file carries a live sub-status showing which site is being checked.
 

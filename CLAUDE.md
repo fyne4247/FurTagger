@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Authoritative product/architecture plan:** see `AGENTS.md` and `PLAN.md`.
+> This file is kept for Claude Code compatibility; when the two disagree, prefer
+> `AGENTS.md` / the live code.
+
 ## What This Is
 
 FurTag is a single Python script (`furtag.py`) that reverse-image-searches media files against furry/booru services and writes the retrieved metadata into Hydrus Network — either via the **Client API** (import + tags + URLs, no sidecars) or as classic Hydrus-compatible sidecar files. It is the consolidation of four earlier iterations (now deleted).
@@ -77,7 +81,7 @@ Pushes are serialised with `_hydrus_lock` because the hash tier and perceptual w
 
 `TagIntegrator.run()` drives four stages (preceded by a PDF pre-pass):
 
-- **PDF pre-pass** (`expand_pdfs()`): before indexing, every `*.pdf` under the root is rendered to per-page PNGs via in-module `convert_pdf()` (into a `<stem>/` subfolder beside the PDF, with `comic:`/`page:` `.txt` sidecars). Returns the set of page-folder paths. Already-rendered PDFs are skipped (guarded on an existing `.png` in the out-dir) so a re-run doesn't churn page mtimes and defeat the ledger. Missing PyMuPDF is non-fatal — PDFs are just left untouched, like a missing credential. See **PDFs** below.
+- **PDF background render** (`plan_pdf_renders()` → `render_pdf_jobs()`): discover PDFs and existing page folders first, then render unconverted PDFs as lossless PNGs on one dedicated worker. Pending output folders are excluded from the initial index so partial pages never leak in. Already-rendered PDFs are skipped. Missing PyMuPDF is non-fatal. See **PDFs** below.
 0. **Index** (`index()`): one `os.walk` of the tree. Skips dotfiles / macOS `._` metadata (`fn.startswith(".")`), non-media extensions, files with an existing tag sidecar, and files the ledger already recorded as matched/no-match (unchanged). Returns the survivors **videos-first, then images** (each group in **natural path order** via `_natural_key` — `PAGE2` before `PAGE10` — for stable, resumable runs). A PNG living in a `pdf_page_dirs` folder is flagged `perceptual_only` and is **exempt from the has-sidecar skip** (its sidecar holds only the base `comic:`/`page:` tags), so it still gets perceptually searched — the ledger alone rules it out on a re-run.
 1. **Hash** (`hash_all()`): compute every candidate's local MD5 in a thread pool (disk-bound, safe to parallelize) so the network stage never recomputes it.
 2. **Hash tier — run ALL and merge** (`hash_tier()`): e621 + InkBunny + Danbooru + Gelbooru queried by MD5 and unioned. The four boorus are **queried concurrently per file** via a `ThreadPoolExecutor` (four different hosts), each self-paced by its own `Pacer`. MD5 identity means byte-identical file, so there is zero false-positive risk and the tag sets genuinely differ. **Never short-circuit between these.** Gelbooru's post API returns a *flat* tag list, so `_gelbooru_categorize()` makes one extra batched call to map tags to `character:`/`creator:`/`series:`, falling back to unnamespaced tags if it fails.
@@ -87,7 +91,7 @@ The hash tier and perceptual tier are **separate passes** over the file list (ph
 
 ### PDFs
 
-`convert_pdf(pdf, out_root, dpi=300, write_sidecars=True) -> [png_paths]` lives in `furtag.py`. `expand_pdfs()` probes for PyMuPDF via `_import_fitz()` once before the render loop (missing PyMuPDF degrades gracefully). The sidecar is written with a **lowercase `.txt`** extension to match `tag_sidecar_path` (`<file>.<ext>.txt`), so perceptual tags append to the *same* file even on a case-sensitive volume. Requires **PyMuPDF** (in `requirements.txt`, import name `fitz`/`pymupdf`). Comic pages therefore never hit the boorus by hash — Fluffle/SauceNAO are their only shot, which is the intended behavior for re-rendered art.
+`convert_pdf(pdf, out_root, dpi=300, write_sidecars=True) -> [png_paths]` lives in `furtag.py`. `plan_pdf_renders()` probes for PyMuPDF via `_import_fitz()` once before launching the background render worker (missing PyMuPDF degrades gracefully). Base-tag sidecars (`comic:`/`page:`) are written in the configured format (txt or json). Requires **PyMuPDF** (in `requirements.txt`, import name `fitz`/`pymupdf`). Comic pages therefore never hit the boorus by hash — Fluffle/SauceNAO are their only shot, which is the intended behavior for re-rendered art.
 
 ### Session ledger
 
@@ -99,7 +103,7 @@ The key pattern: a perceptual hit identifies *which* booru post the image is, so
 
 - Prefer **post ID** over MD5-from-URL (the URL-MD5 trick only works when the CDN URL embeds the hash). `_post_id_from_url()` handles both `/posts/N` and e621's legacy `/post/show/N`.
 - **Fluffle**: `find_best_exact_match()` priority is exact-e621 > exact-other > tossUp-e621. `tossUp` is accepted **only** on e621 (gated by `FLUFFLE_TOSSUP_E621`) because we then re-query e621 by ID via `e621_lookup_by_id()`, so a near-miss stays low-risk. All other `tossUp`/`alternative`/`unlikely` are rejected.
-- **SauceNAO**: `_saucenao_best_authoritative()` reads the `e621_id`/`danbooru_id`/`gelbooru_id` fields directly (preferring e621 → danbooru → gelbooru, and only for sources we hold creds for), then `_authoritative_lookup()` re-queries that booru. Gated behind `SAUCENAO_AUTH_SIMILARITY` (80%), a **higher** bar than `MIN_SIMILARITY` (70%) used to accept SauceNAO's own thinner tags.
+- **SauceNAO**: `_saucenao_best_authoritative()` reads the `e621_id`/`danbooru_id`/`gelbooru_id` fields directly (preferring e621 → danbooru → gelbooru, and only for sources we hold creds for), then `_authoritative_lookup()` re-queries that booru. Gated behind `saucenao_auth_similarity` (default **88%**), a **higher** bar than `saucenao_min_similarity` (default **80%**) used to accept SauceNAO's own thinner tags.
 
 ### SauceNAO own-tags (the messy fallback)
 

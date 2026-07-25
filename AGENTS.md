@@ -6,6 +6,248 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 FurTag is a single Python script (`furtag.py`) that reverse-image-searches media files against furry/booru services and writes the retrieved metadata into Hydrus Network — either via the **Client API** (import + tags + URLs, no sidecars) or as classic Hydrus-compatible sidecar files. It is the consolidation of four earlier iterations (now deleted).
 
+This repository is the GUI branch of FurTag. The current script is the working
+behavioral baseline; the objective is a cross-platform Python desktop GUI in
+the same spirit as Hydrus. It must remain runnable from source on macOS,
+Windows, and Linux, with optional native packages for each platform, without
+changing FurTag's matching, ledger, duplicate, rate-limit, or Hydrus semantics.
+
+## GUI Implementation Plan
+
+### Product target
+
+The first release should feel like a focused desktop application, not a terminal
+embedded in a window:
+
+- Run from source with `python furtag_gui.py`; packaged builds may launch through
+  `FurTag.app`, `FurTag.exe`, or a Linux desktop entry.
+- Show configured source/Hydrus availability before a scan.
+- Provide a Credentials screen that stores API keys and passwords through the
+  operating system's secure credential store rather than a plaintext project
+  file.
+- Choose a folder with a native folder picker or drag-and-drop.
+- Set session-wide Hydrus options once; keep them until the app closes.
+- Show the read-only inventory before work starts, then ask only
+  folder-specific questions such as PDF render quality and sidecar sync.
+- Run the hash and perceptual tracks in the background with separate progress,
+  current-file status, elapsed time, and ETA.
+- Keep a visible rolling issue list plus a complete scrollable run log.
+- Support Cancel, Scan Another Folder, Reveal Results, and Quit.
+- Preserve the guarded `NUKE!` workflow as an explicitly named Reset action
+  with a preview and two confirmations.
+
+The initial GUI does not need an in-app tag editor, thumbnail browser, Hydrus
+replacement, account-creation flow, or automatic updater.
+
+### Architectural direction
+
+Use **PySide6 (Qt for Python)**. This matches the Python/Qt desktop model used
+by applications such as Hydrus and gives FurTag a mature cross-platform widget,
+dialog, drag-and-drop, accessibility, and threading foundation. The larger
+dependency is acceptable; avoid a web runtime or a separate JavaScript frontend.
+The GUI should remain a thin adapter over the existing Python engine.
+
+Do not call Qt widgets from worker threads. The Qt main thread owns every
+widget. The pipeline runs on one coordinator thread and keeps its existing
+internal hash/perceptual worker threads. Deliver structured engine events to the
+main thread through Qt queued signals (or a small queue drained by a `QTimer`).
+
+Refactor toward these contracts:
+
+```python
+@dataclass
+class RunOptions:
+    import_unmatched: bool
+    result_page_limit: int
+    build_already_tagged_page: bool
+    sync_sidecars: bool
+    pdf_dpi: Optional[int]
+
+@dataclass
+class ScanSummary:
+    tagged: int
+    unmatched: int
+    duplicates: int
+    source_hits: Dict[str, int]
+    cancelled: bool = False
+
+class RunObserver:
+    def emit(self, event: "RunEvent") -> None: ...
+```
+
+Exact class names can change, but preserve the separation:
+
+- Engine methods perform work and emit structured events.
+- `TerminalObserver` renders events through `LiveDisplay`/`notify()`.
+- `QtObserver` emits/queues events for the GUI.
+- CLI prompt functions build `RunOptions`; GUI controls build the same object.
+- `TagIntegrator.run(...)` returns a summary instead of making the UI scrape
+  terminal text.
+
+Keep the CLI operational throughout the conversion. Avoid a big-bang rewrite
+or an early package/module split. Once both frontends work against the same
+contracts, moving engine code out of `furtag.py` is optional cleanup.
+
+### Suggested UI flow
+
+1. **Launch**
+   - Load credentials/config and show source status.
+   - Show the persistent session options in one compact settings area.
+2. **Choose folder**
+   - Native directory picker and file-manager drag-and-drop target.
+   - Run discovery/indexing without network mutations.
+3. **Review**
+   - Show media/to-process/already-checked/PDF counts.
+   - Offer sidecar-to-Hydrus sync and PDF DPI only when relevant.
+4. **Run**
+   - Disable settings, folder changes, Reset, and a second Start.
+   - Show independent Hash and Perceptual cards plus Recent Issues.
+5. **Finish**
+   - Show `ScanSummary`.
+   - Re-enable controls and offer Scan Another Folder / Reveal in File Manager.
+
+### Implementation phases
+
+#### Phase 0 — protect the baseline
+
+- Add focused unit tests for ledger skip rules, exact deduplication, Hydrus
+  result routing, deleted-file duplicate-group tagging, sidecar sync, and
+  SauceNAO quota exhaustion.
+- Add request/session fakes; tests must never call live booru or Hydrus APIs.
+- Record a small fixture run for non-TTY output before display refactoring.
+- Keep `credentials.txt`, ledgers, sidecars, and generated PDF pages out of test
+  fixtures unless created inside a temporary directory.
+
+#### Phase 1 — make the engine frontend-neutral
+
+- Introduce `RunOptions`, `ScanSummary`, structured progress events, and a
+  cancellation `threading.Event`.
+- Route pipeline status through the observer while retaining `notify()` as the
+  terminal adapter.
+- Split discovery from execution so the GUI can present inventory before Start.
+- Replace `input()` calls inside engine execution with values in `RunOptions`.
+- Cancellation must be cooperative: stop scheduling new files, allow in-flight
+  requests to finish their existing timeouts, join workers, flush result pages,
+  finalize safe directory fingerprints, and save all ledgers.
+
+#### Phase 2 — build the GUI
+
+- Add `furtag_gui.py` as the PySide6 entry point; it must run directly from a
+  normal Python virtual environment on every supported platform.
+- Build one main window with source status, folder selection, session settings,
+  scan summary, two progress tracks, issues, and action buttons.
+- Use modal dialogs only for destructive Reset confirmation, credentials
+  failures that prevent all useful work, and folder-specific PDF quality.
+- Use `platformdirs` for non-secret settings (`settings.json`) so each operating
+  system gets its conventional per-user application-data directory. Never copy
+  API secrets there.
+- Window close during a run should request cancellation, show “Finishing current
+  request…”, and close only after cleanup completes.
+
+#### Phase 3 — secure credentials
+
+- Use Python's `keyring` package so secrets go to macOS Keychain, Windows
+  Credential Locker, or a supported Linux Secret Service/KWallet backend. Do
+  not invent an encryption format or keep a local encryption key beside
+  encrypted secrets.
+- Store usernames and harmless preferences in the platform settings directory
+  if useful, but store API keys, Hydrus access keys, and the InkBunny password
+  as keyring items under a stable service name such as `org.furtag.FurTag`.
+- Add a Credentials window with one section per service, masked secret fields,
+  Save/Update/Remove actions, and a connection/status test. Empty fields disable
+  that source just as missing keys do today.
+- Never put secrets in progress events, logs, exception text, screenshots,
+  command-line arguments, crash reports, or generated support bundles. Redact
+  request headers and URLs that may contain keys.
+- Do **not** detect, request, create, document, or expose an import button for
+  `credentials.txt` in the released application. New users enter credentials
+  directly into the secure Credentials window and never need a plaintext file.
+- The repository owner's existing `credentials.txt` is a private, one-time
+  migration only. During development, make a temporary local migration helper,
+  run it explicitly on the owner's machine, verify the imported values, and
+  remove the helper before the first distributable build. It must not ship in
+  the GUI, packaged artifacts, normal CLI, or public setup documentation.
+- Refactor GUI and CLI credential loading behind the same keyring-backed
+  `CredentialStore`; the released CLI should not require plaintext credentials
+  either. Preserve plaintext parsing only long enough to complete the private
+  migration, then remove that path.
+- If no usable keyring backend exists or access is denied, show a clear
+  disabled/error state. Never silently fall back to saving a new plaintext
+  credentials file. A future encrypted local vault may be added only with a
+  user-supplied master password and a reviewed password-based key derivation
+  design; it is not part of the first release.
+- Use stable application/bundle identifiers so credential access remains
+  predictable across app updates. Test secure storage both from source and from
+  packaged builds on all supported operating systems.
+
+#### Phase 4 — cross-platform packaging
+
+- Add PyInstaller specs/build scripts for macOS, Windows, and Linux with the GUI
+  entry point, icons, Qt plugins, PyMuPDF/Pillow hidden imports if needed, and
+  no console window.
+- Build natively on each target OS; do not assume one machine can cross-compile
+  reliable artifacts for the other two.
+- Test on clean user accounts with no project venv and no developer packages.
+- Store mutable settings beside neither the executable nor its installation
+  directory; always use the platformdirs location.
+- Add macOS signing/notarization and Windows code-signing after unsigned builds
+  are stable. Do not treat “works from the repo” as packaging verification.
+
+#### Phase 5 — optional Homebrew cask
+
+- A cask distributes the finished `.app`; it is not part of the GUI runtime.
+- It is only the macOS distribution option; Windows/Linux releases remain
+  independent artifacts.
+- Publish a versioned, immutable release archive with a SHA-256 checksum.
+- Put the cask in a personal tap first.
+- Only pursue inclusion in a shared/public tap after releases, signing,
+  notarization, versioning, and download URLs are stable.
+
+### Safety and behavior invariants
+
+- Never mutate widgets outside the Qt main thread.
+- Never allow two scans to run concurrently in one process.
+- Preserve per-service `Pacer` behavior and the invariant that one service is
+  not called concurrently with itself.
+- Preserve atomic ledger saves and interruption recovery.
+- Preserve the directory fingerprint rule: seal only when every current media
+  file is resolved.
+- Reset must keep the existing exact target discovery, filesystem-root refusal,
+  preview counts, source-PDF protection, and separate rendered-PDF confirmation.
+- Secrets must live in an OS-backed keyring in the GUI flow, must never enter
+  logs/events, and must never fall back to new plaintext storage without
+  explicit user action.
+- Existing tag sidecars map only to Hydrus tags; `.urls.txt` entries map only to
+  Hydrus URLs. A sidecar sync must not change ledgers or repeat online searches.
+- For a known-deleted Hydrus file, only relationship type `8` (duplicates) may
+  receive metadata. Relationship type `3` (alternates) must remain excluded.
+- SauceNAO daily exhaustion disables it for the rest of the application
+  session; the UI should show that state once without repeating alerts.
+- A GUI error must not strand the terminal display, worker threads, temporary
+  ledger files, or half-flushed Hydrus result pages.
+
+### Acceptance criteria for the first GUI release
+
+- `./FurTag.command` still runs the CLI successfully.
+- `python furtag_gui.py` launches the same GUI from source on macOS, Windows,
+  and Linux.
+- The GUI can scan a folder, process a mixed image/video/PDF set, cancel safely,
+  and scan another folder without restarting.
+- GUI and CLI runs produce equivalent sidecars, ledger records, Hydrus tags,
+  URLs, duplicate handling, and result-page membership for the same options.
+- Progress remains responsive while hashing, waiting on rate limits, rendering
+  PDFs, and making network requests.
+- Closing during a run saves resumable progress and leaves no live worker.
+- Packaged GUI builds launch on clean macOS, Windows, and Linux environments
+  without opening a terminal/console window.
+- Credentials saved by the packaged app survive a normal app update, remain
+  absent from platform settings files and logs, and can be removed from the GUI.
+- Fresh-install UI and documentation never instruct users to create or import a
+  `credentials.txt` file, and release artifacts contain no legacy importer.
+- The owner's private migration is verified before the plaintext loader and
+  temporary helper are removed.
+- Automated tests and `python -m py_compile` pass before packaging.
+
 ## Running It
 
 ```bash
@@ -65,7 +307,9 @@ When `has_hydrus` is true, `write_results()` calls `_hydrus_push()` instead of (
 3. `POST /add_urls/associate_url` with `urls_to_add`
 4. Silently create an unfocused hash-locked results page, then append each accepted hash via `/manage_pages/add_files`
 
-At startup, unchanged files whose per-directory ledger status is `matched` are collected on a separate unfocused `Already Tagged` hash-locked page. Older ledgers only contain MD5, so FurTag computes the SHA-256 values in parallel once and caches them back into those records; subsequent runs reuse the cache. Page submissions are batched in groups of 256.
+The interactive `hydrus_import_unmatched` run choice calls `write_unmatched()` for final perceptual misses and hash-only video misses. It also imports unchanged prior `nomatch` records lacking cached SHA-256, then caches Hydrus's returned hash so subsequent runs do not repeat the import.
+
+At startup, unchanged files whose per-directory ledger status is `matched` can be collected on a separate unfocused `Already Tagged` hash-locked page. The prompt is suppressed unless at least one valid unchanged matched record exists. Older ledgers only contain MD5, so FurTag computes the SHA-256 values in parallel once and caches them back into those records; subsequent runs reuse the cache. Page submissions are batched in groups of 256.
 
 Pushes are serialised with `_hydrus_lock` because the hash tier and perceptual worker can both call `write_results`. PDF pages still get `comic:`/`page:` via `_pdf_page_base_tags()` even when convert sidecars are skipped.
 
@@ -95,7 +339,7 @@ The key pattern: a perceptual hit identifies *which* booru post the image is, so
 
 - Prefer **post ID** over MD5-from-URL (the URL-MD5 trick only works when the CDN URL embeds the hash). `_post_id_from_url()` handles both `/posts/N` and e621's legacy `/post/show/N`.
 - **Fluffle**: `find_best_exact_match()` priority is exact-e621 > exact-other > tossUp-e621. `tossUp` is accepted **only** on e621 (gated by `FLUFFLE_TOSSUP_E621`) because we then re-query e621 by ID via `e621_lookup_by_id()`, so a near-miss stays low-risk. All other `tossUp`/`alternative`/`unlikely` are rejected.
-- **SauceNAO**: `_saucenao_best_authoritative()` reads the `e621_id`/`danbooru_id`/`gelbooru_id` fields directly (preferring e621 → danbooru → gelbooru, and only for sources we hold creds for), then `_authoritative_lookup()` re-queries that booru. Gated behind `SAUCENAO_AUTH_SIMILARITY` (80%), a **higher** bar than `MIN_SIMILARITY` (70%) used to accept SauceNAO's own thinner tags.
+- **SauceNAO**: `_saucenao_best_authoritative()` reads the `e621_id`/`danbooru_id`/`gelbooru_id` fields directly (preferring e621 → danbooru → gelbooru, and only for sources we hold creds for), then `_authoritative_lookup()` re-queries that booru. Gated behind `saucenao_auth_similarity` (default **88%**), a **higher** bar than `saucenao_min_similarity` (default **80%**) used to accept SauceNAO's own thinner tags. Both are settings-driven (GUI / `settings.json`).
 
 ### SauceNAO own-tags (the messy fallback)
 

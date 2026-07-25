@@ -1,0 +1,1 @@
+# FurTag test package

@@ -1,0 +1,12 @@
+# Recorded non-TTY output shape (before display refactoring).
+# Lines are illustrative anchors; tests check structural markers only.
+🐾 Unified Furry Tag Integrator for Hydrus 🐾
+📋 e621 + InkBunny + Danbooru + Gelbooru MD5 (concurrent) → Fluffle → SauceNAO
+🔑 Loading credentials
+📂 Scanning folder tree…
+📊 media files
+🔢 Hashing
+🔄 Hash tier
+=== Phase
+🏁 DONE
+Total tagged:
