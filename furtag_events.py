@@ -9,6 +9,8 @@ Event kinds
 -----------
 ``begin_phase``   start/reset a track. ``track``, ``phase`` (label), ``total``,
                   ``extra={"growing": bool, "interval": float}``.
+``sidecar_sync``  resumable sidecar reconciliation progress before the scan
+                  tracks. ``index``, ``total``, ``current``, running counters.
 ``grow``          the track's total gained items: ``extra={"by": int}`` (default 1).
 ``freeze_total``  the producer feeding this track is done; total is final.
 ``start_file``    ``track``, ``index`` (1-based), ``current``, ``nxt``.
@@ -23,6 +25,8 @@ Event kinds
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Protocol, runtime_checkable
 
@@ -69,6 +73,23 @@ class TerminalObserver:
     def emit(self, event: RunEvent) -> None:
         d = self.display
         kind = event.kind
+        if kind == "sidecar_sync":
+            if sys.stdout.isatty():
+                line = f"  {event.message}"
+                try:
+                    width = max(
+                        20, os.get_terminal_size(sys.stdout.fileno()).columns)
+                except OSError:
+                    width = 100
+                if len(line) >= width:
+                    line = line[:max(1, width - 2)] + "…"
+                sys.stdout.write("\r" + line + "\x1b[K")
+                if event.extra.get("final"):
+                    sys.stdout.write("\n")
+                sys.stdout.flush()
+            elif event.extra.get("checkpoint") or event.extra.get("final"):
+                print(event.message)
+            return
         if kind in ("log", "issue"):
             # LiveDisplay.log() keeps the panel intact (rolling issue history);
             # without a panel there is nothing to corrupt, so print directly.
@@ -102,6 +123,8 @@ class TerminalObserver:
         elif kind == "status":
             d.status(event.track, event.sub or event.message)
         elif kind == "finish_file":
-            d.finish_file(event.track, event.result or event.message)
+            d.finish_file(
+                event.track, event.result or event.message,
+                source_hits=event.source_hits)
         elif kind == "close_display":
             d.close()

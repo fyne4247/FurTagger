@@ -218,7 +218,10 @@ contracts, moving engine code out of `furtag.py` is optional cleanup.
   logs/events, and must never fall back to new plaintext storage without
   explicit user action.
 - Existing tag sidecars map only to Hydrus tags; `.urls.txt` entries map only to
-  Hydrus URLs. A sidecar sync must not change ledgers or repeat online searches.
+  Hydrus URLs. A sidecar sync must not repeat online searches. It may store a
+  separate payload-signature checkpoint in the per-directory ledger so
+  successful unchanged syncs resume without re-sending metadata, but it must
+  never change matched/no-match/duplicate scan status.
 - For a known-deleted Hydrus file, only relationship type `8` (duplicates) may
   receive metadata. Relationship type `3` (alternates) must remain excluded.
 - SauceNAO daily exhaustion disables it for the rest of the application

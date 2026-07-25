@@ -103,12 +103,12 @@ Run `./FurTag.command` (or `.venv/bin/python furtag.py`). FurTag prompts for a f
 
 - When Hydrus result pages are enabled, FurTag asks for a per-page newest-N limit before every scan. Enter `0` for unlimited; blank accepts the current value from `credentials.txt` (or the previous scan).
 - Hydrus review-page size, no-match importing, and optional **Already Tagged** pages are selected once at launch and remain in effect until FurTag closes. The no-match choice also catches unchanged prior `nomatch` ledger records once and caches their Hydrus SHA-256 so they are not repeatedly imported.
-- After choosing a folder, an optional sidecar sync pushes existing `<media>.txt` tags and `<media>.urls.txt` source URLs to Hydrus without changing any ledgers or re-running searches.
+- After choosing a folder, an optional sidecar sync pushes existing `<media>.txt` tags and `<media>.urls.txt` source URLs to Hydrus without re-running online searches. Successful files receive a separate `sidecar_sync` checkpoint in their per-directory ledger; unchanged media/sidecar payloads are skipped on later syncs, while matched/no-match scan status is left untouched. With Hydrus file-search permission, already-current SHA-256s also bypass the expensive re-import endpoint.
 - After every completed scan, FurTag asks `Scan another folder? [y/N]` instead of immediately exiting.
 
 After local hashing, FurTag detects byte-identical files by MD5 before making any network requests. One deterministic canonical path is searched; its results are then copied to every duplicate filesystem path (including sidecars when enabled), so those copies receive matching ledger records without repeating the lookup. Hydrus already represents byte-identical copies as the same hash, so this does not make duplicate library records. A readable `duplicates.log` in the scanned folder lists each exact hash, the selected canonical file, and every duplicate location. An unchanged file already represented by a matched/no-match ledger takes precedence over a new copy.
 
-It then walks the folder tree and processes files, showing the **two-track live display** — one panel for the hash tier, one for the perceptual tier — each with a previous/current/next file view, a phase label, and a progress bar with elapsed time and ETA. The current file carries a live sub-status showing which site is being checked.
+It then walks the folder tree and processes files, showing the **two-track live display** — one panel for the hash tier, one for the perceptual tier — each with a previous/current/next file view, a phase label, and a progress bar with elapsed time and ETA. The current file carries a live sub-status showing which site is being checked, while running file-hit totals track e621, InkBunny, Danbooru, Gelbooru, Fluffle, and SauceNAO independently.
 
 **Symbol legend:**
 

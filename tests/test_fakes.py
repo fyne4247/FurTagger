@@ -1,5 +1,6 @@
 """Request/session fakes — tests must never call live APIs."""
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -8,7 +9,7 @@ from unittest.mock import MagicMock
 
 import requests
 
-from furtag import TagIntegrator
+from furtag import Ledger, TagIntegrator
 from furtag_settings import Settings
 
 
@@ -104,6 +105,145 @@ class TestHydrusRouting(unittest.TestCase):
             media.write_bytes(b"data2")
             h2 = ti._hydrus_push(media, {"creator:test2"}, set())
             self.assertIn(h2, ti.hydrus_result_pages["updated"]["hashes"])
+
+
+class _RecordingObserver:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event):
+        self.events.append(event)
+
+
+class TestHydrusSidecarSync(unittest.TestCase):
+    @staticmethod
+    def _media_with_sidecar(root, name="sync.jpg", data=b"image"):
+        media = root / name
+        media.write_bytes(data)
+        Path(str(media) + ".txt").write_text(
+            "creator:test\nspecies:fox\n", encoding="utf-8")
+        return media
+
+    def test_current_hash_bypasses_reimport_and_checkpoints(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            media = self._media_with_sidecar(root)
+            sha256 = hashlib.sha256(media.read_bytes()).hexdigest()
+            session = FakeSession([
+                ("GET", "get_files/search_files", FakeResponse(200, {
+                    "hashes": [sha256],
+                })),
+                ("POST", "add_tags/add_tags", FakeResponse(200, {})),
+            ])
+            ti = _hydrus_ti(session)
+            ti.hydrus_can_search_files = True
+            observer = _RecordingObserver()
+            ti._observer = observer
+
+            attempted, failed = ti.sync_sidecars_to_hydrus(root)
+
+            self.assertEqual((attempted, failed), (1, 0))
+            self.assertFalse(any(
+                "add_files/add_file" in url
+                for _, url, _ in session.calls))
+            tag_calls = [
+                call for call in session.calls
+                if "add_tags/add_tags" in call[1]]
+            self.assertEqual(len(tag_calls), 1)
+            self.assertEqual(tag_calls[0][2]["json"]["hash"], sha256)
+            self.assertTrue(any(
+                event.kind == "sidecar_sync"
+                and event.current == media.name
+                for event in observer.events))
+
+            ledger = Ledger(root)
+            ledger.load()
+            st = media.stat()
+            tags, urls = ti.read_sidecar_payload(media)
+            signature = ti._sidecar_sync_signature(tags, urls)
+            self.assertTrue(ledger.sidecar_sync_matches(
+                media.name, st.st_size, st.st_mtime, signature))
+
+            # A second run skips both the Hydrus search and every write.
+            session.calls.clear()
+            attempted, failed = ti.sync_sidecars_to_hydrus(root)
+            self.assertEqual((attempted, failed), (0, 0))
+            self.assertEqual(session.calls, [])
+
+    def test_changed_sidecar_resyncs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            media = self._media_with_sidecar(root)
+            sha256 = hashlib.sha256(media.read_bytes()).hexdigest()
+            session = FakeSession([
+                ("GET", "get_files/search_files", FakeResponse(200, {
+                    "hashes": [sha256],
+                })),
+                ("POST", "add_tags/add_tags", FakeResponse(200, {})),
+            ])
+            ti = _hydrus_ti(session)
+            ti.hydrus_can_search_files = True
+
+            ti.sync_sidecars_to_hydrus(root)
+            Path(str(media) + ".txt").write_text(
+                "creator:test\nspecies:fox\nnew tag\n", encoding="utf-8")
+            session.calls.clear()
+
+            attempted, failed = ti.sync_sidecars_to_hydrus(root)
+
+        self.assertEqual((attempted, failed), (1, 0))
+        self.assertTrue(any(
+            "add_tags/add_tags" in url for _, url, _ in session.calls))
+
+    def test_failed_resume_lookup_falls_back_to_import(self):
+        imported_hash = "b" * 64
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._media_with_sidecar(root)
+            session = FakeSession([
+                ("GET", "get_files/search_files",
+                 FakeResponse(403, {}, text="missing permission")),
+                ("POST", "add_files/add_file", FakeResponse(200, {
+                    "status": 2,
+                    "hash": imported_hash,
+                })),
+                ("POST", "add_tags/add_tags", FakeResponse(200, {})),
+            ])
+            ti = _hydrus_ti(session)
+            ti.hydrus_can_search_files = True
+
+            attempted, failed = ti.sync_sidecars_to_hydrus(root)
+
+        self.assertEqual((attempted, failed), (1, 0))
+        self.assertTrue(any(
+            "add_files/add_file" in url for _, url, _ in session.calls))
+        self.assertFalse(ti.hydrus_can_search_files)
+
+    def test_failed_metadata_write_is_not_checkpointed(self):
+        sha256 = "c" * 64
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            media = self._media_with_sidecar(root)
+            session = FakeSession([
+                ("POST", "add_files/add_file", FakeResponse(200, {
+                    "status": 2,
+                    "hash": sha256,
+                })),
+                ("POST", "add_tags/add_tags",
+                 FakeResponse(500, {}, text="tag failure")),
+            ])
+            ti = _hydrus_ti(session)
+
+            attempted, failed = ti.sync_sidecars_to_hydrus(root)
+            ledger = Ledger(root)
+            ledger.load()
+            st = media.stat()
+            tags, urls = ti.read_sidecar_payload(media)
+
+        self.assertEqual((attempted, failed), (1, 1))
+        self.assertFalse(ledger.sidecar_sync_matches(
+            media.name, st.st_size, st.st_mtime,
+            ti._sidecar_sync_signature(tags, urls)))
 
 
 DELETED_HASH = "d" * 64

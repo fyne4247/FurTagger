@@ -499,7 +499,9 @@ Matching · PDF · Advanced · Maintenance.
 - Secrets live in keyring or env vars, never enter logs or events, and never fall back to new
   plaintext storage without explicit user action.
 - Existing tag sidecars map only to Hydrus tags; URL sidecar entries map only to Hydrus URLs.
-  A sidecar sync must not change ledgers or repeat online searches.
+  A sidecar sync must not repeat online searches or change ordinary scan status. It may
+  checkpoint a normalized payload signature separately in each directory ledger so
+  successful unchanged files are skipped on later syncs.
 - For a known-deleted Hydrus file, only relationship type `8` (duplicates) may receive
   metadata. Type `3` (alternates) stays excluded.
 - SauceNAO daily exhaustion disables it for the rest of the session; the UI shows that state

@@ -839,6 +839,11 @@ class MainWindow(QMainWindow):
         prog.addWidget(self.perc_card["box"])
         scan_lay.addLayout(prog)
 
+        self.source_totals_label = QLabel()
+        self.source_totals_label.setWordWrap(True)
+        self._set_source_totals({})
+        scan_lay.addWidget(self.source_totals_label)
+
         self.review_badge = QPushButton("Needs review — 0")
         self.review_badge.clicked.connect(self._open_review)
         scan_lay.addWidget(self.review_badge)
@@ -1020,6 +1025,7 @@ class MainWindow(QMainWindow):
         self.cancel_event = threading.Event()
         self._set_running(True)
         self.summary_label.setText("")
+        self._set_source_totals({})
         self.issues.clear()
         self._log(f"Starting scan of {self.folder}")
         self.scan_worker = ScanWorker(
@@ -1047,6 +1053,21 @@ class MainWindow(QMainWindow):
         if event.kind == "print" and event.message:
             self._log(event.message)
             return
+        if event.kind == "sidecar_sync":
+            x = event.extra
+            counts = (
+                f"completed {x.get('successful', 0)} · "
+                f"already synced {x.get('skipped', 0)} · "
+                f"failed {x.get('failed', 0)}")
+            current = event.current or event.message
+            self.summary_label.setText(
+                f"SYNCING SIDECARS {event.index}/{event.total}: "
+                f"{current} · {counts}")
+            if event.extra.get("checkpoint") or event.extra.get("final"):
+                self._log(event.message)
+            return
+        if event.source_hits:
+            self._set_source_totals(event.source_hits)
         card = self.hash_card if event.track == "hash" else self.perc_card
         if event.kind == "begin_phase":
             card["total"] = event.total
@@ -1085,6 +1106,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_finished(self, summary: ScanSummary) -> None:
         self._set_running(False)
+        self._set_source_totals(summary.source_hits)
         label = "CANCELLED" if summary.cancelled else "DONE"
         self.summary_label.setText(
             f"{label}: tagged {summary.tagged} · unmatched {summary.unmatched} · "
@@ -1112,6 +1134,21 @@ class MainWindow(QMainWindow):
 
     def _log(self, msg: str) -> None:
         self.log.append(msg)
+
+    def _set_source_totals(self, counts: dict) -> None:
+        labels = (
+            ("e621", "e621"),
+            ("inkbunny", "InkBunny"),
+            ("danbooru", "Danbooru"),
+            ("gelbooru", "Gelbooru"),
+            ("fluffle", "Fluffle"),
+            ("saucenao", "SauceNAO"),
+        )
+        self.source_totals_label.setText(
+            "Tagged files by source · "
+            + "  ·  ".join(
+                f"{label}: {int(counts.get(key, 0))}"
+                for key, label in labels))
 
     def _set_review_badge(self, count: int) -> None:
         self.review_badge.setText(f"Needs review — {count}")
@@ -1178,17 +1215,17 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    # High-DPI policy must be selected before constructing QApplication.
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    except Exception:
+        pass
     # Avoid Qt plugin issues when packaged
     app = QApplication(sys.argv)
     app.setApplicationName("FurTag")
     app.setOrganizationName("FurTag")
     app.setOrganizationDomain("furtag.org")
-    # High-DPI: use screen pixels sanely on Retina Macs
-    try:
-        app.setHighDpiScaleFactorRoundingPolicy(
-            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
-    except Exception:
-        pass
     win = MainWindow()
     win.show()
 

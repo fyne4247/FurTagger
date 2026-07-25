@@ -142,6 +142,18 @@ class TestGrowTotalNotDoubleCounted(unittest.TestCase):
         obs.emit(RunEvent(kind="grow", track="perceptual", extra={"by": 3}))
         self.assertEqual(disp.tracks["perceptual"].total, 3)
 
+    def test_terminal_display_keeps_running_source_totals(self):
+        disp = LiveDisplay()
+        disp.tty = False
+        obs = TerminalObserver(disp)
+        with contextlib.redirect_stdout(io.StringIO()):
+            obs.emit(RunEvent(
+                kind="finish_file", track="hash", result="matched",
+                source_hits={"e621": 4, "inkbunny": 2}))
+        self.assertEqual(disp.source_hits["e621"], 4)
+        self.assertEqual(disp.source_hits["inkbunny"], 2)
+        self.assertEqual(disp.source_hits["danbooru"], 0)
+
     def test_run_perceptual_total_matches_files_processed(self):
         """Regression: the total used to be 2× the file count, because both
         `disp.grow(...)` and a `grow` event fired at the same site."""
@@ -184,6 +196,30 @@ class TestGrowTotalNotDoubleCounted(unittest.TestCase):
 
 
 class TestEventStream(unittest.TestCase):
+    def test_finish_events_carry_running_source_totals(self):
+        d = _make_pngs(2)
+        self.addCleanup(shutil.rmtree, d, True)
+        ti = TagIntegrator(settings=_offline_settings())
+        ti.hash_tier = lambda _item, _executor: (
+            {"creator:test"}, set(), ["e621", "danbooru"])
+        rec = RecordingObserver()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = ti.run(
+                d, options=_run_options(), observer=rec,
+                use_terminal_display=False)
+
+        hits = [
+            event.source_hits for event in rec.kinds("finish_file", "hash")
+            if event.source_hits]
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(hits[0]["e621"], 1)
+        self.assertEqual(hits[0]["danbooru"], 1)
+        self.assertEqual(hits[1]["e621"], 2)
+        self.assertEqual(hits[1]["danbooru"], 2)
+        self.assertEqual(summary.source_hits["e621"], 2)
+        self.assertEqual(summary.source_hits["danbooru"], 2)
+
     def test_expected_stream_for_an_offline_run(self):
         n = 3
         d = _make_pngs(n)

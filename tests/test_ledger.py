@@ -83,6 +83,31 @@ class TestLedgerSkip(unittest.TestCase):
             self.assertEqual(led.md5_for("c.gif", 10, 1.0), "deadbeef")
             self.assertEqual(led.status_for("c.gif", 10, 1.0), "hashed")
 
+    def test_sidecar_sync_checkpoint_is_independent_of_scan_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            led = Ledger(d)
+            led.record_sidecar_sync(
+                "sidecar.jpg", 100, 1.0, "signature-a", "sha-a")
+            self.assertTrue(led.sidecar_sync_matches(
+                "sidecar.jpg", 100, 1.0, "signature-a"))
+            self.assertEqual(
+                led.status_for("sidecar.jpg", 100, 1.0), "sidecar_only")
+            self.assertNotIn("sidecar_only", RESOLVED_LEDGER_STATUSES)
+
+            # A later online match for the same bytes must keep the sync
+            # checkpoint while replacing only the ordinary scan status.
+            led.record(
+                "sidecar.jpg", 100, 1.0, "md5-a", "matched", ["e621"])
+            self.assertEqual(
+                led.status_for("sidecar.jpg", 100, 1.0), "matched")
+            self.assertTrue(led.sidecar_sync_matches(
+                "sidecar.jpg", 100, 1.0, "signature-a"))
+
+            # Replaced media invalidates the checkpoint automatically.
+            self.assertFalse(led.sidecar_sync_matches(
+                "sidecar.jpg", 101, 1.0, "signature-a"))
+
 
 class TestReviewQueue(unittest.TestCase):
     def test_persist(self):

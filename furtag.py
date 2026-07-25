@@ -106,7 +106,7 @@ import time
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import requests
 from PIL import Image, ImageFile
@@ -302,6 +302,11 @@ class LiveDisplay:
 
     def __init__(self) -> None:
         self.tracks: Dict[str, _Track] = {k: _Track() for k in self._TRACK_ORDER}
+        self.source_hits: Dict[str, int] = {
+            name: 0 for name in
+            ("e621", "inkbunny", "danbooru", "gelbooru",
+             "fluffle", "saucenao")
+        }
         self._drawn = 0
         self._lock = threading.Lock()
         self._issues: List[str] = []
@@ -372,11 +377,15 @@ class LiveDisplay:
             if self._live():
                 self._render()
 
-    def finish_file(self, track: str, result: str) -> None:
+    def finish_file(
+            self, track: str, result: str,
+            source_hits: Optional[Dict[str, int]] = None) -> None:
         with self._lock:
             t = self.tracks[track]
             t.done = t.idx
             t.prev = (t.current, result)
+            if source_hits:
+                self.source_hits.update(source_hits)
             if self._live():
                 self._render()
             else:
@@ -450,6 +459,17 @@ class LiveDisplay:
         for i, key in enumerate(self._TRACK_ORDER):
             lines += self._render_track(self.tracks[key])
             lines.append(self._SEP)          # rule after each block
+        lines.append(
+            "  Tagged files · "
+            + "  ".join(
+                f"{self._ABBR.get(name, name)} {self.source_hits.get(name, 0)}"
+                for name in (
+                    "e621", "inkbunny", "danbooru", "gelbooru",
+                    "fluffle", "saucenao"
+                )
+            )
+        )
+        lines.append(self._SEP)
         if self._issues:
             shown = len(self._issues)
             history = (f" · latest {shown} of {self._issue_total}"
@@ -627,10 +647,56 @@ class Ledger:
                 rec["sha256"] = sha256
                 self._dirty += 1
 
+    def sidecar_sync_matches(
+            self, name: str, size: int, mtime: float,
+            signature: str) -> bool:
+        """Whether these exact media bytes and sidecar payload were synced."""
+        rec = self._fresh_record(name, size, mtime)
+        sync = rec.get("sidecar_sync") if rec else None
+        return (
+            isinstance(sync, dict)
+            and bool(signature)
+            and sync.get("signature") == signature
+        )
+
+    def record_sidecar_sync(
+            self, name: str, size: int, mtime: float,
+            signature: str, sha256: Optional[str] = None) -> None:
+        """Checkpoint a successful sidecar→Hydrus reconciliation.
+
+        This metadata is independent of the normal matched/nomatch status. A
+        sidecar-only record therefore remains unresolved for online-search
+        purposes, while a pre-existing scan status remains exactly unchanged.
+        """
+        if not signature:
+            return
+        with self._lock:
+            rec = self._fresh_record(name, size, mtime)
+            if rec is None:
+                rec = {
+                    "size": size,
+                    "mtime": round(mtime, 3),
+                    "md5": None,
+                    "status": "sidecar_only",
+                    "sources": [],
+                }
+                self.records[name] = rec
+            sync = {
+                "signature": signature,
+                "synced_at": time.time(),
+            }
+            if sha256:
+                sync["sha256"] = sha256
+                rec["sha256"] = sha256
+            if rec.get("sidecar_sync") != sync:
+                rec["sidecar_sync"] = sync
+                self._dirty += 1
+
     def record(self, name: str, size: int, mtime: float, md5: Optional[str],
                status: str, sources: List[str], duplicate_of: str = "",
                sha256: Optional[str] = None) -> None:
         with self._lock:
+            previous = self._fresh_record(name, size, mtime) or {}
             record = {
                 "size": size,
                 "mtime": round(mtime, 3),
@@ -655,6 +721,11 @@ class Ledger:
                 record["tagged_at"] = time.time()
             if duplicate_of:
                 record["duplicate_of"] = duplicate_of
+            # Sidecar reconciliation is orthogonal to online scan status. Keep
+            # its checkpoint when this same file later gains a matched,
+            # nomatch, duplicate, or pending-review record.
+            if isinstance(previous.get("sidecar_sync"), dict):
+                record["sidecar_sync"] = previous["sidecar_sync"]
             self.records[name] = record
             self._dirty += 1
 
@@ -676,7 +747,7 @@ class Ledger:
             if self._dirty == 0 and self.path.exists():
                 return
             try:
-                payload: Dict = {"version": 3, "records": self.records}
+                payload: Dict = {"version": 4, "records": self.records}
                 if self.dir_count is not None:
                     payload["dir_fingerprint"] = {"count": self.dir_count, "size": self.dir_size}
                 atomic_write_text(
@@ -1322,6 +1393,71 @@ class TagIntegrator:
                         item.path.name, item.size, item.mtime, sha256)
                     found += 1
         return found
+
+    def _hydrus_current_sha256s(
+            self, hashes: Iterable[str]) -> Optional[Set[str]]:
+        """Return requested SHA-256s that are current local Hydrus files.
+
+        ``None`` means the lookup is unavailable and callers must retain their
+        normal import behavior. An empty set is a successful lookup with no
+        current matches. Hydrus remembers hashes for deleted files, so this
+        deliberately uses ``search_files`` rather than identifier metadata.
+        """
+        if not (self.has_hydrus and self.hydrus_can_search_files):
+            return None
+        wanted = sorted({
+            value.lower() for value in hashes
+            if isinstance(value, str)
+            and re.fullmatch(r"[0-9a-fA-F]{64}", value)
+        })
+        if not wanted:
+            return set()
+
+        current: Set[str] = set()
+        for offset in range(0, len(wanted), HYDRUS_HASH_LOOKUP_BATCH):
+            batch = wanted[offset:offset + HYDRUS_HASH_LOOKUP_BATCH]
+            try:
+                r = self.session.get(
+                    f"{self.hydrus_api_url}/get_files/search_files",
+                    headers=self._hydrus_headers(),
+                    params={
+                        "tags": json.dumps([
+                            "system:hash = " + " ".join(batch) + " sha256"
+                        ]),
+                        "return_hashes": "true",
+                        "return_file_ids": "false",
+                    },
+                    timeout=30,
+                )
+                if r.status_code != 200:
+                    raise RuntimeError(
+                        f"search_files HTTP {r.status_code}: {r.text[:200]}")
+                returned = r.json().get("hashes") or []
+                current.update(
+                    value.lower() for value in returned
+                    if isinstance(value, str)
+                    and re.fullmatch(r"[0-9a-fA-F]{64}", value)
+                )
+            except (requests.RequestException, ValueError, RuntimeError) as e:
+                self.hydrus_can_search_files = False
+                notify("⚠️  Hydrus sidecar resume check unavailable; using "
+                       f"normal imports for this run ({e}).")
+                return None
+        return current
+
+    def _sidecar_sync_signature(
+            self, tags: Set[str], urls: Set[str]) -> str:
+        """Stable digest of normalized payload plus its Hydrus destination."""
+        payload = {
+            "hydrus_api_url": self.hydrus_api_url.rstrip("/"),
+            "hydrus_tag_service_key": self.hydrus_tag_service_key,
+            "tags": sorted(tags),
+            "urls": sorted(urls),
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     @property
     def write_sidecars(self) -> bool:
@@ -2312,11 +2448,18 @@ class TagIntegrator:
             self._append_lines(self.url_sidecar_path(media), urls)
 
     def sync_sidecars_to_hydrus(self, root: Path) -> Tuple[int, int]:
-        """Push existing FurTag sidecars to Hydrus without touching ledgers.
+        """Push existing FurTag sidecars to Hydrus with resumable checkpoints.
 
         This is a migration/reconciliation pass: tag sidecars (txt or JSON)
         supply tags and URL sidecars supply source URLs. It deliberately does
-        no booru lookup and never changes a ``.furtag_ledger.json`` record.
+        no booru lookup. Successful syncs are recorded as independent
+        ``sidecar_sync`` metadata in each directory ledger; normal scan status
+        (matched/nomatch/etc.) is preserved and unaffected.
+
+        Candidates are prepared in small batches. When the access key can
+        search files, their local SHA-256s are checked against Hydrus first so
+        files already present are tagged directly instead of being mirrored,
+        hashed, and re-imported through ``add_files/add_file`` on every retry.
         """
         if not self.has_hydrus:
             return 0, 0
@@ -2336,35 +2479,155 @@ class TagIntegrator:
             return 0, 0
 
         print(f"📤 Syncing sidecars to Hydrus for {len(candidates)} file(s)…")
-        processed = 0
-        # Reading a sidecar is disk-bound and independent per file, so prefetch
-        # payloads on a pool while the serialised Hydrus pushes proceed —
-        # otherwise every push waits on a fresh read first.
-        workers = min(8, max(1, os.cpu_count() or 1))
-        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-            payloads = dict(zip(
-                candidates, ex.map(self.read_sidecar_payload, candidates)))
-        for index, media in enumerate(candidates, start=1):
-            if self.cancelled():
-                print("\n⏹️  Sidecar sync cancelled.")
-                break
-            tags, urls = payloads.get(media, (set(), set()))
+        total = len(candidates)
+        attempted = successful = skipped = failed = 0
+        ledger_mgr = LedgerManager()
+
+        def prepare(media: Path) -> Tuple[
+                Optional[os.stat_result], Set[str], Set[str], str,
+                Optional[str], Optional[Ledger], bool]:
+            try:
+                st = media.stat()
+            except OSError as e:
+                notify(f"⚠️  Couldn't stat sidecar media {media.name}: {e}")
+                return None, set(), set(), "", None, None, False
+            tags, urls = self.read_sidecar_payload(media)
             tags = {tag for tag in tags if not _is_junk_tag(tag)}
-            if not tags and not urls:
-                continue
-            # _hydrus_push reports detailed per-file failures itself. A
-            # successful deleted-file duplicate-group transfer deliberately
-            # returns no source SHA-256, so it must still count as processed.
-            self._hydrus_push(media, tags, urls)
-            processed += 1
-            if sys.stdout.isatty() and (index % 25 == 0 or index == len(candidates)):
-                sys.stdout.write(f"\r  synced {index}/{len(candidates)}")
-                sys.stdout.flush()
-        if sys.stdout.isatty():
-            sys.stdout.write("\n")
-        print(f"✅ Sidecar sync attempted for {processed} file(s); "
-              "ledgers left unchanged.")
-        return processed, 0
+            signature = self._sidecar_sync_signature(tags, urls)
+            ledger = ledger_mgr.get(media.parent)
+            if ledger.sidecar_sync_matches(
+                    media.name, st.st_size, st.st_mtime, signature):
+                return st, tags, urls, signature, None, ledger, True
+            # Empty sidecars are a completed no-op. Do not read the entire media
+            # file merely to checkpoint that they contain no metadata.
+            sha256 = self._sha256_local(media) if (tags or urls) else None
+            return st, tags, urls, signature, sha256, ledger, False
+
+        def emit_progress(
+                index: int, media: Path, state: str,
+                *, final: bool = False) -> None:
+            self._emit(
+                "sidecar_sync",
+                message=f"{state} {index}/{total} · {media.name}",
+                index=index,
+                total=total,
+                current=str(media.relative_to(root)),
+                sub=state,
+                extra={
+                    "checkpoint":
+                        index == 1 or index % 25 == 0 or index == total,
+                    "final": final,
+                    "attempted": attempted,
+                    "successful": successful,
+                    "skipped": skipped,
+                    "failed": failed,
+                },
+            )
+
+        # Sidecar reads and local hashes are disk-bound and independent. Work
+        # one Hydrus-sized batch ahead rather than retaining every payload/hash
+        # for a potentially huge library.
+        workers = min(8, max(1, os.cpu_count() or 1))
+        try:
+            with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+                for offset in range(0, total, HYDRUS_HASH_LOOKUP_BATCH):
+                    if self.cancelled():
+                        break
+                    batch = candidates[
+                        offset:offset + HYDRUS_HASH_LOOKUP_BATCH]
+                    emit_progress(
+                        offset + 1, batch[0], "checking sidecars")
+                    prepared = list(ex.map(prepare, batch))
+                    local_hashes = {
+                        sha256 for _st, _tags, _urls, _signature, sha256,
+                        _ledger, was_synced in prepared
+                        if sha256 is not None and not was_synced
+                    }
+                    current_hashes = self._hydrus_current_sha256s(
+                        local_hashes)
+
+                    for batch_index, (media, item) in enumerate(
+                            zip(batch, prepared), start=1):
+                        index = offset + batch_index
+                        if self.cancelled():
+                            break
+                        (st, tags, urls, signature, sha256,
+                         ledger, was_synced) = item
+                        if st is None or ledger is None:
+                            failed += 1
+                            emit_progress(index, media, "failed")
+                            continue
+                        if was_synced:
+                            skipped += 1
+                            emit_progress(index, media, "already synced")
+                            continue
+                        if not tags and not urls:
+                            ledger.record_sidecar_sync(
+                                media.name, st.st_size, st.st_mtime,
+                                signature)
+                            successful += 1
+                            emit_progress(index, media, "no metadata")
+                            if successful % 25 == 0:
+                                ledger_mgr.save_all()
+                            continue
+
+                        known_sha256 = None
+                        if sha256 and (
+                                not self.hydrus_import
+                                or (current_hashes is not None
+                                    and sha256 in current_hashes)):
+                            known_sha256 = sha256
+
+                        emit_progress(index, media, "syncing")
+                        attempted += 1
+                        file_hash, complete = self._hydrus_push_detailed(
+                            media, tags, urls,
+                            known_sha256=known_sha256)
+                        if complete:
+                            ledger.record_sidecar_sync(
+                                media.name, st.st_size, st.st_mtime,
+                                signature, sha256=file_hash or sha256)
+                            successful += 1
+                            emit_progress(index, media, "synced")
+                            if successful % 25 == 0:
+                                ledger_mgr.save_all()
+                        else:
+                            failed += 1
+                            emit_progress(index, media, "failed")
+
+                    if self.cancelled():
+                        break
+        finally:
+            # A close/cancel or unexpected exception must retain every
+            # successful reconciliation from this run.
+            ledger_mgr.save_all()
+
+        if self.cancelled():
+            final_state = "cancelled"
+            print("⏹️  Sidecar sync cancelled.")
+        else:
+            final_state = "complete"
+        self._emit(
+            "sidecar_sync",
+            message=(
+                f"sidecar sync {final_state} · {successful} new · "
+                f"{skipped} already synced · {failed} failed"),
+            index=min(total, successful + skipped + failed),
+            total=total,
+            extra={
+                "final": True,
+                "checkpoint": True,
+                "attempted": attempted,
+                "successful": successful,
+                "skipped": skipped,
+                "failed": failed,
+            },
+        )
+        print(
+            f"✅ Sidecar sync: {successful} newly completed, "
+            f"{skipped} already synced, {failed} failed; "
+            "ledger checkpoints saved.")
+        return attempted, failed
 
     @staticmethod
     def _pdf_page_base_tags(media: Path) -> Set[str]:
@@ -2507,6 +2770,20 @@ class TagIntegrator:
         is on and the import is refused (previously deleted, vetoed, error),
         we abort the whole push — we do NOT fall through to bare-hash tagging.
         """
+        file_hash, _complete = self._hydrus_push_detailed(
+            media, tags, urls, known_sha256=known_sha256,
+            exact_match=exact_match)
+        return file_hash
+
+    def _hydrus_push_detailed(
+            self, media: Path, tags: Set[str], urls: Set[str],
+            known_sha256: Optional[str] = None,
+            exact_match: bool = False) -> Tuple[Optional[str], bool]:
+        """Hydrus push plus whether every requested metadata write completed.
+
+        The ordinary pipeline only needs the returned hash, while resumable
+        sidecar reconciliation must not checkpoint a partial/failed write.
+        """
         with self._hydrus_lock:
             try:
                 if known_sha256:
@@ -2520,27 +2797,30 @@ class TagIntegrator:
                     # to current members of its Hydrus duplicate group.
                     added = self._hydrus_add_file(media)
                     if not added:
-                        return None
+                        return None, False
                     file_hash, import_status = added
                     if import_status == 3:
-                        self._hydrus_push_to_deleted_duplicates(
+                        complete = self._hydrus_push_to_deleted_duplicates(
                             media, file_hash, tags, urls)
+                        if urls and not self.hydrus_can_edit_urls:
+                            complete = False
                         # Never cache or show the deleted source hash as if it
                         # were a current local file.
-                        return None
+                        return None, complete
                 else:
                     # Tag-only mode: file must already live in Hydrus under this
                     # hash — so it's an existing file, never a fresh import.
                     file_hash = self._sha256_local(media)
                     if not file_hash:
                         notify(f"❌ Hydrus: no hash for {media.name}; skipped push.")
-                        return None
+                        return None, False
                     import_status = 2
 
                 if tags:
                     self._hydrus_add_tags(file_hash, tags)
+                urls_complete = not urls
                 if urls and self.hydrus_can_edit_urls:
-                    self._hydrus_route_urls(
+                    urls_complete = self._hydrus_route_urls(
                         media, file_hash, urls, exact_match=exact_match)
                 # A no-match status-2 file gained no metadata, so do not
                 # mislabel it on the "Newly Tagged" page. Brand-new no-match
@@ -2549,10 +2829,10 @@ class TagIntegrator:
                     self._hydrus_add_to_page("new", file_hash)
                 elif tags or urls:
                     self._hydrus_add_to_page("updated", file_hash)
-                return file_hash
+                return file_hash, urls_complete
             except Exception as e:
                 notify(f"❌ Hydrus push failed for {media.name}: {e}")
-                return None
+                return None, False
 
     def _hydrus_post(self, endpoint: str, body: dict, timeout: int) -> requests.Response:
         """POST to a Hydrus Client API endpoint with the standard headers."""
@@ -2641,6 +2921,7 @@ class TagIntegrator:
                 notify(f"⚠️  Hydrus: {media.name} was previously deleted; no "
                        "current duplicate-group members to tag.")
                 return False
+            metadata_complete = True
             for target_hash in targets:
                 if tags:
                     self._hydrus_add_tags(target_hash, tags)
@@ -2652,13 +2933,14 @@ class TagIntegrator:
                         # members from receiving the authoritative tags.
                         notify(f"⚠️  Hydrus URL association failed for deleted "
                                f"{media.name}: {e}")
+                        metadata_complete = False
                 # Reached only after add_tags succeeded for this member (a
                 # failure raises and aborts the loop), so the page lists exactly
                 # the duplicate-group files that really were tagged.
                 self._hydrus_add_to_page("duplicates", target_hash)
             notify(f"✅ Hydrus: {media.name} was deleted; tagged {len(targets)} "
                    "current duplicate-group file(s).")
-            return True
+            return metadata_complete
         except (requests.RequestException, ValueError, RuntimeError, TypeError) as e:
             notify(f"⚠️  Hydrus: couldn't tag duplicate-group members for "
                    f"deleted {media.name}: {e}")
@@ -2683,13 +2965,14 @@ class TagIntegrator:
 
     def _hydrus_route_urls(
             self, media: Path, file_hash: str, urls: Set[str],
-            exact_match: bool = False) -> None:
+            exact_match: bool = False) -> bool:
         """Enrich safe exact-match URLs; directly associate everything else.
 
         A successful ``add_urls/add_url`` deliberately replaces
         ``associate_url`` for that URL. Associating first can make Hydrus regard
         the already-local file as fully handled and skip the page fetch that
-        supplies notes/descriptions.
+        supplies notes/descriptions. Returns whether every URL was ultimately
+        queued or associated.
         """
         remaining = set(urls)
         if (exact_match and self.hydrus_exact_url_enrichment
@@ -2723,6 +3006,8 @@ class TagIntegrator:
             except Exception as e:
                 notify(f"⚠️  Hydrus URL association failed for "
                        f"{media.name}: {e}")
+                return False
+        return True
 
     @staticmethod
     def _is_exact_hash_post_url(url: str) -> bool:
@@ -3841,12 +4126,13 @@ class TagIntegrator:
         duplicate_lock = threading.Lock()
         duplicates_tagged = prior_duplicates_tagged
 
-        def _bump_hit(sources: List[str]) -> None:
+        def _bump_hit(sources: List[str]) -> Dict[str, int]:
             nonlocal tagged
             with counts_lock:
                 tagged += 1
                 for s in sources:
                     counts[s] = counts.get(s, 0) + 1
+                return dict(counts)
 
         def _bump_miss() -> None:
             nonlocal nomatch
@@ -3926,10 +4212,10 @@ class TagIntegrator:
                                             item.md5, "matched", sources,
                                             sha256=sha)
                         _propagate_duplicates(item, tags, urls, sources, sha)
-                        _bump_hit(sources)
+                        source_totals = _bump_hit(sources)
                         result = f"{'+'.join(sources)}  ({len(tags)} tags)"
                         self._emit("finish_file", track="perceptual",
-                                   result=result)
+                                   result=result, source_hits=source_totals)
                     else:
                         sha = self.write_unmatched(item.path, item.sha256)
                         item.ledger.record(item.path.name, item.size, item.mtime,
@@ -3977,9 +4263,11 @@ class TagIntegrator:
                                             item.md5, "matched", sources,
                                             sha256=sha)
                         _propagate_duplicates(item, tags, urls, sources, sha)
-                        _bump_hit(sources)
+                        source_totals = _bump_hit(sources)
                         result = f"{'+'.join(sources)}  ({len(tags)} tags)"
-                        self._emit("finish_file", track="hash", result=result)
+                        self._emit(
+                            "finish_file", track="hash", result=result,
+                            source_hits=source_totals)
                     elif item.kind == "image":
                         perceptual_q.put(item)
                         # One grow per queued file — the observer is the only
