@@ -46,7 +46,8 @@ DEFAULT_PDF_ARCHIVAL_DPI = 600
 SETTINGS_VERSION = 1
 APP_NAME = "FurTag"
 APP_AUTHOR = "FurTag"
-DEFAULT_SERVICE_NAME = "org.furtag.FurTag"
+# The keyring service name lives in furtag_credentials.KEYRING_SERVICE — this
+# module deliberately keeps no second copy of it.
 
 DEFAULT_TAG_PATTERN = "{name}{ext}.txt"
 DEFAULT_URL_PATTERN = "{name}{ext}.urls.txt"
@@ -310,6 +311,19 @@ def resolve_settings_path(explicit: Optional[Path] = None) -> Path:
     return base / "settings.json"
 
 
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write *text* to *path* via a sibling ``.tmp`` + replace.
+
+    The one implementation of FurTag's crash-safe write, so an interrupted run
+    never leaves a half-written ledger/queue/report. Raises OSError; callers
+    decide whether that is fatal, warned, or ignored.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 class SettingsStore:
     """Load/save settings.json. Never stores secrets."""
 
@@ -326,13 +340,23 @@ class SettingsStore:
         return Settings.from_dict(data if isinstance(data, dict) else {})
 
     def save(self, settings: Settings) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
         payload = settings.to_dict()
         payload["version"] = SETTINGS_VERSION
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-                       encoding="utf-8")
-        tmp.replace(self.path)
+        atomic_write_text(
+            self.path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def validate_output_patterns(output: OutputSettings) -> None:
+    """Validate whichever sidecar name patterns the active format actually uses.
+
+    One definition, so the GUI's save-time check and the pre-scan preflight
+    can't disagree about what counts as a valid pattern set.
+    """
+    if output.sidecar_format == "json":
+        validate_sidecar_pattern(output.sidecar_json_filename, for_json=True)
+    else:
+        validate_sidecar_pattern(output.sidecar_tag_filename)
+        validate_sidecar_pattern(output.sidecar_url_filename)
 
 
 def validate_run_preflight(
@@ -377,12 +401,7 @@ def validate_run_preflight(
             "SauceNAO auth similarity must be ≥ min similarity.")
 
     try:
-        if settings.output.sidecar_format == "json":
-            validate_sidecar_pattern(
-                settings.output.sidecar_json_filename, for_json=True)
-        else:
-            validate_sidecar_pattern(settings.output.sidecar_tag_filename)
-            validate_sidecar_pattern(settings.output.sidecar_url_filename)
+        validate_output_patterns(settings.output)
     except SidecarPatternError as e:
         errors.append(str(e))
 

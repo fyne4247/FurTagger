@@ -10,7 +10,6 @@ import sys
 from pathlib import Path
 
 block_cipher = None
-root = Path(SPECPATH).parent  # packaging/ → project root when run from packaging/
 
 # When SPECPATH is packaging/, parent is project root.
 try:

@@ -104,7 +104,7 @@ import time
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import requests
 from PIL import Image, ImageFile
@@ -117,6 +117,7 @@ from furtag_settings import (
     ScanSummary,
     Settings,
     SettingsStore,
+    atomic_write_text,
     render_sidecar_name,
 )
 from furtag_events import NullObserver, RunEvent, RunObserver, TerminalObserver
@@ -167,6 +168,7 @@ CREDENTIALS_FILE = "credentials.txt"
 LEDGER_FILE      = ".furtag_ledger.json"
 DUPLICATES_FILE  = "duplicates.log"
 HYDRUS_HASH_LOOKUP_BATCH = 256  # well below the Client API's 2 MB GET limit
+HYDRUS_PAGE_BATCH = 256         # hashes per manage_pages call
 HYDRUS_RELATIONSHIP_DUPLICATES = "8"  # Hydrus duplicate-status enum; "3" = alternates
 
 # "Artist unknown" placeholder tags that every booru emits in some form — useless
@@ -644,14 +646,11 @@ class Ledger:
             if self._dirty == 0 and self.path.exists():
                 return
             try:
-                tmp = self.path.with_name(self.path.name + ".tmp")
                 payload: Dict = {"version": 3, "records": self.records}
                 if self.dir_count is not None:
                     payload["dir_fingerprint"] = {"count": self.dir_count, "size": self.dir_size}
-                tmp.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=0),
-                    encoding="utf-8")
-                tmp.replace(self.path)   # atomic
+                atomic_write_text(
+                    self.path, json.dumps(payload, ensure_ascii=False, indent=0))
                 self._dirty = 0
             except Exception as e:
                 notify(f"⚠️  Couldn't write ledger {self.path}: {e}")
@@ -925,13 +924,8 @@ class TagIntegrator:
 
     @staticmethod
     def _read_kv(creds: Path) -> Dict[str, str]:
-        cfg: Dict[str, str] = {}
-        for line in creds.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, v = map(str.strip, line.split("=", 1))
-                cfg[k.lower()] = v
-        return cfg
+        """Parse a legacy credentials.txt. One parser for this file format."""
+        return CredentialStore().load_from_plaintext(creds)
 
     def load_credentials(self, creds: Optional[Path] = None,
                          cfg: Optional[Dict[str, str]] = None) -> None:
@@ -1771,23 +1765,30 @@ class TagIntegrator:
         if not chosen:
             return set(), set(), "", "", review_candidate
 
-        platform = chosen.get("platform", "")
-        loc      = chosen.get("location", "")
+        loc = chosen.get("location", "") or ""
+        tags, urls = self._fluffle_result_payload(chosen)
+        return tags, urls, self._md5_from_url(loc), self._post_id_from_url(loc), None
+
+    @staticmethod
+    def _fluffle_result_payload(result: Dict) -> Tuple[Set[str], Set[str]]:
+        """`creator:`/`site:` tags and the source URL from one Fluffle result.
+
+        Shared by auto-accept and review queueing so an approved review yields
+        exactly the tags an auto-accepted hit would have.
+        """
         tags: Set[str] = set()
         urls: Set[str] = set()
-
-        for c in chosen.get("credits", []):
-            name = EMOJI_PATTERN.sub("", c.get("name", "")).strip()
+        for c in result.get("credits") or []:
+            name = EMOJI_PATTERN.sub("", (c or {}).get("name", "")).strip()
             if name:
                 tags.add(f"creator:{name}")
-        if platform:
-            platform_clean = EMOJI_PATTERN.sub("", platform).strip()
-            if platform_clean:
-                tags.add(f"site:{platform_clean}")
+        platform_clean = EMOJI_PATTERN.sub("", result.get("platform", "") or "").strip()
+        if platform_clean:
+            tags.add(f"site:{platform_clean}")
+        loc = result.get("location", "") or ""
         if loc:
             urls.add(loc)
-
-        return tags, urls, self._md5_from_url(loc), self._post_id_from_url(loc), None
+        return tags, urls
 
     # ── SauceNAO API ─────────────────────────────────────────────────────────
 
@@ -2172,11 +2173,9 @@ class TagIntegrator:
                 merged_tags = sorted((existing_tags | tags) - {""})
                 merged_urls = sorted((existing_urls | urls) - {""})
                 payload = {"tags": merged_tags, "urls": merged_urls}
-                tmp = path.with_name(path.name + ".tmp")
-                tmp.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8")
-                tmp.replace(path)
+                atomic_write_text(
+                    path,
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
             except Exception as e:
                 notify(f"❌ Write failed for {path.name}: {e}")
             return
@@ -2562,30 +2561,80 @@ class TagIntegrator:
         if self.hydrus_results_page_limit:
             del hashes[:-self.hydrus_results_page_limit]
 
+    def _hydrus_create_hash_page(self, name: str, hashes: List[str]) -> Optional[str]:
+        """Create one unfocused, hash-locked page and fill it in batches.
+
+        The single page-creation path for every review page, so batching and
+        error handling can't differ between them. Raises on failure to create
+        the page; callers decide how to report it. A batch that fails after the
+        page exists is reported and stops the fill, keeping what landed.
+        """
+        first, rest = hashes[:HYDRUS_PAGE_BATCH], hashes[HYDRUS_PAGE_BATCH:]
+        with self._hydrus_lock:
+            r = self._hydrus_post("manage_pages/new_page", {
+                "page_type": 6,
+                "page_name": name,
+                "hashes": first,
+                "system_hash_locked": True,
+                "focus_page": False,
+            }, 30)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+            page_key = r.json()["page_key"]
+            for start in range(0, len(rest), HYDRUS_PAGE_BATCH):
+                r = self._hydrus_post("manage_pages/add_files", {
+                    "page_key": page_key,
+                    "hashes": rest[start:start + HYDRUS_PAGE_BATCH],
+                }, 30)
+                if r.status_code != 200:
+                    notify(f"⚠️  Hydrus stopped filling '{name}' page "
+                           f"(HTTP {r.status_code}).")
+                    break
+        return page_key
+
     def _hydrus_flush_result_pages(self) -> None:
         """Create this run's hash-locked result pages from their rolling lists."""
         if not self.has_hydrus:
             return
-        with self._hydrus_lock:
-            for page in self.hydrus_result_pages.values():
-                if not page["enabled"] or not page["hashes"]:
+        for page in self.hydrus_result_pages.values():
+            if not page["enabled"] or not page["hashes"]:
+                continue
+            name = page["name"]
+            try:
+                self._hydrus_create_hash_page(name, page["hashes"])
+            except Exception as e:
+                page["enabled"] = False
+                notify(f"⚠️  Hydrus '{name}' page unavailable ({e}); "
+                       "continuing without it.")
+
+    @staticmethod
+    def _unchanged_records(
+            ledger_mgr: LedgerManager,
+            match: Callable[[Dict], bool],
+            verified: Set[str],
+            require_ledger_file: bool = False,
+    ) -> Iterator[Tuple[Path, "Ledger", str, os.stat_result, Dict]]:
+        """Walk touched ledgers for records still matching their fingerprint.
+
+        One definition of "an unchanged record of status X": select with *match*,
+        then re-verify against the file's current size/mtime via `status_for`, so
+        an edited or replaced file is never treated as still resolved. Yields
+        ``(path, ledger, name, stat_result, record)``.
+        """
+        for ledger in ledger_mgr.touched():
+            if require_ledger_file and not ledger.path.exists():
+                continue
+            for name, rec in ledger.records.items():
+                if not isinstance(rec, dict) or not match(rec):
                     continue
-                name = page["name"]
-                body = {
-                    "page_type": 6,
-                    "page_name": name,
-                    "hashes": page["hashes"],
-                    "system_hash_locked": True,
-                    "focus_page": False,
-                }
+                path = ledger.dir / name
                 try:
-                    r = self._hydrus_post("manage_pages/new_page", body, 30)
-                    if r.status_code != 200:
-                        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-                except Exception as e:
-                    page["enabled"] = False
-                    notify(f"⚠️  Hydrus '{name}' page unavailable ({e}); "
-                           "continuing without it.")
+                    st = path.stat()
+                except OSError:
+                    continue
+                if ledger.status_for(name, st.st_size, st.st_mtime) not in verified:
+                    continue
+                yield path, ledger, name, st, rec
 
     def _hydrus_populate_already_tagged_page(
             self, ledger_mgr: LedgerManager, limit: Optional[int]) -> int:
@@ -2605,22 +2654,12 @@ class TagIntegrator:
             return 0
 
         entries: List[Tuple[Path, Ledger, str, int, float, Optional[str], float]] = []
-        for ledger in ledger_mgr.touched():
-            for name, rec in ledger.records.items():
-                if not isinstance(rec, dict) or rec.get("status") != "matched":
-                    continue
-                path = ledger.dir / name
-                try:
-                    st = path.stat()
-                except OSError:
-                    continue
-                if ledger.status_for(name, st.st_size, st.st_mtime) != "matched":
-                    continue
-                # Records predating tagged_at sort oldest (fall to the tail).
-                tagged_at = rec.get("tagged_at") or 0.0
-                entries.append((path, ledger, name, st.st_size, st.st_mtime,
-                                ledger.sha256_for(name, st.st_size, st.st_mtime),
-                                tagged_at))
+        for path, ledger, name, st, rec in self._unchanged_records(
+                ledger_mgr, lambda r: r.get("status") == "matched", {"matched"}):
+            # Records predating tagged_at sort oldest (fall to the tail).
+            entries.append((path, ledger, name, st.st_size, st.st_mtime,
+                            ledger.sha256_for(name, st.st_size, st.st_mtime),
+                            rec.get("tagged_at") or 0.0))
 
         if not entries:
             return 0
@@ -2658,54 +2697,21 @@ class TagIntegrator:
         if not hashes:
             return 0
 
-        batch_size = 256
-        first = hashes[:batch_size]
-        body = {
-            "page_type": 6,
-            "page_name": self.hydrus_already_tagged_page_name,
-            "hashes": first,
-            "system_hash_locked": True,
-            "focus_page": False,
-        }
-        with self._hydrus_lock:
-            try:
-                r = self._hydrus_post("manage_pages/new_page", body, 30)
-                if r.status_code != 200:
-                    notify(f"⚠️  Hydrus Already Tagged page unavailable "
-                           f"(HTTP {r.status_code}).")
-                    return 0
-                page_key = r.json()["page_key"]
-                for start in range(batch_size, len(hashes), batch_size):
-                    r = self._hydrus_post("manage_pages/add_files", {
-                        "page_key": page_key,
-                        "hashes": hashes[start:start + batch_size],
-                    }, 30)
-                    if r.status_code != 200:
-                        notify(f"⚠️  Hydrus stopped filling Already Tagged page "
-                               f"(HTTP {r.status_code}).")
-                        break
-            except (requests.RequestException, ValueError, KeyError, TypeError) as e:
-                notify(f"⚠️  Hydrus Already Tagged page failed: {e}")
-                return 0
+        try:
+            self._hydrus_create_hash_page(
+                self.hydrus_already_tagged_page_name, hashes)
+        except (requests.RequestException, ValueError, KeyError, TypeError,
+                RuntimeError) as e:
+            notify(f"⚠️  Hydrus Already Tagged page failed: {e}")
+            return 0
         return len(hashes)
 
-    @staticmethod
-    def _has_prior_matched_files(ledger_mgr: LedgerManager) -> bool:
+    @classmethod
+    def _has_prior_matched_files(cls, ledger_mgr: LedgerManager) -> bool:
         """True only when an unchanged, valid matched ledger record exists."""
-        for ledger in ledger_mgr.touched():
-            if not ledger.path.exists():
-                continue
-            for name, rec in ledger.records.items():
-                if not isinstance(rec, dict) or rec.get("status") != "matched":
-                    continue
-                path = ledger.dir / name
-                try:
-                    st = path.stat()
-                except OSError:
-                    continue
-                if ledger.status_for(name, st.st_size, st.st_mtime) == "matched":
-                    return True
-        return False
+        return any(cls._unchanged_records(
+            ledger_mgr, lambda r: r.get("status") == "matched", {"matched"},
+            require_ledger_file=True))
 
     def _hydrus_import_prior_nomatches(self, ledger_mgr: LedgerManager) -> int:
         """Import unchanged old no-match files once when the run toggle is on."""
@@ -2713,18 +2719,11 @@ class TagIntegrator:
                 self.hydrus_import_unmatched):
             return 0
         entries: List[Tuple[Path, Ledger, str, int, float]] = []
-        for ledger in ledger_mgr.touched():
-            for name, rec in ledger.records.items():
-                if (not isinstance(rec, dict) or rec.get("status") != "nomatch" or
-                        rec.get("sha256")):
-                    continue
-                path = ledger.dir / name
-                try:
-                    st = path.stat()
-                except OSError:
-                    continue
-                if ledger.status_for(name, st.st_size, st.st_mtime) == "nomatch":
-                    entries.append((path, ledger, name, st.st_size, st.st_mtime))
+        for path, ledger, name, st, _rec in self._unchanged_records(
+                ledger_mgr,
+                lambda r: r.get("status") == "nomatch" and not r.get("sha256"),
+                {"nomatch"}):
+            entries.append((path, ledger, name, st.st_size, st.st_mtime))
         if entries:
             print(f"📥 Importing {len(entries)} prior no-match file(s) to Hydrus…")
         imported = 0
@@ -3123,30 +3122,20 @@ class TagIntegrator:
         self._write_duplicates_log(root, ledger_mgr)
         return survivors, duplicate_count, duplicate_groups
 
-    @staticmethod
-    def _write_duplicates_log(root: Path, ledger_mgr: LedgerManager) -> None:
+    @classmethod
+    def _write_duplicates_log(cls, root: Path, ledger_mgr: LedgerManager) -> None:
         groups: Dict[Tuple[str, str], List[str]] = {}
-        for ledger in ledger_mgr.touched():
-            for name, rec in ledger.records.items():
-                if (not isinstance(rec, dict) or
-                        (rec.get("status") != "duplicate" and
-                         not rec.get("duplicate_of"))):
-                    continue
-                path = ledger.dir / name
-                try:
-                    st = path.stat()
-                except OSError:
-                    continue
-                if ledger.status_for(name, st.st_size, st.st_mtime) not in (
-                        "duplicate", "matched"):
-                    continue
-                canonical = rec.get("duplicate_of") or "(canonical unknown)"
-                md5 = rec.get("md5") or "(hash unavailable)"
-                try:
-                    duplicate = str(path.relative_to(root))
-                except ValueError:
-                    duplicate = str(path)
-                groups.setdefault((canonical, md5), []).append(duplicate)
+        for path, _ledger, _name, _st, rec in cls._unchanged_records(
+                ledger_mgr,
+                lambda r: r.get("status") == "duplicate" or r.get("duplicate_of"),
+                {"duplicate", "matched"}):
+            canonical = rec.get("duplicate_of") or "(canonical unknown)"
+            md5 = rec.get("md5") or "(hash unavailable)"
+            try:
+                duplicate = str(path.relative_to(root))
+            except ValueError:
+                duplicate = str(path)
+            groups.setdefault((canonical, md5), []).append(duplicate)
 
         log_path = root / DUPLICATES_FILE
         if not groups:
@@ -3169,9 +3158,7 @@ class TagIntegrator:
             lines += [f"DUPLICATE: {path}" for path in sorted(duplicates, key=_natural_key)]
             lines.append("")
         try:
-            tmp = log_path.with_name(log_path.name + ".tmp")
-            tmp.write_text("\n".join(lines), encoding="utf-8")
-            tmp.replace(log_path)
+            atomic_write_text(log_path, "\n".join(lines))
         except OSError as e:
             notify(f"⚠️  Couldn't write {DUPLICATES_FILE}: {e}")
 
@@ -3305,18 +3292,7 @@ class TagIntegrator:
         platform = review_raw.get("platform", "") or ""
         loc = review_raw.get("location", "") or ""
         match_class = review_raw.get("match", "") or ""
-        tags: Set[str] = set()
-        urls: Set[str] = set()
-        for c in review_raw.get("credits", []) or []:
-            name = EMOJI_PATTERN.sub("", (c or {}).get("name", "")).strip()
-            if name:
-                tags.add(f"creator:{name}")
-        if platform:
-            platform_clean = EMOJI_PATTERN.sub("", platform).strip()
-            if platform_clean:
-                tags.add(f"site:{platform_clean}")
-        if loc:
-            urls.add(loc)
+        tags, urls = self._fluffle_result_payload(review_raw)
         pending = PendingReview.create(
             path=str(item.path.resolve()),
             relpath=item.relpath,

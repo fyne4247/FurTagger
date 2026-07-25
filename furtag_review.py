@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from furtag_settings import atomic_write_text
+
 REVIEW_FILE = ".furtag_review.json"
 
 
@@ -58,7 +60,11 @@ class ReviewQueue:
         self.root = Path(root)
         self.path = self.root / REVIEW_FILE
         self.items: Dict[str, PendingReview] = {}
+        # path → id, so replacing the entry for a path is O(1) rather than a
+        # linear scan on every add.
+        self._by_path: Dict[str, str] = {}
         self._lock = threading.Lock()
+        self._dirty = False
 
     def load(self) -> None:
         if not self.path.exists():
@@ -72,37 +78,49 @@ class ReviewQueue:
                 if isinstance(rec, dict):
                     item = PendingReview.from_dict(rec)
                     self.items[item.id] = item
+                    self._by_path[item.path] = item.id
         except Exception:
             pass
 
     def save(self) -> None:
+        """Persist only when something actually changed.
+
+        Callers checkpoint this on a fixed cadence, so without the dirty guard a
+        scan with no pending reviews rewrites an empty queue file repeatedly.
+        """
         with self._lock:
+            if not self._dirty:
+                return
             payload = {
                 "version": 1,
                 "items": [it.to_dict() for it in self.items.values()],
             }
             try:
-                tmp = self.path.with_name(self.path.name + ".tmp")
-                tmp.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2),
-                    encoding="utf-8")
-                tmp.replace(self.path)
+                atomic_write_text(
+                    self.path, json.dumps(payload, ensure_ascii=False, indent=2))
+                self._dirty = False
             except OSError:
                 pass
 
     def add(self, item: PendingReview) -> PendingReview:
         with self._lock:
             # Replace existing entry for same path
-            for eid, existing in list(self.items.items()):
-                if existing.path == item.path:
-                    del self.items[eid]
+            prior_id = self._by_path.get(item.path)
+            if prior_id is not None:
+                self.items.pop(prior_id, None)
             self.items[item.id] = item
+            self._by_path[item.path] = item.id
+            self._dirty = True
         self.save()
         return item
 
     def remove(self, item_id: str) -> Optional[PendingReview]:
         with self._lock:
             item = self.items.pop(item_id, None)
+            if item is not None:
+                if self._by_path.get(item.path) == item_id:
+                    del self._by_path[item.path]
+                self._dirty = True
         if item is not None:
             self.save()
         return item
@@ -119,6 +137,8 @@ class ReviewQueue:
     def clear(self) -> None:
         with self._lock:
             self.items.clear()
+            self._by_path.clear()
+            self._dirty = False
         if self.path.exists():
             try:
                 self.path.unlink()

@@ -93,7 +93,7 @@ from furtag import (
 )
 from furtag_settings import (
     Settings, SettingsStore, RunOptions, ScanSummary, validate_run_preflight,
-    validate_sidecar_pattern, SidecarPatternError, PACE_FLOORS,
+    validate_output_patterns, SidecarPatternError, PACE_FLOORS,
     FLUFFLE_MATCH_CLASSES, FLUFFLE_REVIEW_MODES, DEFAULT_PDF_DPI,
     DEFAULT_PDF_ARCHIVAL_DPI,
 )
@@ -434,7 +434,9 @@ class SettingsPanel(QWidget):
 
     def __init__(self, settings: Settings, parent=None) -> None:
         super().__init__(parent)
-        self.settings = settings.clone()
+        # No stored copy: the widgets are the state, and to_settings() reads it.
+        # A cached Settings here would go stale after the first save.
+        self._initial = settings.clone()
         self._build()
 
     def _add_tab(self, title: str, form_widget: QWidget) -> None:
@@ -579,7 +581,7 @@ class SettingsPanel(QWidget):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        self.load_from(self.settings)
+        self.load_from(self._initial)
 
     def load_from(self, s: Settings) -> None:
         o, h, src, m, p, perf = (
@@ -654,16 +656,11 @@ class SettingsPanel(QWidget):
     def _save_defaults(self) -> None:
         try:
             s = self.to_settings()
-            if s.output.sidecar_format == "json":
-                validate_sidecar_pattern(s.output.sidecar_json_filename, for_json=True)
-            else:
-                validate_sidecar_pattern(s.output.sidecar_tag_filename)
-                validate_sidecar_pattern(s.output.sidecar_url_filename)
+            validate_output_patterns(s.output)
         except SidecarPatternError as e:
             QMessageBox.warning(self, "Invalid pattern", str(e))
             return
         SettingsStore().save(s)
-        self.settings = s
         QMessageBox.information(self, "Settings", "Defaults saved.")
 
     def _restore_defaults(self) -> None:
@@ -969,6 +966,8 @@ class MainWindow(QMainWindow):
         opts.sync_sidecars = self.opt_sync_sidecars.isChecked()
         opts.build_already_tagged_page = self.opt_already.isChecked()
         opts.result_page_limit = self.opt_page_limit.value()
+        # Always set, so the engine never falls through to an interactive prompt.
+        # The PDF-quality dialog below may override it.
         opts.pdf_dpi = s.pdf.pdf_dpi
         opts.settings_override = s
 
@@ -985,9 +984,6 @@ class MainWindow(QMainWindow):
             if not ok:
                 return
             opts.pdf_dpi = dpi
-        else:
-            # Ensure the engine does not fall through to an interactive prompt.
-            opts.pdf_dpi = s.pdf.pdf_dpi
 
         self.cancel_event = threading.Event()
         self._set_running(True)

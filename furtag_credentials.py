@@ -64,13 +64,15 @@ class CredentialStore:
         self._keyring_error: Optional[str] = None
 
     def keyring_status(self) -> Tuple[bool, str]:
-        """Return (usable, message)."""
+        """Return (usable, message), including the last read error if any."""
         try:
             import keyring
             backend = keyring.get_keyring()
             name = type(backend).__name__
             if "fail" in name.lower() or "null" in name.lower():
                 return False, f"No usable keyring backend ({name})"
+            if self._keyring_error:
+                return True, f"Keyring: {name} (last error: {self._keyring_error})"
             return True, f"Keyring: {name}"
         except Exception as e:
             return False, f"Keyring unavailable: {e}"
@@ -141,21 +143,24 @@ class CredentialStore:
                 cfg[k.lower()] = v
         return cfg
 
+    @staticmethod
+    def resolve_plaintext_updates(cfg: Dict[str, str]) -> Dict[str, str]:
+        """Known fields (plus legacy aliases) to import from a credentials dict.
+
+        Exposed so a --dry-run preview shows exactly what a real migration would
+        write, instead of re-deriving the field filter and aliases separately.
+        """
+        updates = {field: cfg[field] for field in ALL_FIELDS if cfg.get(field)}
+        # Legacy alias names for the two Hydrus connection fields.
+        for alias, field in (("hydrus_url", "hydrus_api_url"),
+                             ("hydrus_api_key", "hydrus_access_key")):
+            if not updates.get(field) and cfg.get(alias):
+                updates[field] = cfg[alias]
+        return updates
+
     def migrate_from_plaintext(self, path: Path) -> Tuple[int, List[str]]:
         """Import known fields from credentials.txt into keyring. Returns (n, errs)."""
-        cfg = self.load_from_plaintext(path)
-        updates = {}
-        for field in ALL_FIELDS:
-            if cfg.get(field):
-                updates[field] = cfg[field]
-        # hydrus_url alias
-        if not updates.get("hydrus_api_url"):
-            for alias in ("hydrus_url",):
-                if cfg.get(alias):
-                    updates["hydrus_api_url"] = cfg[alias]
-        if not updates.get("hydrus_access_key"):
-            if cfg.get("hydrus_api_key"):
-                updates["hydrus_access_key"] = cfg["hydrus_api_key"]
+        updates = self.resolve_plaintext_updates(self.load_from_plaintext(path))
         errors = self.save_fields(updates)
         return len(updates) - len(errors), errors
 

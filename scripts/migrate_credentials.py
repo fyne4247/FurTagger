@@ -63,13 +63,9 @@ def main() -> int:
         print(f"No file at {args.credentials}")
         return 1
 
+    # Same resolver the real migration uses, so the preview can't disagree.
     cfg = store.load_from_plaintext(args.credentials)
-    known = {k: v for k, v in cfg.items() if k in ALL_FIELDS and v}
-    # aliases
-    if "hydrus_api_url" not in known and cfg.get("hydrus_url"):
-        known["hydrus_api_url"] = cfg["hydrus_url"]
-    if "hydrus_access_key" not in known and cfg.get("hydrus_api_key"):
-        known["hydrus_access_key"] = cfg["hydrus_api_key"]
+    known = store.resolve_plaintext_updates(cfg)
 
     print(f"Found {len(known)} field(s) in {args.credentials.name}:")
     for k in known:

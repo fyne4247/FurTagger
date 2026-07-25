@@ -338,7 +338,7 @@ The hash tier and perceptual tier are **separate passes** over the file list (ph
 The key pattern: a perceptual hit identifies *which* booru post the image is, so we re-query that booru's API by **post ID** for the full, properly-namespaced tag set — even though the local file was recompressed and didn't hash-match directly.
 
 - Prefer **post ID** over MD5-from-URL (the URL-MD5 trick only works when the CDN URL embeds the hash). `_post_id_from_url()` handles both `/posts/N` and e621's legacy `/post/show/N`.
-- **Fluffle**: `find_best_exact_match()` priority is exact-e621 > exact-other > tossUp-e621. `tossUp` is accepted **only** on e621 (gated by `FLUFFLE_TOSSUP_E621`) because we then re-query e621 by ID via `e621_lookup_by_id()`, so a near-miss stays low-risk. All other `tossUp`/`alternative`/`unlikely` are rejected.
+- **Fluffle**: `find_best_exact_match()` priority is exact-e621 > exact-other > tossUp-e621. `tossUp` is accepted **only** on e621 (gated by `matching.fluffle_tossup_e621_only` in settings, read per instance as `self.fluffle_tossup_e621`) because we then re-query e621 by ID via `e621_lookup_by_id()`, so a near-miss stays low-risk. All other `tossUp`/`alternative`/`unlikely` are rejected.
 - **SauceNAO**: `_saucenao_best_authoritative()` reads the `e621_id`/`danbooru_id`/`gelbooru_id` fields directly (preferring e621 → danbooru → gelbooru, and only for sources we hold creds for), then `_authoritative_lookup()` re-queries that booru. Gated behind `saucenao_auth_similarity` (default **88%**), a **higher** bar than `saucenao_min_similarity` (default **80%**) used to accept SauceNAO's own thinner tags. Both are settings-driven (GUI / `settings.json`).
 
 ### SauceNAO own-tags (the messy fallback)
@@ -359,7 +359,7 @@ When no booru-ID match clears the gate, `_extract_saucenao_tags()` is used. Sauc
 
 ## Rate Limiting
 
-Each service gets its own thread-safe **`Pacer`** (`self.pace[<service>]`) — a minimum-interval limiter that reserves the next free time slot, so successive calls to one service stay ≥ its interval apart even across worker threads, while different services never block each other. Every HTTP getter calls `self.pace[...].wait()` before the request; there are no scattered `time.sleep()` calls anymore. Intervals (top of file) come from each API's documented/observed limit:
+Each service gets its own thread-safe **`Pacer`** (`self.pace[<service>]`) — a minimum-interval limiter that reserves the next free time slot, so successive calls to one service stay ≥ its interval apart even across worker threads, while different services never block each other. Every HTTP getter calls `self.pace[...].wait()` before the request; there are no scattered `time.sleep()` calls anymore. A paced wait sleeps on the run's **cancel event**, not `time.sleep()`, so cancelling never has to wait out a long interval (SauceNAO paces at 6s and backs off further). Intervals (top of file) come from each API's documented/observed limit:
 
 - `E621_INTERVAL=1.0` (hard cap 2/s, e621 recommends sustained ≤1/s) · `INKBUNNY_INTERVAL=1.0` · `DANBOORU_INTERVAL=0.3` (posts endpoint allows 10/s) · `GELBOORU_INTERVAL=0.7` (two calls per hit) · `FLUFFLE_INTERVAL=1.2` (one concurrent request per client) · `SAUCENAO_INTERVAL=6.0` (~6 req/30s).
 
