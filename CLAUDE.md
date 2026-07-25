@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Authoritative product/architecture plan:** see `AGENTS.md` and `PLAN.md`.
+> This file is kept for Claude Code compatibility; when the two disagree, prefer
+> `AGENTS.md` / the live code.
+
 ## What This Is
 
 FurTag is a single Python script (`furtag.py`) that reverse-image-searches media files against furry/booru services and writes the retrieved metadata into Hydrus Network — either via the **Client API** (import + tags + URLs, no sidecars) or as classic Hydrus-compatible sidecar files. It is the consolidation of four earlier iterations (now deleted).
@@ -21,7 +25,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ### Terminal display
 
-`LiveDisplay` renders an in-place panel (previous / current / next file, a **phase label**, and a bottom progress bar with elapsed/ETA). The current line carries a live sub-status: during the hash tier it shows each site ticking off (`hash ▸ e621 ✓  ib ·  dan ✓  gel …` — ✓ hit, ✗/· miss, … in-flight); during perceptual it names the engine and any enrichment step. It is **thread-safe** (a lock guards every write) because the hash tier renders from a worker pool. All warnings/errors go through the module-level **`notify()`** (not `print`), which routes them *above* the live panel via `_display.log()`. When stdout isn't a TTY it degrades to one line per file. **Use `notify()` for any user-facing status message inside the processing loop** — a raw `print` would corrupt the panel.
+`LiveDisplay` renders an in-place panel (previous / current / next file, a **phase label**, and a bottom progress bar with elapsed/ETA). The current line carries a live sub-status: during the hash tier it shows each site ticking off (`hash ▸ e621 ✓  ib ·  dan ✓  gel …` — ✓ hit, ✗/· miss, … in-flight); during perceptual it names the engine and any enrichment step. It is **thread-safe** (a lock guards every write) because the hash tier renders from a worker pool. All warnings/errors go through the module-level **`notify()`** (not `print`), which emits an `issue` event to the active observer. The engine itself never calls a `LiveDisplay` method: every progress point is a `RunEvent` on the run's single observer, and `TerminalObserver` is what drives the panel (a GUI installs `QtObserver` instead). `notify()` emits an `issue` event to the **active observer** (`furtag.set_active_observer()`), so the same call sites feed the CLI panel's rolling **Recent issues** history and the GUI's issue pane. When stdout isn't a TTY it degrades to one line per file. **Use `notify()` for any user-facing status message inside the processing loop** — a raw `print` would corrupt the panel.
 
 ## Output
 
@@ -50,11 +54,15 @@ hydrus_api_url       hydrus_access_key
 hydrus_tag_service   (= "downloader tags" by default)
 hydrus_import        (true/false, default true)
 hydrus_also_sidecars (true/false, default false)
-hydrus_results_page       (name/on/off, default on — master toggle for the two result pages below)
+hydrus_results_page       (name/on/off, default on — master toggle for the result pages below)
 hydrus_new_imports_page   (= "FurTag New Imports" — brand-new imports this run)
 hydrus_newly_tagged_page  (= "FurTag Newly Tagged" — files already in Hydrus, newly tagged)
+hydrus_duplicate_tagged_page (= "FurTag Duplicate Tagged" — current duplicate-group members
+                           tagged on behalf of a previously-deleted file)
 hydrus_already_tagged_page(= "Already Tagged" — ledger-history review page; false disables)
 ```
+
+**Non-secret keys only apply on the explicit `load_credentials(creds=<path>)` path.** The preferred keyring/store path (`load_credentials_from_store()`, which the GUI uses) merges **only** the secret/identity fields in `furtag_credentials.ALL_FIELDS` from a legacy `credentials.txt`; every non-secret preference above (`hydrus_import`, `hydrus_tag_service`, the page names, `hydrus_results_page`, …) then comes from `Settings`, and ignored keys are reported once at startup. This is deliberate: a stale `credentials.txt` used to silently override what the user had just set in the Settings tab.
 
 For InkBunny, enable API access **and** adult ratings in account settings, or explicit results stay hidden. `load_credentials()` reads the file once into a dict and the `_init_<source>` helpers each pull their keys. `_init_hydrus()` verifies the access key and resolves the tag service name → `service_key`; on failure FurTag keeps writing sidecars.
 
@@ -65,9 +73,11 @@ When `has_hydrus` is true, `write_results()` calls `_hydrus_push()` instead of (
 1. `POST /add_files/add_file` with `{path}` when `hydrus_import` (status 1/2 → hash)
 2. `POST /add_tags/add_tags` with `service_keys_to_tags` and `override_previously_deleted_mappings: false` (downloader-like)
 3. `POST /add_urls/associate_url` with `urls_to_add` — **only when the access key holds Hydrus permission 0 ("Import and Edit URLs")**, checked once at startup (`hydrus_can_edit_urls`) and warned about if missing. A URL-association failure is caught and warned per file; it never aborts the tag push, the results-page add, or hash caching.
-4. `_hydrus_add_to_page(kind, hash)` files it onto one of two review pages by **import status**: status 1 (brand-new import) → **New Imports** page, status 2 / tag-only mode (already in Hydrus, just tagged) → **Newly Tagged** page. Pages are created lazily on first file, cached by page key in `self.hydrus_result_pages`, and any per-page failure disables just that page for the run.
+4. `_hydrus_add_to_page(kind, hash)` files it onto one of **three** review pages: status 1 (brand-new import) → **New Imports**, status 2 / tag-only mode (already in Hydrus, just tagged) → **Newly Tagged**, and a current duplicate-group member tagged for a known-deleted file (status 3, via `_hydrus_push_to_deleted_duplicates()`) → **Duplicate Tagged**. Each entry is a rolling newest-N list in `self.hydrus_result_pages` (`hydrus_results_page_limit`); `_hydrus_flush_result_pages()` creates every non-empty page once at end of run through the shared `_hydrus_create_hash_page()`, and any per-page failure disables just that page for the run. All three obey the `hydrus_results_page` master toggle and the Manage Pages permission check.
 
-Pushes are serialised with `_hydrus_lock` because the hash tier and perceptual worker can both call `write_results`. PDF pages still get `comic:`/`page:` via `_pdf_page_base_tags()` even when convert sidecars are skipped.
+A duplicate-group member is added **only after its `add_tags` call succeeded** — a member whose tag push failed aborts the loop and never appears on the page. *Local* byte-identical duplicates (`_propagate_duplicate_results()`) are a different notion of duplicate: those copies share one Hydrus hash record, so they are not added here (that would only re-add the canonical hash).
+
+Pushes are serialised with `_hydrus_lock` because the hash tier and perceptual worker can both call `write_results`. `_hydrus_add_to_page()` is a plain list mutation performed while that lock is already held; only `_hydrus_create_hash_page()` (called from the end-of-run flush, outside the push path) takes the lock itself. PDF pages still get `comic:`/`page:` via `_pdf_page_base_tags()` even when convert sidecars are skipped.
 
 ### Already Tagged review page
 
@@ -77,7 +87,7 @@ Pushes are serialised with `_hydrus_lock` because the hash tier and perceptual w
 
 `TagIntegrator.run()` drives four stages (preceded by a PDF pre-pass):
 
-- **PDF pre-pass** (`expand_pdfs()`): before indexing, every `*.pdf` under the root is rendered to per-page PNGs via in-module `convert_pdf()` (into a `<stem>/` subfolder beside the PDF, with `comic:`/`page:` `.txt` sidecars). Returns the set of page-folder paths. Already-rendered PDFs are skipped (guarded on an existing `.png` in the out-dir) so a re-run doesn't churn page mtimes and defeat the ledger. Missing PyMuPDF is non-fatal — PDFs are just left untouched, like a missing credential. See **PDFs** below.
+- **PDF background render** (`plan_pdf_renders()` → `render_pdf_jobs()`): discover PDFs and existing page folders first, then render unconverted PDFs as lossless PNGs on one dedicated worker. Pending output folders are excluded from the initial index so partial pages never leak in. Already-rendered PDFs are skipped. Missing PyMuPDF is non-fatal. See **PDFs** below.
 0. **Index** (`index()`): one `os.walk` of the tree. Skips dotfiles / macOS `._` metadata (`fn.startswith(".")`), non-media extensions, files with an existing tag sidecar, and files the ledger already recorded as matched/no-match (unchanged). Returns the survivors **videos-first, then images** (each group in **natural path order** via `_natural_key` — `PAGE2` before `PAGE10` — for stable, resumable runs). A PNG living in a `pdf_page_dirs` folder is flagged `perceptual_only` and is **exempt from the has-sidecar skip** (its sidecar holds only the base `comic:`/`page:` tags), so it still gets perceptually searched — the ledger alone rules it out on a re-run.
 1. **Hash** (`hash_all()`): compute every candidate's local MD5 in a thread pool (disk-bound, safe to parallelize) so the network stage never recomputes it.
 2. **Hash tier — run ALL and merge** (`hash_tier()`): e621 + InkBunny + Danbooru + Gelbooru queried by MD5 and unioned. The four boorus are **queried concurrently per file** via a `ThreadPoolExecutor` (four different hosts), each self-paced by its own `Pacer`. MD5 identity means byte-identical file, so there is zero false-positive risk and the tag sets genuinely differ. **Never short-circuit between these.** Gelbooru's post API returns a *flat* tag list, so `_gelbooru_categorize()` makes one extra batched call to map tags to `character:`/`creator:`/`series:`, falling back to unnamespaced tags if it fails.
@@ -87,7 +97,7 @@ The hash tier and perceptual tier are **separate passes** over the file list (ph
 
 ### PDFs
 
-`convert_pdf(pdf, out_root, dpi=300, write_sidecars=True) -> [png_paths]` lives in `furtag.py`. `expand_pdfs()` probes for PyMuPDF via `_import_fitz()` once before the render loop (missing PyMuPDF degrades gracefully). The sidecar is written with a **lowercase `.txt`** extension to match `tag_sidecar_path` (`<file>.<ext>.txt`), so perceptual tags append to the *same* file even on a case-sensitive volume. Requires **PyMuPDF** (in `requirements.txt`, import name `fitz`/`pymupdf`). Comic pages therefore never hit the boorus by hash — Fluffle/SauceNAO are their only shot, which is the intended behavior for re-rendered art.
+`convert_pdf(pdf, out_root, dpi=300, write_sidecars=True) -> [png_paths]` lives in `furtag.py`. `plan_pdf_renders()` probes for PyMuPDF via `_import_fitz()` once before launching the background render worker (missing PyMuPDF degrades gracefully). Base-tag sidecars (`comic:`/`page:`) are written in the configured format (txt or json). Requires **PyMuPDF** (in `requirements.txt`, import name `fitz`/`pymupdf`). Comic pages therefore never hit the boorus by hash — Fluffle/SauceNAO are their only shot, which is the intended behavior for re-rendered art.
 
 ### Session ledger
 
@@ -98,8 +108,8 @@ The hash tier and perceptual tier are **separate passes** over the file list (ph
 The key pattern: a perceptual hit identifies *which* booru post the image is, so we re-query that booru's API by **post ID** for the full, properly-namespaced tag set — even though the local file was recompressed and didn't hash-match directly.
 
 - Prefer **post ID** over MD5-from-URL (the URL-MD5 trick only works when the CDN URL embeds the hash). `_post_id_from_url()` handles both `/posts/N` and e621's legacy `/post/show/N`.
-- **Fluffle**: `find_best_exact_match()` priority is exact-e621 > exact-other > tossUp-e621. `tossUp` is accepted **only** on e621 (gated by `FLUFFLE_TOSSUP_E621`) because we then re-query e621 by ID via `e621_lookup_by_id()`, so a near-miss stays low-risk. All other `tossUp`/`alternative`/`unlikely` are rejected.
-- **SauceNAO**: `_saucenao_best_authoritative()` reads the `e621_id`/`danbooru_id`/`gelbooru_id` fields directly (preferring e621 → danbooru → gelbooru, and only for sources we hold creds for), then `_authoritative_lookup()` re-queries that booru. Gated behind `SAUCENAO_AUTH_SIMILARITY` (80%), a **higher** bar than `MIN_SIMILARITY` (70%) used to accept SauceNAO's own thinner tags.
+- **Fluffle**: `find_best_exact_match()` priority is exact-e621 > exact-other > tossUp-e621. `tossUp` is accepted **only** on e621 (gated by `matching.fluffle_tossup_e621_only` in settings, read per instance as `self.fluffle_tossup_e621`) because we then re-query e621 by ID via `e621_lookup_by_id()`, so a near-miss stays low-risk. All other `tossUp`/`alternative`/`unlikely` are rejected.
+- **SauceNAO**: `_saucenao_best_authoritative()` reads the `e621_id`/`danbooru_id`/`gelbooru_id` fields directly (preferring e621 → danbooru → gelbooru, and only for sources we hold creds for), then `_authoritative_lookup()` re-queries that booru. Gated behind `saucenao_auth_similarity` (default **88%**), a **higher** bar than `saucenao_min_similarity` (default **80%**) used to accept SauceNAO's own thinner tags.
 
 ### SauceNAO own-tags (the messy fallback)
 
@@ -120,7 +130,7 @@ When no booru-ID match clears the gate, `_extract_saucenao_tags()` is used. Sauc
 
 ## Rate Limiting
 
-Each service gets its own thread-safe **`Pacer`** (`self.pace[<service>]`) — a minimum-interval limiter that reserves the next free time slot, so successive calls to one service stay ≥ its interval apart even across worker threads, while different services never block each other. Every HTTP getter calls `self.pace[...].wait()` before the request; there are no scattered `time.sleep()` calls anymore. Intervals (top of file) come from each API's documented/observed limit:
+Each service gets its own thread-safe **`Pacer`** (`self.pace[<service>]`) — a minimum-interval limiter that reserves the next free time slot, so successive calls to one service stay ≥ its interval apart even across worker threads, while different services never block each other. Every HTTP getter calls `self.pace[...].wait()` before the request; there are no scattered `time.sleep()` calls anymore. A paced wait sleeps on the run's **cancel event**, not `time.sleep()`, so cancelling never has to wait out a long interval (SauceNAO paces at 6s and backs off further). Intervals (top of file) come from each API's documented/observed limit:
 
 - `E621_INTERVAL=1.0` (hard cap 2/s, e621 recommends sustained ≤1/s) · `INKBUNNY_INTERVAL=1.0` · `DANBOORU_INTERVAL=0.3` (posts endpoint allows 10/s) · `GELBOORU_INTERVAL=0.7` (two calls per hit) · `FLUFFLE_INTERVAL=1.2` (one concurrent request per client) · `SAUCENAO_INTERVAL=6.0` (~6 req/30s).
 

@@ -75,10 +75,12 @@ Credentials live in a single credentials.txt alongside this script
         hydrus_import        = true    # import file then tag (false = tag-only)
         hydrus_also_sidecars = false   # also write .txt sidecars when API is on
         hydrus_tag_deleted_duplicates = true  # tag current duplicate-group members
-        hydrus_results_page  = on      # blank/false disables both result pages below
+        hydrus_results_page  = on      # blank/false disables the result pages below
         hydrus_results_page_limit = 0  # newest N files per result page; 0 = unlimited
         hydrus_new_imports_page = FurTag New Imports   # brand-new imports this run
         hydrus_newly_tagged_page = FurTag Newly Tagged # files already in Hydrus, newly tagged
+        hydrus_duplicate_tagged_page = FurTag Duplicate Tagged  # duplicate-group members
+                                       # tagged for a previously-deleted file
         hydrus_already_tagged_page = Already Tagged  # matched ledger history; false disables
 
     Note: Danbooru requires a verified-email account for API auth; if the key
@@ -104,11 +106,28 @@ import time
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import requests
 from PIL import Image, ImageFile
 import regex  # for emoji stripping
+
+from furtag_settings import (
+    DEFAULT_JSON_PATTERN,
+    DEFAULT_PDF_ARCHIVAL_DPI,
+    DEFAULT_PDF_DPI,
+    DEFAULT_TAG_PATTERN,
+    DEFAULT_URL_PATTERN,
+    RunOptions,
+    ScanSummary,
+    Settings,
+    SettingsStore,
+    atomic_write_text,
+    render_sidecar_name,
+)
+from furtag_events import NullObserver, RunEvent, RunObserver, TerminalObserver
+from furtag_review import PendingReview, ReviewQueue
+from furtag_credentials import ALL_FIELDS as CREDENTIAL_FIELDS, CredentialStore
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # don't crash on slightly-truncated files
 
@@ -130,25 +149,31 @@ SAUCENAO_INTERVAL = 6.0   # ~6 requests / 30s short limit (+ daily cap via heade
 # Gelbooru tag "type" → Hydrus namespace prefix ("" = unnamespaced)
 GELBOORU_TYPE = {0: "", 1: "creator:", 3: "series:", 4: "character:", 5: ""}
 
-MIN_SIMILARITY = 80.0           # accept SauceNAO's own (thinner) tags above this
-SAUCENAO_AUTH_SIMILARITY = 88.0  # trust a booru-ID match enough to re-query that
-                                 # booru for its authoritative tag set
-
-# Fluffle: always trust "exact". Also accept "tossUp" BUT only when it resolves
-# to e621 — there we re-query the post by ID for the authoritative tag set, so a
-# near-miss stays low-risk. Set False to require exact matches only.
-FLUFFLE_TOSSUP_E621 = True
+# Matching thresholds and the Fluffle tossUp-only-on-e621 rule live in
+# furtag_settings (DEFAULT_SAUCENAO_*, MatchingSettings) and are read per
+# instance (TagIntegrator.saucenao_min_similarity etc.) so the GUI can change
+# them at runtime. There are deliberately no module-level copies here.
 
 IMG_EXTS   = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"}
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv"}
 PDF_EXTS   = {".pdf"}
-PDF_DPI    = 300            # render resolution for PDF pages
-PDF_ARCHIVAL_DPI = 600      # lossless archival preset; custom values are allowed
+PDF_DPI    = DEFAULT_PDF_DPI
+PDF_ARCHIVAL_DPI = DEFAULT_PDF_ARCHIVAL_DPI
+
+# Ledger statuses treated as "resolved" for skip / fingerprint sealing.
+# pending_review is intentionally absent — those files stay eligible.
+RESOLVED_LEDGER_STATUSES = frozenset({"matched", "nomatch", "duplicate"})
+
+# Exact-hash (MD5) sources, then every search source. One ordered definition so
+# the toggle lookups and the per-tier service lists can't drift apart.
+HASH_SOURCES = ("e621", "inkbunny", "danbooru", "gelbooru")
+SEARCH_SOURCES = HASH_SOURCES + ("fluffle", "saucenao")
 
 CREDENTIALS_FILE = "credentials.txt"
 LEDGER_FILE      = ".furtag_ledger.json"
 DUPLICATES_FILE  = "duplicates.log"
 HYDRUS_HASH_LOOKUP_BATCH = 256  # well below the Client API's 2 MB GET limit
+HYDRUS_PAGE_BATCH = 256         # hashes per manage_pages call
 HYDRUS_RELATIONSHIP_DUPLICATES = "8"  # Hydrus duplicate-status enum; "3" = alternates
 
 # "Artist unknown" placeholder tags that every booru emits in some form — useless
@@ -182,6 +207,12 @@ def _truthy(val: str, default: bool = False) -> bool:
         return default
     return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
+
+def _bool_str(val: bool) -> str:
+    """Render a bool in the credentials.txt spelling `_truthy` parses back."""
+    return "true" if val else "false"
+
+
 EMOJI_PATTERN = regex.compile(
     r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF'
     r'\U0001F1E0-\U0001F1FF\U00002700-\U000027BF\U0001F900-\U0001F9FF'
@@ -199,8 +230,14 @@ class Pacer:
     different threads. Different services use different Pacers and never block
     each other."""
 
-    def __init__(self, interval: float) -> None:
+    def __init__(self, interval: float,
+                 cancel: Optional[threading.Event] = None) -> None:
         self.interval = interval
+        # Sleeping on this event instead of time.sleep() makes a paced wait
+        # abort the instant a cancel arrives. SauceNAO paces at 6s and backs
+        # off to 30s+, so an uninterruptible sleep is what made cancelling
+        # look like it hung.
+        self.cancel = cancel
         self._lock = threading.Lock()
         self._next = 0.0
 
@@ -210,7 +247,11 @@ class Pacer:
             slot = self._next if self._next > now else now
             self._next = slot + self.interval
         delay = slot - time.monotonic()
-        if delay > 0:
+        if delay <= 0:
+            return
+        if self.cancel is not None:
+            self.cancel.wait(delay)   # returns early when cancelled
+        else:
             time.sleep(delay)
 
     def backoff(self, seconds: float) -> None:
@@ -278,9 +319,14 @@ class LiveDisplay:
     def _trim(name: str, width: int = 44) -> str:
         return name if len(name) <= width else name[:width - 1] + "…"
 
-    def hash_line(self, state: Dict[str, str]) -> str:
+    @classmethod
+    def hash_line(cls, state: Dict[str, str]) -> str:
+        """Render the per-site hash ticker (`hash ▸ e621 ✓  ib ·  dan …`).
+
+        A classmethod so the engine can format the sub-status for the event
+        stream without owning (or needing) a live panel."""
         return "hash ▸ " + "  ".join(
-            f"{self._ABBR.get(s, s)} {self._SYM.get(st, '?')}" for s, st in state.items())
+            f"{cls._ABBR.get(s, s)} {cls._SYM.get(st, '?')}" for s, st in state.items())
 
     def begin_phase(self, track: str, label: str, total: int,
                      growing: bool = False, interval: float = 0.0) -> None:
@@ -299,7 +345,7 @@ class LiveDisplay:
         hash tier discovers misses)."""
         with self._lock:
             self.tracks[track].total += by
-            if self.tty:
+            if self._live():
                 self._render()
 
     def freeze_total(self, track: str) -> None:
@@ -307,7 +353,7 @@ class LiveDisplay:
         becomes computable (called once the producer feeding it is done)."""
         with self._lock:
             self.tracks[track].growing = False
-            if self.tty:
+            if self._live():
                 self._render()
 
     def start_file(self, track: str, idx: int, current: str,
@@ -315,13 +361,15 @@ class LiveDisplay:
         with self._lock:
             t = self.tracks[track]
             t.idx, t.current, t.nxt, t.sub = idx, current, nxt or "—", "…"
-            if self.tty:
+            if self._live():
                 self._render()
 
     def status(self, track: str, sub: str) -> None:
         with self._lock:
             self.tracks[track].sub = sub
-            if self.tty:
+            # Status can arrive before the first phase (local hashing, Hydrus
+            # pre-passes); don't paint a half-empty panel over the startup log.
+            if self._live():
                 self._render()
 
     def finish_file(self, track: str, result: str) -> None:
@@ -329,7 +377,7 @@ class LiveDisplay:
             t = self.tracks[track]
             t.done = t.idx
             t.prev = (t.current, result)
-            if self.tty:
+            if self._live():
                 self._render()
             else:
                 print(f"[{track}] [{t.idx}/{t.total}] {self._trim(t.current)} → {result}")
@@ -339,18 +387,29 @@ class LiveDisplay:
 
         Non-interactive output stays line-oriented so redirected logs retain
         every issue. In a terminal, old issues roll off instead of permanently
-        accumulating above the progress display.
+        accumulating above the progress display. Before the first phase starts
+        there is no panel on screen yet, so those messages print inline rather
+        than disappearing into a history nobody has rendered.
         """
         with self._lock:
-            if not self.tty:
+            if not self._live():
                 print(msg)
                 return
             clean = " ".join(str(msg).split())
             self._issue_total += 1
             self._issues.append(self._trim(clean, 56))
             self._issues = self._issues[-self._MAX_ISSUES:]
-            if any(t.phase for t in self.tracks.values()):
-                self._render()
+            self._render()
+
+    def _live(self) -> bool:
+        """True once a phase has started, i.e. the panel owns the screen and a
+        raw `print` would corrupt it. Caller must hold self._lock."""
+        return self.tty and any(t.phase for t in self.tracks.values())
+
+    def active(self) -> bool:
+        """Locked `_live()`, for callers outside the display."""
+        with self._lock:
+            return self._live()
 
     def close(self) -> None:
         with self._lock:
@@ -405,8 +464,25 @@ class LiveDisplay:
         self._drawn = len(lines)
 
 
-# Active display, if any. notify() routes warnings into its rolling history.
+# Active live panel, if any. Only LiveDisplay-specific fallbacks (the plain
+# `hashed n/m` counter) consult this; all rendering goes through the observer.
 _display: Optional["LiveDisplay"] = None
+
+# The observer every module-level message is routed to. Defaults to a
+# display-less TerminalObserver, which prints — the right behaviour for a CLI
+# before the panel exists and for any headless caller. `_run_impl` swaps in the
+# run's observer for its duration; a GUI installs a long-lived one at startup
+# via set_active_observer() so credential/Hydrus warnings reach its issue pane.
+_active_observer: RunObserver = TerminalObserver()
+
+
+def set_active_observer(observer: Optional[RunObserver]) -> RunObserver:
+    """Install the observer notify() routes to; returns the previous one."""
+    global _active_observer
+    prev = _active_observer
+    _active_observer = observer if observer is not None else TerminalObserver()
+    return prev
+
 
 # Sentinel pushed onto the perceptual queue once the hash tier is done
 # producing, so the perceptual worker thread knows to stop and exit.
@@ -414,10 +490,13 @@ _PERCEPTUAL_DONE = object()
 
 
 def notify(msg: str) -> None:
-    if _display is not None:
-        _display.log(msg)
-    else:
-        print(msg)
+    """The single chokepoint for user-facing warnings/errors.
+
+    Every one becomes an `issue` event on the active observer, so the terminal
+    panel (via TerminalObserver → LiveDisplay.log) and the GUI issue pane are
+    fed from the same call sites. Never `print` from inside the processing loop
+    — that would corrupt the live panel."""
+    _active_observer.emit(RunEvent(kind="issue", message=str(msg)))
 
 
 def _natural_key(s: str) -> List:
@@ -486,8 +565,9 @@ class Ledger:
         except Exception as e:
             notify(f"⚠️  Couldn't read ledger {self.path} ({e}); starting fresh.")
 
-    def status_for(self, name: str, size: int, mtime: float) -> Optional[str]:
-        """'matched' / 'nomatch' if this exact file was already processed, else None."""
+    def _fresh_record(self, name: str, size: int, mtime: float) -> Optional[Dict]:
+        """The stored record for `name` iff its (size, mtime) fingerprint still
+        matches the file on disk — i.e. it describes these exact bytes."""
         rec = self.records.get(name)
         if not rec or rec.get("size") != size:
             return None
@@ -496,21 +576,19 @@ class Ledger:
                 return None
         except (TypeError, ValueError):
             return None
-        return rec.get("status")
+        return rec
+
+    def status_for(self, name: str, size: int, mtime: float) -> Optional[str]:
+        """'matched' / 'nomatch' if this exact file was already processed, else None."""
+        rec = self._fresh_record(name, size, mtime)
+        return rec.get("status") if rec else None
 
     def md5_for(self, name: str, size: int, mtime: float) -> Optional[str]:
         """Reuse a previously-computed MD5 for an unchanged file even if its
         status isn't matched/nomatch (e.g. a booru was briefly unreachable
         last time) — saves re-hashing on retry."""
-        rec = self.records.get(name)
-        if not rec or rec.get("size") != size:
-            return None
-        try:
-            if abs(float(rec.get("mtime", -1)) - mtime) > self.MTIME_EPS:
-                return None
-        except (TypeError, ValueError):
-            return None
-        return rec.get("md5")
+        rec = self._fresh_record(name, size, mtime)
+        return rec.get("md5") if rec else None
 
     def cache_md5(self, name: str, size: int, mtime: float, md5: str) -> None:
         """Checkpoint a local MD5 before the network stages finish.
@@ -521,14 +599,8 @@ class Ledger:
         if not md5:
             return
         with self._lock:
-            rec = self.records.get(name)
-            unchanged = bool(rec and rec.get("size") == size)
-            if unchanged:
-                try:
-                    unchanged = abs(float(rec.get("mtime", -1)) - mtime) <= self.MTIME_EPS
-                except (TypeError, ValueError):
-                    unchanged = False
-            if unchanged:
+            rec = self._fresh_record(name, size, mtime)
+            if rec is not None:
                 if rec.get("md5") != md5:
                     rec["md5"] = md5
                     self._dirty += 1
@@ -544,27 +616,14 @@ class Ledger:
 
     def sha256_for(self, name: str, size: int, mtime: float) -> Optional[str]:
         """Return a cached Hydrus/SHA-256 hash for this unchanged file."""
-        rec = self.records.get(name)
-        if not rec or rec.get("size") != size:
-            return None
-        try:
-            if abs(float(rec.get("mtime", -1)) - mtime) > self.MTIME_EPS:
-                return None
-        except (TypeError, ValueError):
-            return None
-        return rec.get("sha256")
+        rec = self._fresh_record(name, size, mtime)
+        return rec.get("sha256") if rec else None
 
     def cache_sha256(self, name: str, size: int, mtime: float, sha256: str) -> None:
         """Add SHA-256 to an existing unchanged record for future page loads."""
         with self._lock:
-            rec = self.records.get(name)
-            if not rec or rec.get("size") != size:
-                return
-            try:
-                unchanged = abs(float(rec.get("mtime", -1)) - mtime) <= self.MTIME_EPS
-            except (TypeError, ValueError):
-                unchanged = False
-            if unchanged and rec.get("sha256") != sha256:
+            rec = self._fresh_record(name, size, mtime)
+            if rec is not None and rec.get("sha256") != sha256:
                 rec["sha256"] = sha256
                 self._dirty += 1
 
@@ -579,6 +638,13 @@ class Ledger:
                 "status": status,
                 "sources": sources,
             }
+            if not sha256:
+                # No fresh hash from this write (sidecar-only mode, or unmatched
+                # files with hydrus_import_unmatched off) — keep the one already
+                # cached for these exact bytes rather than dropping it. Guarded on
+                # the same (size, mtime) freshness `sha256_for` uses, so a changed
+                # file never inherits a hash computed from different bytes.
+                sha256 = (self._fresh_record(name, size, mtime) or {}).get("sha256")
             if sha256:
                 # Persist the SHA-256 Hydrus already handed us on import, so the
                 # Already Tagged page never has to recompute it on a later run.
@@ -610,14 +676,11 @@ class Ledger:
             if self._dirty == 0 and self.path.exists():
                 return
             try:
-                tmp = self.path.with_name(self.path.name + ".tmp")
                 payload: Dict = {"version": 3, "records": self.records}
                 if self.dir_count is not None:
                     payload["dir_fingerprint"] = {"count": self.dir_count, "size": self.dir_size}
-                tmp.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=0),
-                    encoding="utf-8")
-                tmp.replace(self.path)   # atomic
+                atomic_write_text(
+                    self.path, json.dumps(payload, ensure_ascii=False, indent=0))
                 self._dirty = 0
             except Exception as e:
                 notify(f"⚠️  Couldn't write ledger {self.path}: {e}")
@@ -664,13 +727,19 @@ def _import_fitz():
 
 
 def convert_pdf(pdf_path: Path, output_root: Path, dpi: int = PDF_DPI,
-                write_sidecars: bool = True) -> List[Path]:
+                write_sidecars: bool = True,
+                sidecar_format: str = "txt",
+                tag_pattern: str = "{name}{ext}.txt",
+                json_pattern: str = "{name}{ext}.json",
+                should_cancel: Optional[Callable[[], bool]] = None) -> List[Path]:
     """Render every page of ``pdf_path`` to a PNG under ``output_root/<stem>/``.
 
     Returns the list of PNG paths written. When ``write_sidecars`` is True each
-    PNG also gets a ``comic:``/``page:`` ``.txt`` sidecar (lowercase extension
-    so it matches ``tag_sidecar_path`` on case-sensitive volumes and perceptual
-    tags append to the same file later).
+    PNG also gets a ``comic:``/``page:`` base-tag sidecar (txt or json per
+    *sidecar_format*) so perceptual tags append to the same file later.
+
+    *should_cancel* is polled between pages so a cancel doesn't have to wait out
+    a whole multi-hundred-page render.
     """
     fitz = _import_fitz()
     stem = pdf_path.stem
@@ -686,16 +755,29 @@ def convert_pdf(pdf_path: Path, output_root: Path, dpi: int = PDF_DPI,
     generated: List[Path] = []
     try:
         for i, page in enumerate(doc, start=1):
+            if should_cancel is not None and should_cancel():
+                break
             base_name = f"{stem} PAGE{i}.PNG"
             png_path = out_dir / base_name
-            txt_path = out_dir / f"{base_name}.txt"
 
             pix = page.get_pixmap(dpi=dpi)
             pix.save(png_path)
             generated.append(png_path)
 
             if write_sidecars:
-                txt_path.write_text(f"comic:{stem}\npage:{i}\n", encoding="utf-8")
+                tags = {f"comic:{stem}", f"page:{i}"}
+                if sidecar_format == "json":
+                    sc_name = render_sidecar_name(json_pattern, png_path)
+                    sc_path = png_path.parent / sc_name
+                    payload = {"tags": sorted(tags), "urls": []}
+                    sc_path.write_text(
+                        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+                else:
+                    sc_name = render_sidecar_name(tag_pattern, png_path)
+                    sc_path = png_path.parent / sc_name
+                    sc_path.write_text(
+                        "\n".join(sorted(tags)) + "\n", encoding="utf-8")
     finally:
         doc.close()
     print(f"  {pdf_path.name}: {len(generated)} page(s) at {dpi} DPI -> {out_dir}")
@@ -740,28 +822,32 @@ def prompt_for_pdf_dpi(pdf_count: int) -> int:
 
 class TagIntegrator:
 
-    def __init__(self) -> None:
-        self.session = requests.Session()
+    def __init__(self, settings: Optional[Settings] = None,
+                 session: Optional[requests.Session] = None) -> None:
+        self.settings = (settings or Settings()).clone()
+        self.session = session if session is not None else requests.Session()
+        self.cancel_event = threading.Event()
+        self._observer: RunObserver = NullObserver()
+        self._display_detached = True
+        self._review_queue: Optional[ReviewQueue] = None
+        self._run_lock = threading.Lock()  # one scan at a time
 
-        # Per-service pacers
-        self.pace = {
-            "e621":     Pacer(E621_INTERVAL),
-            "inkbunny": Pacer(INKBUNNY_INTERVAL),
-            "danbooru": Pacer(DANBOORU_INTERVAL),
-            "gelbooru": Pacer(GELBOORU_INTERVAL),
-            "fluffle":  Pacer(FLUFFLE_INTERVAL),
-            "saucenao": Pacer(SAUCENAO_INTERVAL),
-        }
+        # Per-service pacers — intervals are filled in by apply_settings() below,
+        # which is the single place settings → instance attrs is wired.
+        self.pace = {name: Pacer(0.0) for name in
+                     ("e621", "inkbunny", "danbooru", "gelbooru",
+                      "fluffle", "saucenao")}
 
         # Fluffle
         self.fluffle_api  = "https://api.fluffle.xyz/v1/search"
         self.headers_fluf = {"User-Agent": "HydrusIntegrator/5.0 (Fluffle+e621+InkBunny+SauceNAO)"}
 
-        # e621
+        # e621 — has_* = credentials present (available); enabled_* = user toggle
         self.e621_username = ""
         self.e621_api_key  = ""
         self.headers_e6: Dict[str, str] = {}
         self.has_e621 = False
+        self.enabled_e621 = True
         self._pool_cache: Dict[int, Dict] = {}   # pool_id → pool JSON
 
         # InkBunny
@@ -769,85 +855,224 @@ class TagIntegrator:
         self.ib_password = ""
         self.ib_sid = ""
         self.has_inkbunny = False
+        self.enabled_inkbunny = True
 
         # Danbooru
         self.danbooru_username = ""
         self.danbooru_api_key  = ""
         self.has_danbooru = False
+        self.enabled_danbooru = True
         self.danbooru_anon = False   # set True after a 401/403 → drop auth
 
         # Gelbooru
         self.gelbooru_user_id = ""
         self.gelbooru_api_key = ""
         self.has_gelbooru = False
+        self.enabled_gelbooru = True
 
         # SauceNAO
         self.saucenao_api_key = ""
         self.headers_saucenao: Dict[str, str] = {}
         self.has_saucenao = False
+        self.enabled_saucenao = True
         self.saucenao_exhausted = False   # set True when the daily quota runs out
+
+        # Fluffle has no credentials — availability is always True when enabled
+        self.has_fluffle = True
+        self.enabled_fluffle = True
 
         # Hydrus Client API (optional output sink — skip sidecars when on)
         self.hydrus_api_url = ""
         self.hydrus_access_key = ""
-        self.hydrus_tag_service_name = "downloader tags"
         self.hydrus_tag_service_key = ""
-        self.hydrus_import = True
-        self.hydrus_import_unmatched = False  # launcher-session interactive choice
-        self.hydrus_also_sidecars = False
         self.hydrus_can_edit_urls = False   # access key has "Import and Edit URLs"
         self.hydrus_can_search_files = False  # MD5 → current SHA-256 lookup
-        self.hydrus_tag_deleted_duplicates = True
         self.hydrus_can_manage_relationships = False
-        self.hydrus_results_page_limit = 0  # 0 = unlimited, newest N per page
-        # Two result pages: genuinely new imports vs. files already in Hydrus
-        # that merely gained tags. Hashes are retained as rolling newest-N
-        # lists, then each page is created once when the scan finishes.
+        # Three result pages: genuinely new imports, files already in Hydrus
+        # that merely gained tags, and current duplicate-group members tagged
+        # on behalf of a previously-deleted file. Hashes are retained as rolling
+        # newest-N lists, then each page is created once when the scan finishes.
+        # Page names come from settings via apply_settings().
         self.hydrus_result_pages: Dict[str, Dict] = {
-            "new":     {"name": "FurTag New Imports",  "enabled": False, "hashes": []},
-            "updated": {"name": "FurTag Newly Tagged", "enabled": False, "hashes": []},
+            "new":        {"name": "", "enabled": False, "hashes": []},
+            "updated":    {"name": "", "enabled": False, "hashes": []},
+            "duplicates": {"name": "", "enabled": False, "hashes": []},
         }
-        self.hydrus_already_tagged_page_name = "Already Tagged"
+        self.hydrus_already_tagged_page_name = ""
         self.hydrus_already_tagged_page_enabled = False
         # Set once from the startup Hydrus menu. None means do not build an
         # Already Tagged page this session; 0 means include every match.
         self.hydrus_already_tagged_page_limit: Optional[int] = None
         self.has_hydrus = False
         self._hydrus_lock = threading.Lock()  # serialise API writes (hash + perc)
+        self.apply_settings(self.settings)
+
+    def apply_settings(self, settings: Settings) -> None:
+        """Re-apply non-secret settings (thresholds, toggles, pacers)."""
+        self.settings = settings.clone()
+        m = self.settings.matching
+        self.saucenao_min_similarity = float(m.saucenao_min_similarity)
+        self.saucenao_auth_similarity = float(m.saucenao_auth_similarity)
+        self.fluffle_tossup_e621 = bool(m.fluffle_tossup_e621_only)
+        self.fluffle_accepted_matches = list(m.fluffle_accepted_matches or ["exact"])
+        self.fluffle_review_mode = m.fluffle_review_mode or "off"
+        perf = self.settings.performance
+        for name in self.pace:
+            self.pace[name].interval = getattr(perf, f"{name}_interval")
+        self._bind_cancel_to_pacers()
+        out = self.settings.output
+        self.hydrus_import = out.hydrus_import
+        self.hydrus_also_sidecars = out.sidecars_enabled
+        self.hydrus_tag_deleted_duplicates = out.hydrus_tag_deleted_duplicates
+        prev_service = getattr(self, "hydrus_tag_service_name", "")
+        self.hydrus_tag_service_name = out.hydrus_tag_service
+        if (self.hydrus_tag_service_name != prev_service
+                and getattr(self, "hydrus_tag_service_key", "")):
+            # The resolved service_key belongs to the OLD name; pushing tags with
+            # it now would silently write to the wrong tag service. Re-resolve, and
+            # if that fails drop to sidecars rather than tag the wrong service.
+            self._reresolve_tag_service()
+        self.hydrus_import_unmatched = out.hydrus_import_unmatched
+        hy = self.settings.hydrus
+        self.hydrus_results_page_limit = hy.result_page_limit
+        self.hydrus_result_pages["new"]["name"] = hy.new_imports_page_name
+        self.hydrus_result_pages["updated"]["name"] = hy.newly_tagged_page_name
+        self.hydrus_result_pages["duplicates"]["name"] = hy.duplicate_tagged_page_name
+        self.hydrus_already_tagged_page_name = hy.already_tagged_page_name
+        self._apply_source_toggles()
+
+    def _reresolve_tag_service(self) -> None:
+        """Re-resolve `hydrus_tag_service_name` → service_key after a settings
+        change. On any failure the stale key is cleared and the Hydrus sink is
+        disabled (sidecars only) — never keep writing to the previous service."""
+        try:
+            svc_key = self._hydrus_resolve_tag_service(self.hydrus_tag_service_name)
+        except Exception as e:                       # network / API / parse failure
+            svc_key = ""
+            notify(f"‼️  Couldn't re-resolve Hydrus tag service "
+                   f"'{self.hydrus_tag_service_name}' ({e}) – sidecars only.")
+        else:
+            if not svc_key:
+                notify(f"‼️  Hydrus tag service '{self.hydrus_tag_service_name}' "
+                       f"not found – sidecars only.")
+        self.hydrus_tag_service_key = svc_key
+        if not svc_key:
+            self.has_hydrus = False
+
+    def _apply_source_toggles(self) -> None:
+        src = self.settings.sources
+        self.enabled_e621 = bool(src.e621_enabled)
+        self.enabled_inkbunny = bool(src.inkbunny_enabled)
+        self.enabled_danbooru = bool(src.danbooru_enabled)
+        self.enabled_gelbooru = bool(src.gelbooru_enabled)
+        self.enabled_fluffle = bool(src.fluffle_enabled)
+        self.enabled_saucenao = bool(src.saucenao_enabled)
+
+    def _bind_cancel_to_pacers(self) -> None:
+        """Point every Pacer at the live cancel event so paced sleeps abort."""
+        for pacer in self.pace.values():
+            pacer.cancel = self.cancel_event
+
+    def cancelled(self) -> bool:
+        return self.cancel_event.is_set()
+
+    def request_cancel(self) -> None:
+        self.cancel_event.set()
 
     # ── Credential loading ───────────────────────────────────────────────────
 
     @staticmethod
     def _read_kv(creds: Path) -> Dict[str, str]:
-        cfg: Dict[str, str] = {}
-        for line in creds.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, v = map(str.strip, line.split("=", 1))
-                cfg[k.lower()] = v
-        return cfg
+        """Parse a legacy credentials.txt. One parser for this file format."""
+        return CredentialStore().load_from_plaintext(creds)
 
-    def load_credentials(self, creds: Path) -> None:
-        """Load every source's credentials from a single credentials.txt.
-        Any missing/incomplete set just disables that source."""
-        print(f"🔑 Loading credentials from {creds.name}")
-        if not creds.exists():
-            print("‼️  Missing credentials.txt – all API sources disabled.")
-            return
+    def load_credentials(self, creds: Optional[Path] = None,
+                         cfg: Optional[Dict[str, str]] = None) -> None:
+        """Load credentials from a dict, CredentialStore, or legacy credentials.txt.
 
-        cfg = self._read_kv(creds)
+        Any missing/incomplete set just marks that source unavailable.
+        """
+        if cfg is None:
+            if creds is None:
+                creds = Path(__file__).with_name(CREDENTIALS_FILE)
+            print(f"🔑 Loading credentials from {creds.name}")
+            if not creds.exists():
+                notify("‼️  Missing credentials.txt – all API sources disabled.")
+                # Still try env/keyring
+                store = CredentialStore()
+                cfg = store.load_all().as_cfg()
+                if not any(cfg.values()):
+                    return
+            else:
+                cfg = self._read_kv(creds)
+                # Overlay env vars (env wins)
+                store = CredentialStore()
+                env_cfg = store.load_all().as_cfg()
+                for k, v in env_cfg.items():
+                    if v:
+                        cfg[k] = v
+        else:
+            print("🔑 Loading credentials from secure store / environment")
+
+        # Non-secret Hydrus prefs default from settings; anything already in cfg
+        # (i.e. explicitly set in credentials.txt) wins.
+        out = self.settings.output
+        hy = self.settings.hydrus
+        defaults = {
+            "hydrus_import": _bool_str(out.hydrus_import),
+            "hydrus_also_sidecars": _bool_str(out.sidecars_enabled),
+            "hydrus_tag_deleted_duplicates": _bool_str(out.hydrus_tag_deleted_duplicates),
+            "hydrus_results_page_limit": str(hy.result_page_limit),
+            "hydrus_new_imports_page": hy.new_imports_page_name,
+            "hydrus_newly_tagged_page": hy.newly_tagged_page_name,
+            "hydrus_duplicate_tagged_page": hy.duplicate_tagged_page_name,
+            "hydrus_already_tagged_page": hy.already_tagged_page_name,
+            "hydrus_results_page": "on" if hy.results_pages_enabled else "off",
+        }
+        if out.hydrus_tag_service:
+            defaults["hydrus_tag_service"] = out.hydrus_tag_service
+        cfg = {**defaults, **cfg}
+
         self._init_e621(cfg)
         self._init_inkbunny(cfg)
         self._init_danbooru(cfg)
         self._init_gelbooru(cfg)
         self._init_saucenao(cfg)
-        self._init_hydrus(cfg)
+        if self.settings.output.hydrus_enabled:
+            self._init_hydrus(cfg)
+        else:
+            self.has_hydrus = False
+        self._apply_source_toggles()
+
+    def load_credentials_from_store(self, store: Optional[CredentialStore] = None,
+                                    legacy_path: Optional[Path] = None) -> None:
+        """Preferred path: keyring + env vars (no plaintext file required)."""
+        store = store or CredentialStore()
+        snap = store.load_all()
+        cfg = snap.as_cfg()
+        # Also merge legacy credentials.txt if present (private migration window),
+        # but ONLY its secret/identity fields. Non-secret preferences (tag
+        # service, page names, hydrus_import, …) must always come from Settings —
+        # a leftover line in this file used to silently beat the Settings tab.
+        legacy = legacy_path or Path(__file__).with_name(CREDENTIALS_FILE)
+        if legacy.exists():
+            allowed = set(CREDENTIAL_FIELDS) | {"hydrus_url", "hydrus_api_key"}
+            ignored: List[str] = []
+            for k, v in self._read_kv(legacy).items():
+                if k in allowed:
+                    cfg.setdefault(k, v)
+                elif v:
+                    ignored.append(k)
+            if ignored:
+                notify(f"⚠️  Ignoring non-secret key(s) in {legacy.name}: "
+                       f"{', '.join(sorted(ignored))} — these now come from Settings.")
+        self.load_credentials(cfg=cfg)
 
     def _init_e621(self, cfg: Dict[str, str]) -> None:
         self.e621_username = cfg.get("e621_username", "")
         self.e621_api_key  = cfg.get("e621_api_key", "")
         if not (self.e621_username and self.e621_api_key):
-            print("‼️  e621 credentials incomplete – e621 disabled.")
+            notify("‼️  e621 credentials incomplete – e621 disabled.")
             return
         self.headers_e6 = {
             "User-Agent": f"HydrusIntegrator/5.0 (by {self.e621_username} on e621)"
@@ -859,7 +1084,7 @@ class TagIntegrator:
         self.ib_username = cfg.get("inkbunny_username", "")
         self.ib_password = cfg.get("inkbunny_password", "")
         if not (self.ib_username and self.ib_password):
-            print("‼️  InkBunny credentials incomplete – InkBunny disabled.")
+            notify("‼️  InkBunny credentials incomplete – InkBunny disabled.")
             return
         if self.inkbunny_login():
             self.has_inkbunny = True
@@ -868,7 +1093,7 @@ class TagIntegrator:
         self.danbooru_username = cfg.get("danbooru_username", "")
         self.danbooru_api_key  = cfg.get("danbooru_api_key", "")
         if not (self.danbooru_username and self.danbooru_api_key):
-            print("‼️  Danbooru credentials incomplete – Danbooru disabled.")
+            notify("‼️  Danbooru credentials incomplete – Danbooru disabled.")
             return
         print(f"✅ Danbooru credentials loaded for {self.danbooru_username}")
         self.has_danbooru = True
@@ -877,7 +1102,7 @@ class TagIntegrator:
         self.gelbooru_user_id = cfg.get("gelbooru_user_id", "")
         self.gelbooru_api_key = cfg.get("gelbooru_api_key", "")
         if not (self.gelbooru_user_id and self.gelbooru_api_key):
-            print("‼️  Gelbooru credentials incomplete – Gelbooru disabled.")
+            notify("‼️  Gelbooru credentials incomplete – Gelbooru disabled.")
             return
         print("✅ Gelbooru credentials loaded")
         self.has_gelbooru = True
@@ -885,7 +1110,7 @@ class TagIntegrator:
     def _init_saucenao(self, cfg: Dict[str, str]) -> None:
         self.saucenao_api_key = cfg.get("sauce_nao_api_key", "")
         if not self.saucenao_api_key:
-            print("‼️  No sauce_nao_api_key found – SauceNAO fallback disabled.")
+            notify("‼️  No sauce_nao_api_key found – SauceNAO fallback disabled.")
             return
         self.headers_saucenao = {"User-Agent": "HydrusIntegrator/5.0 (SauceNAO)"}
         print("✅ SauceNAO API key loaded")
@@ -913,16 +1138,16 @@ class TagIntegrator:
             self.hydrus_results_page_limit = max(
                 0, int((cfg.get("hydrus_results_page_limit") or "0").strip()))
         except ValueError:
-            print("⚠️  Invalid hydrus_results_page_limit; using unlimited.")
+            notify("⚠️  Invalid hydrus_results_page_limit; using unlimited.")
             self.hydrus_results_page_limit = 0
         page_setting = cfg.get("hydrus_results_page", "on").strip()
         page_requested = page_setting.lower() not in {"", "0", "false", "no", "off"}
-        new_name = cfg.get("hydrus_new_imports_page", "").strip()
-        upd_name = cfg.get("hydrus_newly_tagged_page", "").strip()
-        if new_name:
-            self.hydrus_result_pages["new"]["name"] = new_name
-        if upd_name:
-            self.hydrus_result_pages["updated"]["name"] = upd_name
+        for key, cfg_key in (("new", "hydrus_new_imports_page"),
+                             ("updated", "hydrus_newly_tagged_page"),
+                             ("duplicates", "hydrus_duplicate_tagged_page")):
+            name = cfg.get(cfg_key, "").strip()
+            if name:
+                self.hydrus_result_pages[key]["name"] = name
         old_page_setting = cfg.get(
             "hydrus_already_tagged_page", "Already Tagged").strip()
         self.hydrus_already_tagged_page_name = old_page_setting or "Already Tagged"
@@ -936,8 +1161,8 @@ class TagIntegrator:
                 timeout=10,
             )
             if r.status_code != 200:
-                print(f"‼️  Hydrus API rejected access key (HTTP {r.status_code}) – "
-                      f"sidecars only.")
+                notify(f"‼️  Hydrus API rejected access key (HTTP {r.status_code}) – "
+                       f"sidecars only.")
                 return
             access = r.json()
             permissions = access.get("basic_permissions") or []
@@ -954,33 +1179,33 @@ class TagIntegrator:
             # file searching in Hydrus.
             self.hydrus_can_manage_relationships = everything or 8 in permissions
             if not self.hydrus_can_edit_urls:
-                print("⚠️  Hydrus URLs disabled – access key needs the "
-                      "'Import and Edit URLs' permission; tags still work.")
+                notify("⚠️  Hydrus URLs disabled – access key needs the "
+                       "'Import and Edit URLs' permission; tags still work.")
             if not self.hydrus_can_search_files:
-                print("⚠️  Hydrus hash cache disabled – access key needs "
-                      "'Search for and Fetch Files'; imports still work.")
+                notify("⚠️  Hydrus hash cache disabled – access key needs "
+                       "'Search for and Fetch Files'; imports still work.")
             if (self.hydrus_tag_deleted_duplicates and
                     not self.hydrus_can_manage_relationships):
-                print("⚠️  Deleted-file duplicate tagging disabled – access key needs "
-                      "'Manage File Relationships'.")
+                notify("⚠️  Deleted-file duplicate tagging disabled – access key needs "
+                       "'Manage File Relationships'.")
             for page in self.hydrus_result_pages.values():
                 page["enabled"] = page_requested and can_manage_pages
             self.hydrus_already_tagged_page_enabled = (
                 old_page_requested and can_manage_pages)
             if (page_requested or old_page_requested) and not can_manage_pages:
-                print("⚠️  Hydrus pages disabled – access key needs Manage Pages permission.")
+                notify("⚠️  Hydrus pages disabled – access key needs Manage Pages permission.")
             svc_key = self._hydrus_resolve_tag_service(self.hydrus_tag_service_name)
             if not svc_key:
-                print(f"‼️  Hydrus tag service '{self.hydrus_tag_service_name}' not found – "
-                      f"sidecars only.")
+                notify(f"‼️  Hydrus tag service '{self.hydrus_tag_service_name}' not found – "
+                       f"sidecars only.")
                 return
             self.hydrus_tag_service_key = svc_key
             self.has_hydrus = True
             print(f"✅ Hydrus Client API → {self.hydrus_api_url}  "
                   f"[{self.hydrus_tag_service_name}]  ({self.hydrus_mode_desc()})")
         except requests.RequestException as e:
-            print(f"‼️  Hydrus API unreachable ({e}) – sidecars only. "
-                  f"Is the client running with the API enabled?")
+            notify(f"‼️  Hydrus API unreachable ({e}) – sidecars only. "
+                   f"Is the client running with the API enabled?")
 
     def hydrus_mode_desc(self) -> str:
         """e.g. "import+tag" / "tag-only + sidecars" — used in startup banners."""
@@ -1092,18 +1317,51 @@ class TagIntegrator:
 
     @property
     def write_sidecars(self) -> bool:
-        """Sidecars when Hydrus API is off, or when hydrus_also_sidecars is set."""
-        return (not self.has_hydrus) or self.hydrus_also_sidecars
+        """Sidecars when Hydrus API is off, or when sidecars_enabled / also_sidecars."""
+        if self.has_hydrus:
+            # apply_settings() mirrors settings.output.sidecars_enabled onto this
+            # attribute, so it is the single holder — don't OR it with its source.
+            return bool(self.hydrus_also_sidecars)
+        # Classic fallback: always write when Hydrus is unavailable, unless the
+        # user explicitly disabled sidecars while also disabling Hydrus (blocked
+        # by preflight). Prefer writing over silent data loss.
+        return True
+
+    def source_available(self, name: str) -> bool:
+        """Credentials present. Called per file per service — no dict building."""
+        if name == "saucenao":
+            return self.has_saucenao and not self.saucenao_exhausted
+        return name in SEARCH_SOURCES and getattr(self, f"has_{name}", False)
+
+    def source_enabled(self, name: str) -> bool:
+        """User toggle. Called per file per service — no dict building."""
+        return name in SEARCH_SOURCES and getattr(self, f"enabled_{name}", False)
+
+    def source_active(self, name: str) -> bool:
+        """Available credentials AND user-enabled."""
+        return self.source_available(name) and self.source_enabled(name)
 
     def any_source(self) -> bool:
-        return any((self.has_e621, self.has_inkbunny, self.has_danbooru,
-                    self.has_gelbooru, self.has_saucenao))
+        """True if any search source is active (available + enabled)."""
+        return any(self.source_active(s) for s in SEARCH_SOURCES)
+
+    def any_source_available(self) -> bool:
+        return any(self.source_available(s) for s in SEARCH_SOURCES)
 
     def enabled_hash_services(self) -> List[str]:
-        return [s for s, on in (("e621", self.has_e621),
-                                ("inkbunny", self.has_inkbunny),
-                                ("danbooru", self.has_danbooru),
-                                ("gelbooru", self.has_gelbooru)) if on]
+        return [s for s in HASH_SOURCES if self.source_active(s)]
+
+    def source_status_map(self) -> Dict[str, str]:
+        """Map service → 'active' | 'disabled' | 'unavailable' for UI."""
+        out: Dict[str, str] = {}
+        for s in ("e621", "inkbunny", "danbooru", "gelbooru", "fluffle", "saucenao"):
+            if not self.source_available(s):
+                out[s] = "unavailable"
+            elif not self.source_enabled(s):
+                out[s] = "disabled"
+            else:
+                out[s] = "active"
+        return out
 
     # ── Thumbnail / MD5 helpers ──────────────────────────────────────────────
 
@@ -1509,68 +1767,160 @@ class TagIntegrator:
             notify(f"❌ Fluffle request failed: {e}")
             return None
 
-    def find_best_exact_match(self, j: Dict) -> Tuple[Set[str], Set[str], str, str]:
+    #: Fluffle match slots, strictly highest confidence first. Each row is a
+    #: ``(match class, is-e621)`` pair; ``_fluffle_slot_verdict()`` turns a row
+    #: into accept / review / reject using the three user settings. A real
+    #: ``exact`` therefore always outranks ``tossUp``, which outranks
+    #: ``alternative``, which outranks ``unlikely`` — no matter what order
+    #: Fluffle returned them in.
+    _FLUFFLE_SLOTS: Tuple[Tuple[str, bool], ...] = (
+        ("exact", True),
+        ("exact", False),
+        ("tossUp", True),
+        ("tossUp", False),
+        ("alternative", True),
+        ("alternative", False),
+        ("unlikely", True),
+        ("unlikely", False),
+    )
+
+    def _fluffle_slot_verdict(self, match: str, e621: bool,
+                              accepted: Set[str], review_mode: str) -> str:
+        """``"accept"`` / ``"review"`` / ``"reject"`` for one Fluffle slot.
+
+        The whole accept/reject matrix lives here:
+
+        ==============  ================================================
+        exact           accept when the user accepts ``exact``
+        tossUp (e621)   accept when the user accepts ``tossUp`` **or**
+                        ``fluffle_tossup_e621`` (the documented low-risk
+                        gate: we re-query e621 by post ID afterwards)
+        tossUp (other)  accept only when the user accepts ``tossUp`` and
+                        the e621-only gate is off
+        alternative     accept only when the user accepts ``alternative``
+        unlikely        accept only when the user accepts ``unlikely``
+        ==============  ================================================
+
+        Anything not accepted falls to ``review`` when *review_mode* covers
+        its class (``tossups`` → tossUps, ``tossups_alternatives`` → tossUps
+        and alternatives), else ``reject``. ``exact`` and ``unlikely`` are
+        never review candidates.
         """
-        Parse Fluffle results. Priority: exact-e621 > exact-other > tossUp-e621
-        (the last only when FLUFFLE_TOSSUP_E621, since we re-query e621 by ID).
-        Returns (tags, urls, md5_from_url, post_id).
+        if match == "exact":
+            return "accept" if "exact" in accepted else "reject"
+        if match == "tossUp":
+            if "tossUp" in accepted:
+                accept = e621 or not self.fluffle_tossup_e621
+            else:
+                accept = e621 and self.fluffle_tossup_e621
+            if accept:
+                return "accept"
+            return ("review"
+                    if review_mode in ("tossups", "tossups_alternatives")
+                    else "reject")
+        if match == "alternative":
+            if "alternative" in accepted:
+                return "accept"
+            return "review" if review_mode == "tossups_alternatives" else "reject"
+        if match == "unlikely":
+            return "accept" if "unlikely" in accepted else "reject"
+        return "reject"
+
+    def find_best_exact_match(
+            self, j: Dict
+            ) -> Tuple[Set[str], Set[str], str, str, Optional[Dict]]:
+        """
+        Parse Fluffle results. Priority among auto-accepted classes:
+        exact-e621 > exact-other > tossUp-e621 (when fluffle_tossup_e621),
+        then the opt-in classes in the order of ``_FLUFFLE_SLOTS``.
+
+        Returns (tags, urls, md5_from_url, post_id, review_candidate).
+        *review_candidate* is a raw Fluffle result dict when nothing was
+        auto-accepted but the best hit falls in the human-review band (and
+        review mode is on); otherwise None.
         """
         results = j.get("results") if j else None
         if not results or not isinstance(results, list):
-            return set(), set(), "", ""
+            return set(), set(), "", "", None
 
         def is_e621(r: Dict) -> bool:
-            return ("e621" in r.get("platform", "").lower()
-                    or "e621.net" in r.get("location", ""))
+            return ("e621" in (r.get("platform") or "").lower()
+                    or "e621.net" in (r.get("location") or ""))
 
-        exact_e621 = exact_other = tossup_e621 = None
+        accepted = set(self.fluffle_accepted_matches or ["exact"])
+        # Always allow exact if the accepted list is empty/broken
+        if not accepted:
+            accepted = {"exact"}
+        review_mode = self.fluffle_review_mode or "off"
+
+        # Best (= first-returned) result per slot; Fluffle orders by confidence
+        # within a class, so first wins.
+        best: Dict[Tuple[str, bool], Dict] = {}
         for result in results:
-            match = result.get("match")
-            if match == "exact":
-                if is_e621(result):
-                    exact_e621 = exact_e621 or result
-                elif exact_other is None:
-                    exact_other = result
-            elif match == "tossUp" and FLUFFLE_TOSSUP_E621 and is_e621(result):
-                tossup_e621 = tossup_e621 or result
+            if not isinstance(result, dict):
+                continue
+            slot = (result.get("match"), is_e621(result))
+            if slot in self._FLUFFLE_SLOTS and slot not in best:
+                best[slot] = result
 
-        chosen = exact_e621 or exact_other or tossup_e621
+        chosen: Optional[Dict] = None
+        review_candidate: Optional[Dict] = None
+        for match, e621 in self._FLUFFLE_SLOTS:
+            result = best.get((match, e621))
+            if result is None:
+                continue
+            verdict = self._fluffle_slot_verdict(match, e621, accepted, review_mode)
+            if verdict == "accept":
+                chosen = result
+                break                       # an auto-accept beats any review
+            if verdict == "review" and review_candidate is None:
+                review_candidate = result
+
         if not chosen:
-            return set(), set(), "", ""
+            return set(), set(), "", "", review_candidate
 
-        platform = chosen.get("platform", "")
-        loc      = chosen.get("location", "")
+        loc = chosen.get("location", "") or ""
+        tags, urls = self._fluffle_result_payload(chosen)
+        return tags, urls, self._md5_from_url(loc), self._post_id_from_url(loc), None
+
+    @staticmethod
+    def _fluffle_result_payload(result: Dict) -> Tuple[Set[str], Set[str]]:
+        """`creator:`/`site:` tags and the source URL from one Fluffle result.
+
+        Shared by auto-accept and review queueing so an approved review yields
+        exactly the tags an auto-accepted hit would have.
+        """
         tags: Set[str] = set()
         urls: Set[str] = set()
-
-        for c in chosen.get("credits", []):
-            name = EMOJI_PATTERN.sub("", c.get("name", "")).strip()
+        for c in result.get("credits") or []:
+            name = EMOJI_PATTERN.sub("", (c or {}).get("name", "")).strip()
             if name:
                 tags.add(f"creator:{name}")
-        if platform:
-            platform_clean = EMOJI_PATTERN.sub("", platform).strip()
-            if platform_clean:
-                tags.add(f"site:{platform_clean}")
+        platform_clean = EMOJI_PATTERN.sub("", result.get("platform", "") or "").strip()
+        if platform_clean:
+            tags.add(f"site:{platform_clean}")
+        loc = result.get("location", "") or ""
         if loc:
             urls.add(loc)
-
-        return tags, urls, self._md5_from_url(loc), self._post_id_from_url(loc)
+        return tags, urls
 
     # ── SauceNAO API ─────────────────────────────────────────────────────────
 
     def saucenao_search(self, img: Path,
-                        similarity_threshold: float = MIN_SIMILARITY
+                        similarity_threshold: Optional[float] = None
                         ) -> Tuple[Optional[str], Optional[str], Set[str], Set[str]]:
         """
         Returns (service, post_id, own_tags, own_urls).
-        (service, post_id) is set only when a result above SAUCENAO_AUTH_SIMILARITY
+        (service, post_id) is set only when a result above saucenao_auth_similarity
         resolves to a booru we hold credentials for — the caller should then
         re-query that booru for the authoritative tag set rather than trusting
         SauceNAO's own thinner tags. own_tags/own_urls are the fallback for
         matches that resolve to sites we can't re-query.
         """
-        if not self.has_saucenao or self.saucenao_exhausted:
+        if not self.source_active("saucenao") or self.saucenao_exhausted:
             return None, None, set(), set()
+        if similarity_threshold is None:
+            similarity_threshold = self.saucenao_min_similarity
         thumb = self._prepare_thumb(img)
         if not thumb:
             return None, None, set(), set()
@@ -1600,7 +1950,8 @@ class TagIntegrator:
             self._saucenao_check_quota(j.get("header", {}))
             if j.get("header", {}).get("status", 0) != 0:
                 return None, None, set(), set()
-            service, post_id = self._saucenao_best_authoritative(j, SAUCENAO_AUTH_SIMILARITY)
+            service, post_id = self._saucenao_best_authoritative(
+                j, self.saucenao_auth_similarity)
             tags, urls = self._extract_saucenao_tags(j, similarity_threshold)
             return service, post_id, tags, urls
         except (requests.RequestException, ValueError):
@@ -1646,9 +1997,9 @@ class TagIntegrator:
         """Highest-confidence result above threshold that carries a booru ID we
         can re-query (and hold creds for). Returns (service, id) or (None, None).
         Preference order e621 → danbooru → gelbooru when a result has several."""
-        candidates = [("e621", "e621_id", self.has_e621),
-                      ("danbooru", "danbooru_id", self.has_danbooru),
-                      ("gelbooru", "gelbooru_id", self.has_gelbooru)]
+        candidates = [("e621", "e621_id", self.source_active("e621")),
+                      ("danbooru", "danbooru_id", self.source_active("danbooru")),
+                      ("gelbooru", "gelbooru_id", self.source_active("gelbooru"))]
         best: Tuple[Optional[str], Optional[str]] = (None, None)
         best_sim = threshold
         for result in json_data.get("results", []):
@@ -1815,16 +2166,92 @@ class TagIntegrator:
 
     # ── Sidecar I/O ──────────────────────────────────────────────────────────
 
+    def tag_sidecar_path(self, media: Path) -> Path:
+        """Configured tag sidecar path (txt format)."""
+        pattern = self.settings.output.sidecar_tag_filename or "{name}{ext}.txt"
+        return media.parent / render_sidecar_name(pattern, media)
+
+    def url_sidecar_path(self, media: Path) -> Path:
+        """Configured URL sidecar path (txt format)."""
+        pattern = self.settings.output.sidecar_url_filename or "{name}{ext}.urls.txt"
+        return media.parent / render_sidecar_name(pattern, media)
+
+    def json_sidecar_path(self, media: Path) -> Path:
+        pattern = self.settings.output.sidecar_json_filename or "{name}{ext}.json"
+        return media.parent / render_sidecar_name(pattern, media)
+
     @staticmethod
-    def tag_sidecar_path(media: Path) -> Path:
+    def legacy_tag_sidecar_path(media: Path) -> Path:
         return media.with_suffix(media.suffix + ".txt")
 
     @staticmethod
-    def url_sidecar_path(media: Path) -> Path:
+    def legacy_url_sidecar_path(media: Path) -> Path:
         return media.with_suffix(media.suffix + ".urls.txt")
 
+    def _tag_sidecar_candidates(self, media: Path) -> List[Path]:
+        """Configured + legacy tag sidecar names, de-duplicated, in read order."""
+        return list(dict.fromkeys((self.tag_sidecar_path(media),
+                                   self.legacy_tag_sidecar_path(media))))
+
+    def _url_sidecar_candidates(self, media: Path) -> List[Path]:
+        """Configured + legacy URL sidecar names, de-duplicated, in read order."""
+        return list(dict.fromkeys((self.url_sidecar_path(media),
+                                   self.legacy_url_sidecar_path(media))))
+
+    def _json_sidecar_candidates(self, media: Path) -> List[Path]:
+        """Configured + common alternate JSON sidecar names, de-duplicated."""
+        return list(dict.fromkeys((self.json_sidecar_path(media),
+                                   media.with_suffix(media.suffix + ".json"))))
+
     def has_sidecar(self, media: Path) -> bool:
-        return self.tag_sidecar_path(media).exists()
+        """True if any recognized sidecar exists (configured + legacy .txt).
+
+        Legacy ``.txt`` sidecars are always recognized even when the format
+        setting is JSON, so switching formats never re-scans a library.
+
+        A ``<media>.<ext>.json`` neighbour must additionally *look* like FurTag's
+        own payload: that name is also gallery-dl's default metadata filename, and
+        counting a foreign file here would silently exclude the media from every
+        future scan (same root cause as the Reset-deletes-metadata bug).
+        """
+        for p in self._tag_sidecar_candidates(media) + self._url_sidecar_candidates(media):
+            if p.exists():
+                return True
+        return any(p.is_file() and _looks_like_furtag_json_sidecar(p)
+                   for p in self._json_sidecar_candidates(media))
+
+    def read_sidecar_payload(self, media: Path) -> Tuple[Set[str], Set[str]]:
+        """Read tags and URLs from any supported sidecar shape beside *media*."""
+        tags: Set[str] = set()
+        urls: Set[str] = set()
+        # JSON first (single file with both). Same guard as has_sidecar: a
+        # gallery-dl `<media>.<ext>.json` is not ours, and ingesting its "tags"
+        # would push a foreign tool's vocabulary into Hydrus.
+        for jp in self._json_sidecar_candidates(media):
+            if jp.is_file() and _looks_like_furtag_json_sidecar(jp):
+                try:
+                    data = json.loads(jp.read_text("utf-8"))
+                    if isinstance(data, dict):
+                        for t in data.get("tags") or []:
+                            if t:
+                                tags.add(str(t))
+                        for u in data.get("urls") or []:
+                            if u:
+                                urls.add(str(u))
+                    elif isinstance(data, list):
+                        for t in data:
+                            if t:
+                                tags.add(str(t))
+                except (OSError, ValueError, TypeError):
+                    pass
+        # Text sidecars (configured + legacy)
+        for tp in self._tag_sidecar_candidates(media):
+            if tp.is_file():
+                tags |= {t for t in self._read_result_sidecar(tp) if t}
+        for up in self._url_sidecar_candidates(media):
+            if up.is_file():
+                urls |= {u for u in self._read_result_sidecar(up) if u}
+        return tags, urls
 
     @staticmethod
     def _append_lines(path: Path, lines: Set[str]) -> int:
@@ -1845,6 +2272,32 @@ class TagIntegrator:
     def _write_sidecar_results(self, media: Path, tags: Set[str],
                                urls: Set[str]) -> None:
         """Write an already-cleaned result payload without touching Hydrus."""
+        if not tags and not urls:
+            # Nothing to record. Creating an empty ``{"tags": [], "urls": []}``
+            # would make has_sidecar() true forever, so index() would count the
+            # file as already tagged and never retry it. Leave any existing
+            # sidecar (and its content) exactly as it is.
+            return
+        fmt = (self.settings.output.sidecar_format or "txt").lower()
+        if fmt == "json":
+            path = self.json_sidecar_path(media)
+            try:
+                existing_tags: Set[str] = set()
+                existing_urls: Set[str] = set()
+                if path.exists():
+                    data = json.loads(path.read_text("utf-8"))
+                    if isinstance(data, dict):
+                        existing_tags = set(data.get("tags") or [])
+                        existing_urls = set(data.get("urls") or [])
+                merged_tags = sorted((existing_tags | tags) - {""})
+                merged_urls = sorted((existing_urls | urls) - {""})
+                payload = {"tags": merged_tags, "urls": merged_urls}
+                atomic_write_text(
+                    path,
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            except Exception as e:
+                notify(f"❌ Write failed for {path.name}: {e}")
+            return
         if tags:
             self._append_lines(self.tag_sidecar_path(media), tags)
         if urls:
@@ -1853,22 +2306,22 @@ class TagIntegrator:
     def sync_sidecars_to_hydrus(self, root: Path) -> Tuple[int, int]:
         """Push existing FurTag sidecars to Hydrus without touching ledgers.
 
-        This is a migration/reconciliation pass: ``<media>.txt`` supplies tags
-        and ``<media>.urls.txt`` supplies source URLs. It deliberately does no
-        booru lookup and never changes a ``.furtag_ledger.json`` record, so a
-        normal already-processed tree remains skipped on the following scan.
+        This is a migration/reconciliation pass: tag sidecars (txt or JSON)
+        supply tags and URL sidecars supply source URLs. It deliberately does
+        no booru lookup and never changes a ``.furtag_ledger.json`` record.
         """
         if not self.has_hydrus:
             return 0, 0
         candidates: List[Path] = []
         for dp, dirs, files in os.walk(root):
             dirs.sort()
+            if self.cancelled():
+                break
             for name in sorted(files):
                 if name.startswith(".") or not self._media_kind(name):
                     continue
                 media = Path(dp) / name
-                if (self.tag_sidecar_path(media).is_file() or
-                        self.url_sidecar_path(media).is_file()):
+                if self.has_sidecar(media):
                     candidates.append(media)
         if not candidates:
             print("📤 No FurTag sidecars found to sync to Hydrus.")
@@ -1876,11 +2329,19 @@ class TagIntegrator:
 
         print(f"📤 Syncing sidecars to Hydrus for {len(candidates)} file(s)…")
         processed = 0
+        # Reading a sidecar is disk-bound and independent per file, so prefetch
+        # payloads on a pool while the serialised Hydrus pushes proceed —
+        # otherwise every push waits on a fresh read first.
+        workers = min(8, max(1, os.cpu_count() or 1))
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            payloads = dict(zip(
+                candidates, ex.map(self.read_sidecar_payload, candidates)))
         for index, media in enumerate(candidates, start=1):
-            tags = {tag for tag in self._read_result_sidecar(
-                self.tag_sidecar_path(media)) if not _is_junk_tag(tag)}
-            urls = {url for url in self._read_result_sidecar(
-                self.url_sidecar_path(media)) if url}
+            if self.cancelled():
+                print("\n⏹️  Sidecar sync cancelled.")
+                break
+            tags, urls = payloads.get(media, (set(), set()))
+            tags = {tag for tag in tags if not _is_junk_tag(tag)}
             if not tags and not urls:
                 continue
             # _hydrus_push reports detailed per-file failures itself. A
@@ -1992,10 +2453,9 @@ class TagIntegrator:
                 st.st_size, st.st_mtime, self._media_kind(canonical_path.name) or "image",
                 ledger=ledger, md5=rec.get("md5"),
                 sha256=ledger.sha256_for(canonical_path.name, st.st_size, st.st_mtime))
+            c_tags, c_urls = self.read_sidecar_payload(canonical_path)
             copied_total += self._propagate_duplicate_results(
-                root, canonical, copies,
-                self._read_result_sidecar(self.tag_sidecar_path(canonical_path)),
-                self._read_result_sidecar(self.url_sidecar_path(canonical_path)),
+                root, canonical, copies, c_tags, c_urls,
                 list(rec.get("sources") or []), canonical.sha256)
             duplicate_groups.pop(canonical_path, None)
         return copied_total
@@ -2137,7 +2597,9 @@ class TagIntegrator:
         Hydrus relationship type ``8`` is the duplicate group; alternates use
         type ``3`` and are intentionally never considered. The API's default
         file domain is combined current local files, so trashed/deleted members
-        are excluded before any tag or URL write is attempted.
+        are excluded before any tag or URL write is attempted. Every member that
+        is successfully tagged is filed onto the "duplicates" result page so the
+        run's duplicate-group tagging is reviewable like any other page.
         """
         if not tags and not urls:
             return False
@@ -2174,7 +2636,10 @@ class TagIntegrator:
                         # members from receiving the authoritative tags.
                         notify(f"⚠️  Hydrus URL association failed for deleted "
                                f"{media.name}: {e}")
-                self._hydrus_add_to_page("updated", target_hash)
+                # Reached only after add_tags succeeded for this member (a
+                # failure raises and aborts the loop), so the page lists exactly
+                # the duplicate-group files that really were tagged.
+                self._hydrus_add_to_page("duplicates", target_hash)
             notify(f"✅ Hydrus: {media.name} was deleted; tagged {len(targets)} "
                    "current duplicate-group file(s).")
             return True
@@ -2185,6 +2650,9 @@ class TagIntegrator:
 
     def _hydrus_add_tags(self, file_hash: str, tags: Set[str]) -> None:
         """POST /add_tags/add_tags — act like a downloader (don't override deletes)."""
+        if not self.hydrus_tag_service_key:
+            raise RuntimeError("Hydrus tag service is unresolved; refusing to "
+                               "push tags to an unknown service.")
         body = {
             "hash": file_hash,
             "service_keys_to_tags": {
@@ -2220,30 +2688,80 @@ class TagIntegrator:
         if self.hydrus_results_page_limit:
             del hashes[:-self.hydrus_results_page_limit]
 
+    def _hydrus_create_hash_page(self, name: str, hashes: List[str]) -> Optional[str]:
+        """Create one unfocused, hash-locked page and fill it in batches.
+
+        The single page-creation path for every review page, so batching and
+        error handling can't differ between them. Raises on failure to create
+        the page; callers decide how to report it. A batch that fails after the
+        page exists is reported and stops the fill, keeping what landed.
+        """
+        first, rest = hashes[:HYDRUS_PAGE_BATCH], hashes[HYDRUS_PAGE_BATCH:]
+        with self._hydrus_lock:
+            r = self._hydrus_post("manage_pages/new_page", {
+                "page_type": 6,
+                "page_name": name,
+                "hashes": first,
+                "system_hash_locked": True,
+                "focus_page": False,
+            }, 30)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+            page_key = r.json()["page_key"]
+            for start in range(0, len(rest), HYDRUS_PAGE_BATCH):
+                r = self._hydrus_post("manage_pages/add_files", {
+                    "page_key": page_key,
+                    "hashes": rest[start:start + HYDRUS_PAGE_BATCH],
+                }, 30)
+                if r.status_code != 200:
+                    notify(f"⚠️  Hydrus stopped filling '{name}' page "
+                           f"(HTTP {r.status_code}).")
+                    break
+        return page_key
+
     def _hydrus_flush_result_pages(self) -> None:
         """Create this run's hash-locked result pages from their rolling lists."""
         if not self.has_hydrus:
             return
-        with self._hydrus_lock:
-            for page in self.hydrus_result_pages.values():
-                if not page["enabled"] or not page["hashes"]:
+        for page in self.hydrus_result_pages.values():
+            if not page["enabled"] or not page["hashes"]:
+                continue
+            name = page["name"]
+            try:
+                self._hydrus_create_hash_page(name, page["hashes"])
+            except Exception as e:
+                page["enabled"] = False
+                notify(f"⚠️  Hydrus '{name}' page unavailable ({e}); "
+                       "continuing without it.")
+
+    @staticmethod
+    def _unchanged_records(
+            ledger_mgr: LedgerManager,
+            match: Callable[[Dict], bool],
+            verified: Set[str],
+            require_ledger_file: bool = False,
+    ) -> Iterator[Tuple[Path, "Ledger", str, os.stat_result, Dict]]:
+        """Walk touched ledgers for records still matching their fingerprint.
+
+        One definition of "an unchanged record of status X": select with *match*,
+        then re-verify against the file's current size/mtime via `status_for`, so
+        an edited or replaced file is never treated as still resolved. Yields
+        ``(path, ledger, name, stat_result, record)``.
+        """
+        for ledger in ledger_mgr.touched():
+            if require_ledger_file and not ledger.path.exists():
+                continue
+            for name, rec in ledger.records.items():
+                if not isinstance(rec, dict) or not match(rec):
                     continue
-                name = page["name"]
-                body = {
-                    "page_type": 6,
-                    "page_name": name,
-                    "hashes": page["hashes"],
-                    "system_hash_locked": True,
-                    "focus_page": False,
-                }
+                path = ledger.dir / name
                 try:
-                    r = self._hydrus_post("manage_pages/new_page", body, 30)
-                    if r.status_code != 200:
-                        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-                except Exception as e:
-                    page["enabled"] = False
-                    notify(f"⚠️  Hydrus '{name}' page unavailable ({e}); "
-                           "continuing without it.")
+                    st = path.stat()
+                except OSError:
+                    continue
+                if ledger.status_for(name, st.st_size, st.st_mtime) not in verified:
+                    continue
+                yield path, ledger, name, st, rec
 
     def _hydrus_populate_already_tagged_page(
             self, ledger_mgr: LedgerManager, limit: Optional[int]) -> int:
@@ -2263,22 +2781,12 @@ class TagIntegrator:
             return 0
 
         entries: List[Tuple[Path, Ledger, str, int, float, Optional[str], float]] = []
-        for ledger in ledger_mgr.touched():
-            for name, rec in ledger.records.items():
-                if not isinstance(rec, dict) or rec.get("status") != "matched":
-                    continue
-                path = ledger.dir / name
-                try:
-                    st = path.stat()
-                except OSError:
-                    continue
-                if ledger.status_for(name, st.st_size, st.st_mtime) != "matched":
-                    continue
-                # Records predating tagged_at sort oldest (fall to the tail).
-                tagged_at = rec.get("tagged_at") or 0.0
-                entries.append((path, ledger, name, st.st_size, st.st_mtime,
-                                ledger.sha256_for(name, st.st_size, st.st_mtime),
-                                tagged_at))
+        for path, ledger, name, st, rec in self._unchanged_records(
+                ledger_mgr, lambda r: r.get("status") == "matched", {"matched"}):
+            # Records predating tagged_at sort oldest (fall to the tail).
+            entries.append((path, ledger, name, st.st_size, st.st_mtime,
+                            ledger.sha256_for(name, st.st_size, st.st_mtime),
+                            rec.get("tagged_at") or 0.0))
 
         if not entries:
             return 0
@@ -2292,6 +2800,9 @@ class TagIntegrator:
         if missing:
             print(f"🏷️  Preparing {self.hydrus_already_tagged_page_name} page "
                   f"({len(entries)} ledger match(es))…")
+            self._emit("status", track="perceptual",
+                       sub=f"{self.hydrus_already_tagged_page_name} page · "
+                           f"hashing {len(missing)} file(s)")
             workers = min(8, max(1, os.cpu_count() or 1))
             with cf.ThreadPoolExecutor(max_workers=workers) as ex:
                 futures = {ex.submit(self._sha256_local, entry[0]): entry
@@ -2316,54 +2827,21 @@ class TagIntegrator:
         if not hashes:
             return 0
 
-        batch_size = 256
-        first = hashes[:batch_size]
-        body = {
-            "page_type": 6,
-            "page_name": self.hydrus_already_tagged_page_name,
-            "hashes": first,
-            "system_hash_locked": True,
-            "focus_page": False,
-        }
-        with self._hydrus_lock:
-            try:
-                r = self._hydrus_post("manage_pages/new_page", body, 30)
-                if r.status_code != 200:
-                    notify(f"⚠️  Hydrus Already Tagged page unavailable "
-                           f"(HTTP {r.status_code}).")
-                    return 0
-                page_key = r.json()["page_key"]
-                for start in range(batch_size, len(hashes), batch_size):
-                    r = self._hydrus_post("manage_pages/add_files", {
-                        "page_key": page_key,
-                        "hashes": hashes[start:start + batch_size],
-                    }, 30)
-                    if r.status_code != 200:
-                        notify(f"⚠️  Hydrus stopped filling Already Tagged page "
-                               f"(HTTP {r.status_code}).")
-                        break
-            except (requests.RequestException, ValueError, KeyError, TypeError) as e:
-                notify(f"⚠️  Hydrus Already Tagged page failed: {e}")
-                return 0
+        try:
+            self._hydrus_create_hash_page(
+                self.hydrus_already_tagged_page_name, hashes)
+        except (requests.RequestException, ValueError, KeyError, TypeError,
+                RuntimeError) as e:
+            notify(f"⚠️  Hydrus Already Tagged page failed: {e}")
+            return 0
         return len(hashes)
 
-    @staticmethod
-    def _has_prior_matched_files(ledger_mgr: LedgerManager) -> bool:
+    @classmethod
+    def _has_prior_matched_files(cls, ledger_mgr: LedgerManager) -> bool:
         """True only when an unchanged, valid matched ledger record exists."""
-        for ledger in ledger_mgr.touched():
-            if not ledger.path.exists():
-                continue
-            for name, rec in ledger.records.items():
-                if not isinstance(rec, dict) or rec.get("status") != "matched":
-                    continue
-                path = ledger.dir / name
-                try:
-                    st = path.stat()
-                except OSError:
-                    continue
-                if ledger.status_for(name, st.st_size, st.st_mtime) == "matched":
-                    return True
-        return False
+        return any(cls._unchanged_records(
+            ledger_mgr, lambda r: r.get("status") == "matched", {"matched"},
+            require_ledger_file=True))
 
     def _hydrus_import_prior_nomatches(self, ledger_mgr: LedgerManager) -> int:
         """Import unchanged old no-match files once when the run toggle is on."""
@@ -2371,22 +2849,20 @@ class TagIntegrator:
                 self.hydrus_import_unmatched):
             return 0
         entries: List[Tuple[Path, Ledger, str, int, float]] = []
-        for ledger in ledger_mgr.touched():
-            for name, rec in ledger.records.items():
-                if (not isinstance(rec, dict) or rec.get("status") != "nomatch" or
-                        rec.get("sha256")):
-                    continue
-                path = ledger.dir / name
-                try:
-                    st = path.stat()
-                except OSError:
-                    continue
-                if ledger.status_for(name, st.st_size, st.st_mtime) == "nomatch":
-                    entries.append((path, ledger, name, st.st_size, st.st_mtime))
+        for path, ledger, name, st, _rec in self._unchanged_records(
+                ledger_mgr,
+                lambda r: r.get("status") == "nomatch" and not r.get("sha256"),
+                {"nomatch"}):
+            entries.append((path, ledger, name, st.st_size, st.st_mtime))
         if entries:
             print(f"📥 Importing {len(entries)} prior no-match file(s) to Hydrus…")
         imported = 0
-        for path, ledger, name, size, mtime in entries:
+        for done, (path, ledger, name, size, mtime) in enumerate(entries, 1):
+            # A per-file Hydrus round trip — without a status event the GUI's
+            # progress cards sit frozen for the whole (possibly long) import.
+            self._emit("status", track="hash",
+                       sub=f"Hydrus import (prior no-match) "
+                           f"{done}/{len(entries)} · {path.name}")
             sha = self.write_unmatched(path)
             if sha:
                 ledger.cache_sha256(name, size, mtime, sha)
@@ -2395,12 +2871,12 @@ class TagIntegrator:
 
     # ── PDF pre-pass ───────────────────────────────────────────────────────────
 
-    def plan_pdf_renders(self, root: Path) -> Tuple[Set[Path], List[Path]]:
-        """Discover PDF page folders and return the PDFs that still need rendering.
+    @staticmethod
+    def _find_pdfs(root: Path) -> List[Path]:
+        """Every non-dotfile PDF under *root*, in natural walk order.
 
-        The caller launches `render_pdf_jobs` in a background worker, while
-        excluding those jobs' output folders from its initial index so a
-        half-written page can never enter the pipeline.
+        One definition, so the render planner and the "PDF rendering disabled"
+        path agree on which PDFs exist (and both skip macOS `._` shadow files).
         """
         pdfs: List[Path] = []
         for dp, dirs, files in os.walk(root):
@@ -2410,6 +2886,20 @@ class TagIntegrator:
                     continue
                 if Path(fn).suffix.lower() in PDF_EXTS:
                     pdfs.append(Path(dp) / fn)
+        return pdfs
+
+    def pdf_page_dirs_for(self, root: Path) -> Set[Path]:
+        """Page-output folder for every PDF under *root* (no rendering)."""
+        return {pdf.parent / pdf.stem for pdf in self._find_pdfs(root)}
+
+    def plan_pdf_renders(self, root: Path) -> Tuple[Set[Path], List[Path]]:
+        """Discover PDF page folders and return the PDFs that still need rendering.
+
+        The caller launches `render_pdf_jobs` in a background worker, while
+        excluding those jobs' output folders from its initial index so a
+        half-written page can never enter the pipeline.
+        """
+        pdfs = self._find_pdfs(root)
         if not pdfs:
             return set(), []
 
@@ -2432,13 +2922,29 @@ class TagIntegrator:
             jobs.append(pdf)
         return page_dirs, jobs
 
-    @staticmethod
-    def _clear_partial_pdf_render(pdf: Path) -> None:
+    def _pdf_sidecar_patterns(self) -> List[str]:
+        """Sidecar name patterns a PDF page render could have written.
+
+        The configured ones (whichever format is active) plus the shipped
+        defaults, so a purge still cleans pages rendered before a format or
+        pattern change.
+        """
+        out = self.settings.output
+        patterns: List[str] = []
+        for pattern in (out.sidecar_json_filename, out.sidecar_tag_filename,
+                        out.sidecar_url_filename, DEFAULT_JSON_PATTERN,
+                        DEFAULT_TAG_PATTERN, DEFAULT_URL_PATTERN):
+            pattern = str(pattern or "").strip()
+            if pattern and pattern not in patterns:
+                patterns.append(pattern)
+        return patterns
+
+    def _clear_partial_pdf_render(self, pdf: Path) -> None:
         """Remove only this PDF's precisely named partial page outputs."""
         out_dir = pdf.parent / pdf.stem
         if not out_dir.is_dir():
             return
-        pattern = _pdf_page_pattern(pdf, include_txt=True)
+        pattern = _pdf_page_pattern(pdf, self._pdf_sidecar_patterns())
         try:
             targets = [p for p in out_dir.iterdir()
                        if p.is_file() and pattern.match(p.name)]
@@ -2455,13 +2961,21 @@ class TagIntegrator:
         """Render planned PDFs serially with adaptive oversized-page fallback."""
         generated: List[Path] = []
         for pdf in pdfs:
+            if self.cancelled():
+                break
             attempt_dpi = dpi
             pdf_generated: List[Path] = []
             while True:
                 try:
+                    out = self.settings.output
                     pdf_generated = convert_pdf(
                         pdf, pdf.parent, attempt_dpi,
-                        write_sidecars=self.write_sidecars)
+                        write_sidecars=(self.write_sidecars and
+                                        self.settings.pdf.pdf_write_sidecars),
+                        sidecar_format=out.sidecar_format,
+                        tag_pattern=out.sidecar_tag_filename,
+                        json_pattern=out.sidecar_json_filename,
+                        should_cancel=self.cancelled)
                     break
                 except Exception as e:
                     oversized = "overly large image" in str(e).lower()
@@ -2570,7 +3084,8 @@ class TagIntegrator:
                     canonical = dir_ledger.records.get(fn, {}).get("duplicate_of", "")
                     if canonical and not (root / canonical).is_file():
                         status = None  # chosen copy disappeared; elect/search again
-                if status in ("matched", "nomatch", "duplicate"):
+                # pending_review stays eligible (unresolved)
+                if status in RESOLVED_LEDGER_STATUSES:
                     seen += 1
                     continue
 
@@ -2606,7 +3121,7 @@ class TagIntegrator:
                 continue
             ledger = ledger_mgr.get(path.parent)
             status = ledger.status_for(path.name, st.st_size, st.st_mtime)
-            if status in ("matched", "nomatch", "duplicate"):
+            if status in RESOLVED_LEDGER_STATUSES:
                 continue
             items.append(FileItem(
                 path=path, relpath=relpath, size=st.st_size, mtime=st.st_mtime,
@@ -2651,12 +3166,20 @@ class TagIntegrator:
                 if self.has_sidecar(p) and not is_pdf_page:
                     continue
                 if dir_ledger.status_for(fn, st.st_size, st.st_mtime) not in (
-                        "matched", "nomatch", "duplicate"):
+                        RESOLVED_LEDGER_STATUSES):
                     complete = False
                     break
 
             if complete and count:
                 dir_ledger.mark_dir_complete(count, total_size)
+
+    # ── Progress events ──────────────────────────────────────────────────────
+
+    def _emit(self, kind: str, **fields: Any) -> None:
+        """Single write path for progress. The engine never touches a display:
+        `TerminalObserver` renders the CLI panel, `QtObserver` feeds the GUI, so
+        each progress point is written exactly once."""
+        self._observer.emit(RunEvent(kind=kind, **fields))
 
     # ── Parallel local hashing ───────────────────────────────────────────────
 
@@ -2667,9 +3190,12 @@ class TagIntegrator:
         if not todo:
             return
         workers = min(8, (os.cpu_count() or 2))
-        if _display is not None:
-            _display.status("perceptual", f"local hash · {len(todo)} PDF page(s)")
-        else:
+        self._emit("status", track="perceptual",
+                   sub=f"local hash · {len(todo)} file(s)")
+        # The panel only owns the screen once a phase has begun; before that
+        # (and headless / in the GUI) the plain lines are the only feedback.
+        panel_live = _display is not None and _display.active()
+        if not panel_live:
             print(f"🔢 Hashing {len(todo)} files (×{workers})…")
         done = 0
         dirty_ledgers: Set[Ledger] = set()
@@ -2689,13 +3215,13 @@ class TagIntegrator:
                     for ledger in dirty_ledgers:
                         ledger.save()
                     dirty_ledgers.clear()
-                if (_display is None and sys.stdout.isatty() and
+                if (not panel_live and sys.stdout.isatty() and
                         (done % 25 == 0 or done == len(todo))):
                     sys.stdout.write(f"\r  hashed {done}/{len(todo)}")
                     sys.stdout.flush()
         for ledger in dirty_ledgers:
             ledger.save()
-        if _display is None and sys.stdout.isatty():
+        if not panel_live and sys.stdout.isatty():
             sys.stdout.write("\n")
 
     def deduplicate(self, root: Path, items: List[FileItem],
@@ -2758,30 +3284,20 @@ class TagIntegrator:
         self._write_duplicates_log(root, ledger_mgr)
         return survivors, duplicate_count, duplicate_groups
 
-    @staticmethod
-    def _write_duplicates_log(root: Path, ledger_mgr: LedgerManager) -> None:
+    @classmethod
+    def _write_duplicates_log(cls, root: Path, ledger_mgr: LedgerManager) -> None:
         groups: Dict[Tuple[str, str], List[str]] = {}
-        for ledger in ledger_mgr.touched():
-            for name, rec in ledger.records.items():
-                if (not isinstance(rec, dict) or
-                        (rec.get("status") != "duplicate" and
-                         not rec.get("duplicate_of"))):
-                    continue
-                path = ledger.dir / name
-                try:
-                    st = path.stat()
-                except OSError:
-                    continue
-                if ledger.status_for(name, st.st_size, st.st_mtime) not in (
-                        "duplicate", "matched"):
-                    continue
-                canonical = rec.get("duplicate_of") or "(canonical unknown)"
-                md5 = rec.get("md5") or "(hash unavailable)"
-                try:
-                    duplicate = str(path.relative_to(root))
-                except ValueError:
-                    duplicate = str(path)
-                groups.setdefault((canonical, md5), []).append(duplicate)
+        for path, _ledger, _name, _st, rec in cls._unchanged_records(
+                ledger_mgr,
+                lambda r: r.get("status") == "duplicate" or r.get("duplicate_of"),
+                {"duplicate", "matched"}):
+            canonical = rec.get("duplicate_of") or "(canonical unknown)"
+            md5 = rec.get("md5") or "(hash unavailable)"
+            try:
+                duplicate = str(path.relative_to(root))
+            except ValueError:
+                duplicate = str(path)
+            groups.setdefault((canonical, md5), []).append(duplicate)
 
         log_path = root / DUPLICATES_FILE
         if not groups:
@@ -2804,9 +3320,7 @@ class TagIntegrator:
             lines += [f"DUPLICATE: {path}" for path in sorted(duplicates, key=_natural_key)]
             lines.append("")
         try:
-            tmp = log_path.with_name(log_path.name + ".tmp")
-            tmp.write_text("\n".join(lines), encoding="utf-8")
-            tmp.replace(log_path)
+            atomic_write_text(log_path, "\n".join(lines))
         except OSError as e:
             notify(f"⚠️  Couldn't write {DUPLICATES_FILE}: {e}")
 
@@ -2823,7 +3337,7 @@ class TagIntegrator:
             return self.gelbooru_lookup_by_md5(md5)
         return set(), set()
 
-    def hash_tier(self, item: FileItem, disp: LiveDisplay, ex: cf.Executor
+    def hash_tier(self, item: FileItem, ex: cf.Executor
                   ) -> Tuple[Set[str], Set[str], List[str]]:
         """Query every enabled booru for this file's MD5 concurrently and merge.
         MD5 identity is byte-exact, so there is zero false-positive risk and the
@@ -2835,9 +3349,17 @@ class TagIntegrator:
         if not item.md5 or not services:
             return tags, urls, []
 
+        def _tick(state: Dict[str, str]) -> None:
+            # Per-site ticker as a status event, so the GUI's sub-status slot
+            # updates too. `extra["hash_state"]` carries the raw per-service
+            # states for frontends that want to render them differently.
+            self._emit("status", track="hash",
+                       sub=LiveDisplay.hash_line(state),
+                       extra={"hash_state": dict(state)})
+
         state = {s: "run" for s in services}
         futs = {ex.submit(self._hash_lookup, s, item.md5): s for s in services}
-        disp.status("hash", disp.hash_line(state))
+        _tick(state)
         for fut in cf.as_completed(futs):
             s = futs[fut]
             try:
@@ -2847,7 +3369,7 @@ class TagIntegrator:
                 # so surface it as ⚠ rather than ✗ (the file may still exist there).
                 notify(f"❌ {s} failed on {item.path.name}: {e}")
                 state[s] = "err"
-                disp.status("hash", disp.hash_line(state))
+                _tick(state)
                 continue
             if t or u:
                 tags |= t
@@ -2856,47 +3378,60 @@ class TagIntegrator:
                 state[s] = "hit"
             else:
                 state[s] = "miss"
-            disp.status("hash", disp.hash_line(state))
+            _tick(state)
 
         sources = [s for s in services if s in hit]   # deterministic order
         return tags, urls, sources
 
     # ── Perceptual tier (Fluffle → SauceNAO, sequential) ─────────────────────
 
-    def perceptual_tier(self, item: FileItem, disp: LiveDisplay
-                        ) -> Tuple[Set[str], Set[str], List[str]]:
+    def perceptual_tier(self, item: FileItem
+                        ) -> Tuple[Set[str], Set[str], List[str], Optional[Dict]]:
+        """Run Fluffle → SauceNAO. Returns (tags, urls, sources, review_raw).
+
+        When *review_raw* is set, the caller should queue a PendingReview and
+        not write final results / nomatch for this file.
+        """
         tags: Set[str] = set()
         urls: Set[str] = set()
         sources: List[str] = []
+        review_raw: Optional[Dict] = None
         fp = item.path
 
-        disp.status("perceptual", "Fluffle…")
-        js = self.fluffle_search(fp)
-        if js:
-            f_tags, f_urls, md5_u, pid = self.find_best_exact_match(js)
-            if f_tags or f_urls:
-                tags |= f_tags
-                urls |= f_urls
-                # A perceptual hit only tells us which post this is — re-query
-                # e621 by ID for the full, properly-namespaced tag set. Prefer
-                # the post ID (reliable) over the MD5-from-URL trick.
-                if self.has_e621 and (pid or md5_u):
-                    disp.status("perceptual", "Fluffle → e621 enrich…")
-                    e_tags, e_urls = (self.e621_lookup_by_id(pid)
-                                      if pid else (set(), set()))
-                    if not e_tags and md5_u:
-                        e_tags, e_urls = self.e621_lookup_by_md5(md5_u)
-                    tags |= e_tags
-                    urls |= e_urls
-                sources.append("fluffle")
+        def _status(msg: str) -> None:
+            self._emit("status", track="perceptual", sub=msg)
 
-        if not (tags or urls) and self.has_saucenao and not self.saucenao_exhausted:
-            disp.status("perceptual", "SauceNAO…")
+        if self.source_active("fluffle"):
+            _status("Fluffle…")
+            js = self.fluffle_search(fp)
+            if js:
+                f_tags, f_urls, md5_u, pid, review_raw = self.find_best_exact_match(js)
+                if f_tags or f_urls:
+                    tags |= f_tags
+                    urls |= f_urls
+                    # A perceptual hit only tells us which post this is — re-query
+                    # e621 by ID for the full, properly-namespaced tag set.
+                    if self.source_active("e621") and (pid or md5_u):
+                        _status("Fluffle → e621 enrich…")
+                        e_tags, e_urls = (self.e621_lookup_by_id(pid)
+                                          if pid else (set(), set()))
+                        if not e_tags and md5_u:
+                            e_tags, e_urls = self.e621_lookup_by_md5(md5_u)
+                        tags |= e_tags
+                        urls |= e_urls
+                    sources.append("fluffle")
+                    review_raw = None  # auto-accepted; no review needed
+
+        # SauceNAO is the slowest stage (6s pace, longer after a quota backoff),
+        # so don't start it for a file the user has already cancelled out of.
+        if (not (tags or urls) and review_raw is None
+                and not self.cancelled() and self.source_active("saucenao")):
+            _status("SauceNAO…")
             service, rid, s_tags, s_urls = self.saucenao_search(fp)
             if service and rid:
                 # High-confidence booru match → pull the authoritative,
                 # properly-namespaced tag set instead of SauceNAO's own.
-                disp.status("perceptual", f"SauceNAO → {service} enrich…")
+                _status(f"SauceNAO → {service} enrich…")
                 a_tags, a_urls = self._authoritative_lookup(service, rid)
                 if a_tags or a_urls:
                     tags |= a_tags
@@ -2913,37 +3448,237 @@ class TagIntegrator:
                 urls |= s_urls
                 sources.append("saucenao")
 
-        return tags, urls, sources
+        return tags, urls, sources, review_raw
+
+    def _queue_pending_review(self, item: FileItem, root: Path,
+                              review_raw: Dict) -> PendingReview:
+        """Persist a pending_review ledger status + ReviewQueue entry."""
+        platform = review_raw.get("platform", "") or ""
+        loc = review_raw.get("location", "") or ""
+        match_class = review_raw.get("match", "") or ""
+        tags, urls = self._fluffle_result_payload(review_raw)
+        pending = PendingReview.create(
+            path=str(item.path.resolve()),
+            relpath=item.relpath,
+            size=item.size,
+            mtime=item.mtime,
+            md5=item.md5,
+            source="fluffle",
+            match_class=match_class,
+            platform=platform,
+            location=loc,
+            post_id=self._post_id_from_url(loc),
+            md5_from_url=self._md5_from_url(loc),
+            fluffle_tags=sorted(tags),
+            fluffle_urls=sorted(urls),
+        )
+        if self._review_queue is not None:
+            self._review_queue.add(pending)
+        item.ledger.record(item.path.name, item.size, item.mtime, item.md5,
+                           "pending_review", ["pending_review"])
+        return pending
+
+    def resolve_pending_review(self, pending: PendingReview, approve: bool,
+                               root: Optional[Path] = None) -> bool:
+        """Approve (enrich + write) or reject (nomatch) a pending review item."""
+        path = Path(pending.path)
+        if not path.is_file():
+            return False
+        try:
+            st = path.stat()
+        except OSError:
+            return False
+        ledger = Ledger(path.parent)
+        ledger.load()
+        if approve:
+            tags: Set[str] = set(pending.fluffle_tags or [])
+            urls: Set[str] = set(pending.fluffle_urls or [])
+            sources = ["fluffle"]
+            pid = pending.post_id
+            md5_u = pending.md5_from_url
+            if self.source_active("e621") and (pid or md5_u):
+                e_tags, e_urls = (self.e621_lookup_by_id(pid)
+                                  if pid else (set(), set()))
+                if not e_tags and md5_u:
+                    e_tags, e_urls = self.e621_lookup_by_md5(md5_u)
+                tags |= e_tags
+                urls |= e_urls
+            # Only a genuine rendered PDF page gets comic:/page: — an ordinary
+            # PNG would otherwise pick up comic:<its folder name>.
+            if _is_pdf_page_render(path):
+                tags |= self._pdf_page_base_tags(path)
+            sha = self.write_results(path, tags, urls)
+            ledger.record(path.name, st.st_size, st.st_mtime, pending.md5,
+                          "matched", sources, sha256=sha)
+        else:
+            sha = self.write_unmatched(path)
+            ledger.record(path.name, st.st_size, st.st_mtime, pending.md5,
+                          "nomatch", [], sha256=sha)
+        ledger.save()
+        if self._review_queue is not None:
+            self._review_queue.remove(pending.id)
+        elif root is not None:
+            rq = ReviewQueue(root)
+            rq.load()
+            rq.remove(pending.id)
+        return True
 
     # ── Orchestration ────────────────────────────────────────────────────────
 
-    def run(self, root: Path) -> None:
-        global _display
+    def discover(self, root: Path, ledger_mgr: Optional[LedgerManager] = None
+                 ) -> Dict:
+        """Read-only discovery: index + PDF plan. No network mutations.
 
-        # A launcher session may scan multiple folders. Result pages are per
-        # scan, so never let a previous folder's rolling hashes leak into the
-        # next folder's review pages.
-        for page in self.hydrus_result_pages.values():
-            page["hashes"].clear()
-        ledger_mgr = LedgerManager()
-        pdf_page_dirs, pdf_jobs = self.plan_pdf_renders(root)
-        pdf_executor: Optional[cf.ThreadPoolExecutor] = None
-        pdf_future = None
-        pdf_completed: "queue.Queue" = queue.Queue()
+        Returns a dict with keys: items, candidate_dirs, pdf_page_dirs,
+        pdf_jobs, ledger_mgr, media counts via index side-effects printed.
+        """
+        root = Path(root).resolve()
+        ledger_mgr = ledger_mgr or LedgerManager()
+        if self.settings.pdf.pdf_enabled:
+            pdf_page_dirs, pdf_jobs = self.plan_pdf_renders(root)
+        else:
+            # Still collect existing page dirs so perceptual_only flags work
+            pdf_page_dirs, pdf_jobs = self.pdf_page_dirs_for(root), []
         pending_pdf_dirs = {pdf.parent / pdf.stem for pdf in pdf_jobs}
         items, candidate_dirs = self.index(
             root, ledger_mgr, pdf_page_dirs, excluded_dirs=pending_pdf_dirs)
+        return {
+            "root": root,
+            "items": items,
+            "candidate_dirs": candidate_dirs,
+            "pdf_page_dirs": pdf_page_dirs,
+            "pdf_jobs": pdf_jobs,
+            "ledger_mgr": ledger_mgr,
+        }
 
-        # The scan above is read-only. Ask the one folder-specific question
-        # only after showing what needs work, then start rendering alongside
-        # the network pipeline.
-        if pdf_jobs:
-            pdf_dpi = prompt_for_pdf_dpi(len(pdf_jobs))
-            print(f"📄 Rendering {len(pdf_jobs)} PDF(s) at {pdf_dpi} DPI in background…")
+    def run(self, root: Path,
+            options: Optional[RunOptions] = None,
+            observer: Optional[RunObserver] = None,
+            cancel_event: Optional[threading.Event] = None,
+            use_terminal_display: bool = True,
+            pdf_dpi: Optional[int] = None) -> ScanSummary:
+        """Full pipeline. Returns ScanSummary. Cooperative cancellation via cancel_event."""
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError("A scan is already running in this process.")
+        try:
+            return self._run_impl(
+                root, options, observer, cancel_event,
+                use_terminal_display, pdf_dpi)
+        finally:
+            self._run_lock.release()
+
+    def _run_impl(self, root: Path,
+                  options: Optional[RunOptions],
+                  observer: Optional[RunObserver],
+                  cancel_event: Optional[threading.Event],
+                  use_terminal_display: bool,
+                  pdf_dpi: Optional[int]) -> ScanSummary:
+        """Install this run's single observer, then run the pipeline.
+
+        Terminal mode wraps a `LiveDisplay` in a `TerminalObserver`; the GUI
+        passes its own. Either way the engine below only ever emits events, so
+        every progress point is rendered exactly once.
+        """
+        global _display
+
+        disp = LiveDisplay() if use_terminal_display else None
+        prev_observer, prev_display = self._observer, _display
+        self._observer = observer or TerminalObserver(disp)
+        prev_active = set_active_observer(self._observer)
+        self._display_detached = False
+        if disp is not None:
+            _display = disp
+        try:
+            return self._run_pipeline(
+                root, options, cancel_event, use_terminal_display, pdf_dpi)
+        finally:
+            self._detach_display()
+            _display = prev_display
+            set_active_observer(prev_active)
+            self._observer = prev_observer
+
+    def _detach_display(self) -> None:
+        """Tear the live panel down and stop routing messages into it.
+
+        Called from the pipeline's own `finally` (before the closing ledger /
+        fingerprint work, which still calls `notify()`) and again by `_run_impl`
+        as a backstop; the second call is a no-op."""
+        global _display
+        if self._display_detached:
+            return
+        self._display_detached = True
+        self._emit("close_display")
+        _display = None
+        if isinstance(self._observer, TerminalObserver) and self._observer.display:
+            # The panel is gone; later warnings must print, not redraw it.
+            self._observer = TerminalObserver(None)
+            set_active_observer(self._observer)
+
+    def _run_pipeline(self, root: Path,
+                      options: Optional[RunOptions],
+                      cancel_event: Optional[threading.Event],
+                      use_terminal_display: bool,
+                      pdf_dpi: Optional[int]) -> ScanSummary:
+        if options and options.settings_override is not None:
+            self.apply_settings(options.settings_override)
+        self.cancel_event = cancel_event or threading.Event()
+        self.cancel_event.clear()
+        self._bind_cancel_to_pacers()
+        summary = ScanSummary(
+            source_hits={k: 0 for k in
+                         ("e621", "inkbunny", "danbooru",
+                          "gelbooru", "fluffle", "saucenao")})
+
+        # Per-scan result pages
+        for page in self.hydrus_result_pages.values():
+            page["hashes"].clear()
+
+        # Apply run options onto instance
+        if options is not None:
+            self.hydrus_import_unmatched = options.import_unmatched
+            self.hydrus_results_page_limit = options.result_page_limit
+            if options.build_already_tagged_page:
+                self.hydrus_already_tagged_page_limit = options.result_page_limit
+            else:
+                self.hydrus_already_tagged_page_limit = None
+            if options.sync_sidecars and self.has_hydrus:
+                self.sync_sidecars_to_hydrus(Path(root))
+
+        discovery = self.discover(root)
+        root = discovery["root"]
+        items: List[FileItem] = discovery["items"]
+        candidate_dirs: Set[Path] = discovery["candidate_dirs"]
+        pdf_page_dirs: Set[Path] = discovery["pdf_page_dirs"]
+        pdf_jobs: List[Path] = discovery["pdf_jobs"]
+        ledger_mgr: LedgerManager = discovery["ledger_mgr"]
+
+        self._review_queue = ReviewQueue(root)
+        self._review_queue.load()
+
+        pdf_executor: Optional[cf.ThreadPoolExecutor] = None
+        pdf_future = None
+        pdf_completed: "queue.Queue" = queue.Queue()
+
+        # Resolve PDF DPI from options / settings / prompt — only when
+        # rendering is enabled and discover actually queued jobs.
+        if pdf_jobs and self.settings.pdf.pdf_enabled:
+            if pdf_dpi is not None:
+                chosen_dpi = pdf_dpi
+            elif options is not None and options.pdf_dpi is not None:
+                chosen_dpi = options.pdf_dpi
+            elif use_terminal_display and sys.stdin.isatty():
+                chosen_dpi = prompt_for_pdf_dpi(len(pdf_jobs))
+            else:
+                chosen_dpi = self.settings.pdf.pdf_dpi or PDF_DPI
+            print(f"📄 Rendering {len(pdf_jobs)} PDF(s) at {chosen_dpi} DPI in background…")
             pdf_executor = cf.ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="pdf-render")
             pdf_future = pdf_executor.submit(
-                self.render_pdf_jobs, pdf_jobs, pdf_dpi, pdf_completed)
+                self.render_pdf_jobs, pdf_jobs, chosen_dpi, pdf_completed)
+        elif pdf_jobs and not self.settings.pdf.pdf_enabled:
+            # Defensive: discover should have returned [] when disabled.
+            pdf_jobs = []
+
         prior_imported = self._hydrus_import_prior_nomatches(ledger_mgr)
         if prior_imported:
             ledger_mgr.save_all()
@@ -2962,10 +3697,17 @@ class TagIntegrator:
             print("✅ Nothing to do — everything is tagged or already checked.")
             self.finalize_dir_fingerprints(candidate_dirs, pdf_page_dirs, ledger_mgr)
             ledger_mgr.save_all()
-            return
+            summary.pending_review = len(self._review_queue) if self._review_queue else 0
+            return summary
+        if self.cancelled():
+            summary.cancelled = True
+            ledger_mgr.save_all()
+            return summary
+
         self.hash_all(items)
         items, duplicates, duplicate_groups = self.deduplicate(
             root, items, ledger_mgr)
+        summary.duplicates = duplicates
         prior_duplicates_tagged = self._propagate_prior_duplicate_groups(
             root, duplicate_groups, ledger_mgr)
         if prior_duplicates_tagged:
@@ -2983,15 +3725,14 @@ class TagIntegrator:
             print("✅ Nothing unique left to search.")
             self.finalize_dir_fingerprints(candidate_dirs, pdf_page_dirs, ledger_mgr)
             ledger_mgr.save_all()
-            return
+            return summary
 
         print("🔄 Hash tier: e621 · InkBunny · Danbooru · Gelbooru (concurrent, merged)"
               "  →  Perceptual: Fluffle → SauceNAO")
         print(f"   {LiveDisplay._LEGEND}\n")
 
-        counts = {k: 0 for k in ("e621", "inkbunny", "danbooru",
-                                 "gelbooru", "fluffle", "saucenao")}
-        tagged = nomatch = 0
+        counts = summary.source_hits
+        tagged = nomatch = pending_review_count = 0
         counts_lock = threading.Lock()
         duplicate_lock = threading.Lock()
         duplicates_tagged = prior_duplicates_tagged
@@ -3001,12 +3742,17 @@ class TagIntegrator:
             with counts_lock:
                 tagged += 1
                 for s in sources:
-                    counts[s] += 1
+                    counts[s] = counts.get(s, 0) + 1
 
         def _bump_miss() -> None:
             nonlocal nomatch
             with counts_lock:
                 nomatch += 1
+
+        def _bump_pending() -> None:
+            nonlocal pending_review_count
+            with counts_lock:
+                pending_review_count += 1
 
         def _propagate_duplicates(item: FileItem, tags: Set[str], urls: Set[str],
                                   sources: List[str], sha256: Optional[str]) -> None:
@@ -3030,10 +3776,9 @@ class TagIntegrator:
                     return
                 save_counter = 0
             ledger_mgr.save_all()
+            if self._review_queue is not None:
+                self._review_queue.save()
 
-        # PDF pages bypass the hash tier and go straight into the perceptual
-        # queue, seeded before either tier starts so they're worked on as
-        # soon as the perceptual worker is free.
         hash_items = [it for it in items if not it.perceptual_only]
         perceptual_q: "queue.Queue" = queue.Queue()
         seed_count = 0
@@ -3042,9 +3787,8 @@ class TagIntegrator:
                 perceptual_q.put(it)
                 seed_count += 1
 
-        disp = LiveDisplay()
-        _display = disp
-        hash_workers = max(1, len(self.enabled_hash_services()))
+        hw = self.settings.performance.hash_worker_count
+        hash_workers = hw if hw > 0 else max(1, len(self.enabled_hash_services()) or 1)
 
         def perceptual_worker() -> None:
             idx = 0
@@ -3053,12 +3797,23 @@ class TagIntegrator:
                 if item is _PERCEPTUAL_DONE:
                     perceptual_q.task_done()
                     return
+                if self.cancelled():
+                    perceptual_q.task_done()
+                    # Drain remaining without processing
+                    continue
                 idx += 1
                 try:
-                    disp.start_file("perceptual", idx, item.path.name,
-                                     f"{perceptual_q.qsize()} queued")
-                    tags, urls, sources = self.perceptual_tier(item, disp)
-                    if tags or urls:
+                    self._emit("start_file", track="perceptual", index=idx,
+                               current=item.path.name,
+                               nxt=f"{perceptual_q.qsize()} queued")
+                    tags, urls, sources, review_raw = self.perceptual_tier(item)
+                    if review_raw is not None and not (tags or urls):
+                        self._queue_pending_review(item, root, review_raw)
+                        _bump_pending()
+                        self._emit("finish_file", track="perceptual",
+                                   result="⏳ needs review",
+                                   extra={"pending_review": True})
+                    elif tags or urls:
                         if item.perceptual_only:
                             tags = set(tags) | self._pdf_page_base_tags(item.path)
                         sha = self.write_results(
@@ -3068,14 +3823,16 @@ class TagIntegrator:
                                             sha256=sha)
                         _propagate_duplicates(item, tags, urls, sources, sha)
                         _bump_hit(sources)
-                        disp.finish_file(
-                            "perceptual", f"{'+'.join(sources)}  ({len(tags)} tags)")
+                        result = f"{'+'.join(sources)}  ({len(tags)} tags)"
+                        self._emit("finish_file", track="perceptual",
+                                   result=result)
                     else:
                         sha = self.write_unmatched(item.path, item.sha256)
                         item.ledger.record(item.path.name, item.size, item.mtime,
                                             item.md5, "nomatch", [], sha256=sha)
                         _bump_miss()
-                        disp.finish_file("perceptual", "— no match")
+                        self._emit("finish_file", track="perceptual",
+                                   result="— no match")
                     _maybe_save_ledgers()
                 except Exception as e:
                     notify(f"❌ perceptual worker error on {item.path.name}: {e}")
@@ -3086,28 +3843,28 @@ class TagIntegrator:
             hash_interval = max(
                 (self.pace[s].interval for s in self.enabled_hash_services()),
                 default=0.0)
-            disp.begin_phase(
-                "hash", "Phase · hash lookups (e621·InkBunny·Danbooru·Gelbooru)",
-                len(hash_items), interval=hash_interval)
-            disp.begin_phase(
-                "perceptual", "Phase · perceptual (Fluffle → SauceNAO)",
-                seed_count, growing=True)
+            self._emit(
+                "begin_phase", track="hash",
+                phase="Phase · hash lookups (e621·InkBunny·Danbooru·Gelbooru)",
+                total=len(hash_items), extra={"interval": hash_interval})
+            self._emit(
+                "begin_phase", track="perceptual",
+                phase="Phase · perceptual (Fluffle → SauceNAO)",
+                total=seed_count, extra={"growing": True})
 
             perc_thread = threading.Thread(
                 target=perceptual_worker, name="perceptual-worker", daemon=True)
             perc_thread.start()
 
-            # ── Hash tier over every hashable candidate (videos first). Images
-            # that miss are handed straight to the perceptual worker, which
-            # runs concurrently on its own thread rather than waiting for the
-            # whole hash tier to finish — the two tiers hit disjoint services,
-            # each still individually rate-paced by its own Pacer.
             with cf.ThreadPoolExecutor(max_workers=hash_workers) as ex:
                 for i, item in enumerate(hash_items):
+                    if self.cancelled():
+                        break
                     nxt = hash_items[i + 1].path.name if i + 1 < len(hash_items) else None
-                    disp.start_file("hash", i + 1, item.path.name, nxt)
+                    self._emit("start_file", track="hash", index=i + 1,
+                               current=item.path.name, nxt=nxt or "")
 
-                    tags, urls, sources = self.hash_tier(item, disp, ex)
+                    tags, urls, sources = self.hash_tier(item, ex)
                     if tags or urls:
                         sha = self.write_results(
                             item.path, tags, urls, item.sha256)
@@ -3116,37 +3873,40 @@ class TagIntegrator:
                                             sha256=sha)
                         _propagate_duplicates(item, tags, urls, sources, sha)
                         _bump_hit(sources)
-                        disp.finish_file("hash", f"{'+'.join(sources)}  ({len(tags)} tags)")
+                        result = f"{'+'.join(sources)}  ({len(tags)} tags)"
+                        self._emit("finish_file", track="hash", result=result)
                     elif item.kind == "image":
                         perceptual_q.put(item)
-                        disp.grow("perceptual")
-                        disp.finish_file("hash", "no hash match → perceptual")
+                        # One grow per queued file — the observer is the only
+                        # write path, so the perceptual total can't double-count.
+                        self._emit("grow", track="perceptual")
+                        self._emit("finish_file", track="hash",
+                                   result="no hash match → perceptual")
                     else:                                  # video: hash-only
                         sha = self.write_unmatched(item.path, item.sha256)
                         item.ledger.record(item.path.name, item.size, item.mtime,
                                             item.md5, "nomatch", [], sha256=sha)
                         _bump_miss()
-                        disp.finish_file("hash", "— no match")
+                        self._emit("finish_file", track="hash",
+                                   result="— no match")
                     _maybe_save_ledgers()
 
-            # Let the ordinary perceptual queue settle before reading ledgers
-            # for PDF deduplication; the worker remains alive for new pages.
             perceptual_q.join()
 
-            # PDF rendering has overlapped the ordinary hash/perceptual work
-            # above. Once complete, only fully-written pages are indexed,
-            # locally hashed/deduplicated, and appended to the live perceptual
-            # queue. They never enter the booru hash tier.
-            if pdf_future is not None:
+            if pdf_future is not None and not self.cancelled():
                 pdfs_received = 0
                 while not pdf_future.done() or not pdf_completed.empty():
+                    if self.cancelled():
+                        break
                     try:
                         pdf_name, rendered_paths, effective_dpi = pdf_completed.get(
                             timeout=0.25)
                     except queue.Empty:
-                        disp.status(
-                            "perceptual",
-                            f"waiting for PDF render · {pdfs_received}/{len(pdf_jobs)} complete")
+                        # Real event, not just a panel poke: without it the GUI's
+                        # perceptual card looks frozen for the whole PDF wait.
+                        self._emit("status", track="perceptual",
+                                   sub=f"waiting for PDF render · "
+                                       f"{pdfs_received}/{len(pdf_jobs)} complete")
                         continue
                     pdfs_received += 1
                     pdf_items = self.index_rendered_pdf_pages(
@@ -3162,42 +3922,56 @@ class TagIntegrator:
                         ledger_mgr.save_all()
                     if pdf_duplicates:
                         duplicates += pdf_duplicates
+                        summary.duplicates = duplicates
                         notify(f"♊ {pdf_duplicates} duplicate PDF page(s) skipped; "
                                f"see {DUPLICATES_FILE}.")
                     for item in pdf_items:
                         candidate_dirs.add(item.path.parent)
                         perceptual_q.put(item)
-                        disp.grow("perceptual")
+                        self._emit("grow", track="perceptual")
                     items.extend(pdf_items)
                     pdf_completed.task_done()
-                    disp.status(
-                        "perceptual",
-                        f"PDF {pdfs_received}/{len(pdf_jobs)} · {effective_dpi} DPI · "
-                        f"{pdf_name}")
-                    # Finish this PDF's page searches before the next ledger
-                    # snapshot/dedup pass; later PDFs keep rendering meanwhile.
+                    self._emit("status", track="perceptual",
+                               sub=f"PDF {pdfs_received}/{len(pdf_jobs)} · "
+                                   f"{effective_dpi} DPI · {pdf_name}")
                     perceptual_q.join()
                 try:
                     pdf_future.result()
                 except Exception as e:
                     notify(f"⚠️  Background PDF rendering failed: {e}")
 
-            disp.freeze_total("perceptual")
+            self._emit("freeze_total", track="perceptual")
             perceptual_q.put(_PERCEPTUAL_DONE)
             perc_thread.join()
         finally:
             if pdf_executor is not None:
                 pdf_executor.shutdown(wait=True)
             self._hydrus_flush_result_pages()
-            disp.close()
-            _display = None
+            # Close the panel before the closing bookkeeping below, whose
+            # notify()s must print rather than redraw a torn-down panel.
+            self._detach_display()
             self.finalize_dir_fingerprints(candidate_dirs, pdf_page_dirs, ledger_mgr)
             self._write_duplicates_log(root, ledger_mgr)
             ledger_mgr.save_all()
+            if self._review_queue is not None:
+                self._review_queue.save()
+
+        summary.tagged = tagged
+        summary.unmatched = nomatch
+        summary.pending_review = pending_review_count
+        if self._review_queue is not None:
+            summary.pending_review = max(
+                summary.pending_review, len(self._review_queue))
+        summary.duplicates = duplicates
+        summary.total_items = len(items)
+        summary.cancelled = self.cancelled()
+        if duplicates_tagged:
+            summary.duplicates = max(summary.duplicates, duplicates_tagged)
 
         # ── Summary ──────────────────────────────────────────────────────────
         total = len(items)
-        print("\n🏁 DONE")
+        label = "CANCELLED" if summary.cancelled else "DONE"
+        print(f"\n🏁 {label}")
         print(f"Total tagged:        {tagged}/{total}")
         print(f"  ├─ e621 hits:      {counts['e621']}")
         print(f"  ├─ InkBunny hits:  {counts['inkbunny']}")
@@ -3206,12 +3980,15 @@ class TagIntegrator:
         print(f"  ├─ Fluffle hits:   {counts['fluffle']}")
         print(f"  ├─ SauceNAO hits:  {counts['saucenao']}")
         print(f"  └─ No match:       {nomatch}")
+        if pending_review_count:
+            print(f"  └─ Needs review:   {pending_review_count}")
         if self.saucenao_exhausted:
             print("⚠️  SauceNAO was skipped after its daily quota was exhausted.")
         if duplicates_tagged:
             print(f"♊ Duplicate copies tagged: {duplicates_tagged}")
         print(f"🗒️  Session ledgers updated across the scanned tree "
               f"({LEDGER_FILE} per folder)")
+        return summary
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
@@ -3237,18 +4014,93 @@ QUIT_WORDS = {"q", "quit", "exit"}
 NUKE_COMMAND = "NUKE!"
 
 
-def _is_furtag_sidecar(path: Path) -> bool:
-    """True only for FurTag's media-extension-preserving sidecar names."""
+def _sidecar_name_regex(pattern: str, name_re: str, ext_re: str) -> str:
+    """Translate a ``{name}``/``{ext}`` sidecar pattern into a regex body.
+
+    Placeholder-order agnostic (``{name}.tags{ext}`` works), so purge/detection
+    logic always derives its names from the same patterns the writer used.
+    """
+    parts: List[str] = []
+    for chunk in re.split(r"(\{name\}|\{ext\})", pattern):
+        if chunk == "{name}":
+            parts.append(name_re)
+        elif chunk == "{ext}":
+            parts.append(ext_re)
+        elif chunk:
+            parts.append(re.escape(chunk))
+    return "".join(parts)
+
+
+def _json_sidecar_patterns(settings: Optional[Settings] = None) -> List[str]:
+    """JSON sidecar name patterns FurTag could have written under *settings*."""
+    patterns = [DEFAULT_JSON_PATTERN]
+    if settings is None:
+        try:
+            settings = SettingsStore().load()
+        except Exception:
+            settings = None
+    if settings is not None:
+        configured = str(settings.output.sidecar_json_filename or "").strip()
+        if configured and configured not in patterns:
+            patterns.append(configured)
+    return patterns
+
+
+def _looks_like_furtag_json_sidecar(path: Path) -> bool:
+    """True only for a JSON object of exactly FurTag's own sidecar shape.
+
+    ``<media>.<ext>.json`` is also gallery-dl's default metadata filename, so a
+    name match alone must never mark a file deletable — the content has to be
+    FurTag's ``{"tags": [...], "urls": [...]}`` payload and nothing else.
+    """
+    try:
+        if path.stat().st_size > 4 * 1024 * 1024:
+            return False                        # far larger than any FurTag sidecar
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(data, dict) or not data:
+        return False
+    if set(data.keys()) - {"tags", "urls"}:
+        return False                            # extra keys → someone else's file
+    return all(isinstance(v, list) for v in data.values())
+
+
+def _is_furtag_sidecar(path: Path, json_patterns: Optional[List[str]] = None
+                       ) -> bool:
+    """True only for FurTag's media-extension-preserving sidecar names.
+
+    ``.txt`` / ``.urls.txt`` names are FurTag-specific enough to accept by name.
+    A ``.json`` name is accepted only when it matches a configured JSON sidecar
+    pattern *and* the contents look like FurTag's own payload.
+    """
     name = path.name.lower()
     media_exts = IMG_EXTS | VIDEO_EXTS
-    return any(name.endswith(ext + ".txt") or
-               name.endswith(ext + ".urls.txt") for ext in media_exts)
+    if any(name.endswith(ext + ".txt") or name.endswith(ext + ".urls.txt")
+           for ext in media_exts):
+        return True
+    if not name.endswith(".json"):
+        return False
+    if json_patterns is None:
+        json_patterns = _json_sidecar_patterns()
+    ext_re = "(?:%s)" % "|".join(sorted(
+        (re.escape(e) for e in media_exts), key=len, reverse=True))
+    for pattern in json_patterns:
+        try:
+            body = _sidecar_name_regex(pattern, r".+", ext_re)
+            if re.fullmatch(body, path.name, re.I):
+                return _looks_like_furtag_json_sidecar(path)
+        except re.error:
+            continue
+    return False
 
 
-def _nuke_candidates(root: Path) -> Tuple[List[Path], List[Path]]:
+def _nuke_candidates(root: Path, settings: Optional[Settings] = None
+                     ) -> Tuple[List[Path], List[Path]]:
     """Find generated ledgers and sidecars below root without following links."""
     ledgers: List[Path] = []
     sidecars: List[Path] = []
+    json_patterns = _json_sidecar_patterns(settings)
     ledger_names = {LEDGER_FILE, LEDGER_FILE + ".tmp", DUPLICATES_FILE,
                     DUPLICATES_FILE + ".tmp"}
     for dp, dirs, files in os.walk(root, followlinks=False):
@@ -3257,15 +4109,49 @@ def _nuke_candidates(root: Path) -> Tuple[List[Path], List[Path]]:
             path = Path(dp) / fn
             if fn in ledger_names:
                 ledgers.append(path)
-            elif _is_furtag_sidecar(path):
+            elif _is_furtag_sidecar(path, json_patterns):
                 sidecars.append(path)
     return ledgers, sidecars
 
 
-def _pdf_page_pattern(pdf: Path, include_txt: bool = False) -> "re.Pattern":
-    """Regex matching this PDF's rendered page files (optionally their sidecars)."""
-    suffix = r"(?:\.txt)?" if include_txt else ""
-    return re.compile(rf"^{re.escape(pdf.stem)} PAGE\d+\.PNG{suffix}$", re.I)
+def _pdf_page_pattern(pdf: Path,
+                      sidecar_patterns: Optional[List[str]] = None
+                      ) -> "re.Pattern":
+    """Regex matching this PDF's rendered page files (optionally their sidecars).
+
+    When *sidecar_patterns* is given, the sidecar alternatives are derived from
+    the very patterns ``convert_pdf`` writes with, so a txt/json/custom base
+    sidecar is always recognized (and purged) rather than only ``.txt``.
+    """
+    page_re = rf"{re.escape(pdf.stem)} PAGE\d+"
+    alts = [page_re + r"\.PNG"]
+    for pattern in sidecar_patterns or []:
+        if not pattern:
+            continue
+        try:
+            alts.append(_sidecar_name_regex(pattern, page_re, r"\.PNG"))
+        except re.error:
+            continue
+    return re.compile("^(?:%s)$" % "|".join(alts), re.I)
+
+
+def _is_pdf_page_render(path: Path) -> bool:
+    """True when *path* is a page PNG this tool rendered from a sibling PDF.
+
+    A rendered page always lives at ``<dir>/<stem>/<stem> PAGEn.PNG`` beside
+    ``<dir>/<stem>.pdf`` — the same test ``_pdf_render_candidates()`` uses to
+    build ``pdf_page_dirs``. Anything else is an ordinary PNG and must not be
+    given ``comic:``/``page:`` tags from its parent folder name.
+    """
+    if path.suffix.lower() != ".png":
+        return False
+    out_dir = path.parent
+    for ext in PDF_EXTS:
+        for candidate in (out_dir.name + ext, out_dir.name + ext.upper()):
+            pdf = out_dir.parent / candidate
+            if pdf.is_file() and _pdf_page_pattern(pdf).match(path.name):
+                return True
+    return False
 
 
 def _pdf_render_candidates(root: Path) -> Tuple[List[Path], Set[Path]]:
@@ -3294,7 +4180,43 @@ def _pdf_render_candidates(root: Path) -> Tuple[List[Path], Set[Path]]:
     return pages, page_dirs
 
 
-def _prompt_for_nuke() -> Optional[Path]:
+def is_filesystem_root(path: Path) -> bool:
+    """True for a filesystem root, which is never a legal reset target."""
+    resolved = path.expanduser().resolve()
+    return resolved == Path(resolved.anchor)
+
+
+def perform_nuke(root: Path, include_pdf_pages: bool = False,
+                 settings: Optional[Settings] = None
+                 ) -> Tuple[int, List[Tuple[Path, OSError]]]:
+    """Delete FurTag-generated state under *root*.
+
+    The single implementation behind both the CLI ``NUKE!`` prompt and the GUI
+    Reset dialog, so the two can't drift. Returns ``(removed, failures)``;
+    callers own how failures are reported.
+    """
+    ledgers, sidecars = _nuke_candidates(root, settings)
+    pdf_pages, pdf_page_dirs = _pdf_render_candidates(root)
+
+    removed = 0
+    failures: List[Tuple[Path, OSError]] = []
+    for path in ledgers + sidecars + (pdf_pages if include_pdf_pages else []):
+        try:
+            path.unlink()
+            removed += 1
+        except OSError as e:
+            failures.append((path, e))
+    if include_pdf_pages:
+        # Deepest-first, so nested page folders empty out before their parents.
+        for out_dir in sorted(pdf_page_dirs, key=lambda p: len(p.parts), reverse=True):
+            try:
+                out_dir.rmdir()  # succeeds only when no unrelated content remains
+            except OSError:
+                pass
+    return removed, failures
+
+
+def _prompt_for_nuke(settings: Optional[Settings] = None) -> Optional[Path]:
     """Confirm and remove FurTag-generated state, returning the folder to scan.
 
     Blank input and cancellation return to the normal folder prompt. The
@@ -3314,11 +4236,11 @@ def _prompt_for_nuke() -> Optional[Path]:
     if not root.is_dir():
         print(f"‼️  '{root}' is not a valid directory. Nuke cancelled.")
         return None
-    if root == Path(root.anchor):
+    if is_filesystem_root(root):
         print("⛔ Refusing to nuke an entire filesystem root.")
         return None
 
-    ledgers, sidecars = _nuke_candidates(root)
+    ledgers, sidecars = _nuke_candidates(root, settings)
     pdf_pages, pdf_page_dirs = _pdf_render_candidates(root)
     print(f"\nTarget:   {root}")
     print(f"Ledgers/reports: {len(ledgers)}")
@@ -3342,25 +4264,14 @@ def _prompt_for_nuke() -> Optional[Path]:
             answer = ""
         reexport_pdfs = answer == "y"
 
-    removed = 0
-    failed = 0
-    targets = ledgers + sidecars + (pdf_pages if reexport_pdfs else [])
-    for path in targets:
-        try:
-            path.unlink()
-            removed += 1
-        except OSError as e:
-            failed += 1
-            print(f"⚠️  Could not delete {path}: {e}")
-    if reexport_pdfs:
-        for out_dir in sorted(pdf_page_dirs, key=lambda p: len(p.parts), reverse=True):
-            try:
-                out_dir.rmdir()  # succeeds only when no unrelated content remains
-            except OSError:
-                pass
+    removed, failures = perform_nuke(root, include_pdf_pages=reexport_pdfs,
+                                     settings=settings)
+    for path, err in failures:
+        print(f"⚠️  Could not delete {path}: {err}")
     print(f"\n💥 Reset complete — removed {removed} generated file(s).")
-    if failed:
-        print(f"⚠️  {failed} file(s) could not be removed and may still be skipped.")
+    if failures:
+        print(f"⚠️  {len(failures)} file(s) could not be removed "
+              "and may still be skipped.")
     print("🔄 Starting a fresh scan of that folder…\n")
     return root
 
@@ -3445,7 +4356,7 @@ def prompt_for_another_folder() -> bool:
     return answer in {"y", "yes"}
 
 
-def prompt_for_folder() -> Path:
+def prompt_for_folder(settings: Optional[Settings] = None) -> Path:
     """Ask for a folder, re-prompting until a real directory is given.
 
     Blank defaults to the current directory. Typing NUKE! enters the confirmed
@@ -3460,7 +4371,7 @@ def prompt_for_folder() -> Path:
         if raw.lower() in QUIT_WORDS:
             sys.exit("👋 Bye.")
         if raw.upper() == NUKE_COMMAND:
-            nuked_root = _prompt_for_nuke()
+            nuked_root = _prompt_for_nuke(settings)
             if nuked_root is not None:
                 return nuked_root
             continue
@@ -3470,32 +4381,70 @@ def prompt_for_folder() -> Path:
         print(f"‼️  '{root}' is not a valid directory. Try again (q to quit).\n")
 
 
+def _cli_review_loop(ti: TagIntegrator, root: Path) -> None:
+    """Interactive post-run review of pending Fluffle matches (CLI parity)."""
+    rq = ti._review_queue or ReviewQueue(root)
+    rq.load()
+    items = rq.list_items()
+    if not items:
+        return
+    if not sys.stdin.isatty():
+        print(f"⏳ {len(items)} file(s) left pending_review for a later GUI session.")
+        return
+    print(f"\n👀 {len(items)} match(es) need review.")
+    for pending in list(items):
+        print(f"\n  File:     {pending.relpath}")
+        print(f"  Match:    {pending.match_class} on {pending.platform or '?'}")
+        print(f"  Location: {pending.location or '(none)'}")
+        print(f"  Tags:     {', '.join(pending.fluffle_tags[:8]) or '(none)'}")
+        try:
+            ans = input("  [a]pprove / [r]eject / [s]kip / [q]uit review: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Leaving remaining items pending.")
+            break
+        if ans in {"q", "quit"}:
+            break
+        if ans in {"s", "skip", ""}:
+            continue
+        if ans in {"a", "y", "yes", "approve"}:
+            if ti.resolve_pending_review(pending, approve=True, root=root):
+                print("  ✅ Approved.")
+            else:
+                print("  ⚠️  Could not resolve.")
+        elif ans in {"r", "n", "no", "reject"}:
+            if ti.resolve_pending_review(pending, approve=False, root=root):
+                print("  ❌ Rejected (nomatch).")
+            else:
+                print("  ⚠️  Could not resolve.")
+
+
 def main() -> None:
     print("🐾 Unified Furry Tag Integrator for Hydrus 🐾")
     print("📋 e621 + InkBunny + Danbooru + Gelbooru MD5 (concurrent) → Fluffle → SauceNAO")
     print("⏭️  Skips files already tagged or logged in .furtag_ledger.json\n")
 
-    ti = TagIntegrator()
-    ti.load_credentials(Path(__file__).with_name(CREDENTIALS_FILE))
+    store = SettingsStore()
+    settings = store.load()
+    ti = TagIntegrator(settings=settings)
+    ti.load_credentials_from_store(CredentialStore())
 
     if ti.has_hydrus:
         print(f"📝 Output → Hydrus Client API  ({ti.hydrus_mode_desc()})")
     else:
         print("📝 Output → sidecars  "
               "(<file>.<ext>.txt + <file>.<ext>.urls.txt)")
-        print("   Tip: set hydrus_api_url + hydrus_access_key in credentials.txt "
-              "to push straight into Hydrus.")
+        print("   Tip: store hydrus_api_url + hydrus_access_key via keyring or "
+              "FURTAG_HYDRUS_* environment variables to push into Hydrus.")
 
     if not ti.any_source():
-        print("\n⚠️  No API credentials loaded! Only Fluffle will be used.")
+        print("\n⚠️  No API credentials loaded! Only Fluffle will be used "
+              "(if enabled).")
         try:
             input("Press Enter to continue anyway, or Ctrl+C to quit...")
         except (EOFError, KeyboardInterrupt):
             sys.exit("\n👋 Bye.")
 
     # These Hydrus choices apply to every folder scanned before FurTag exits.
-    # Keeping them together makes the folder flow predictable and ensures all
-    # review-page windows get the same newest-N limit.
     if ti.has_hydrus:
         if any(page["enabled"] for page in ti.hydrus_result_pages.values()):
             ti.hydrus_results_page_limit = prompt_for_results_page_limit(
@@ -3507,12 +4456,20 @@ def main() -> None:
             prompt_for_unmatched_import() if ti.hydrus_import else False)
 
     while True:
-        root = prompt_for_folder()
+        root = prompt_for_folder(settings)
+        opts = RunOptions.from_settings(ti.settings)
+        opts.import_unmatched = ti.hydrus_import_unmatched
+        opts.result_page_limit = ti.hydrus_results_page_limit
+        opts.build_already_tagged_page = (
+            ti.hydrus_already_tagged_page_limit is not None)
         if ti.has_hydrus and prompt_for_sidecar_sync():
-            ti.sync_sidecars_to_hydrus(root)
+            opts.sync_sidecars = True
         try:
-            ti.run(root)
+            summary = ti.run(root, options=opts)
+            if summary.pending_review:
+                _cli_review_loop(ti, root)
         except KeyboardInterrupt:
+            ti.request_cancel()
             sys.exit("\n⛔ Interrupted (progress saved to ledger).")
 
         if not prompt_for_another_folder():

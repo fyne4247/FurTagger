@@ -2,3 +2,6 @@ pillow
 requests
 regex
 PyMuPDF
+platformdirs
+keyring
+PySide6
