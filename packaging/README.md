@@ -46,5 +46,16 @@ executable. Secrets never enter `settings.json`.
 
 ## Homebrew cask
 
-See `packaging/homebrew/furtag.rb`. Personal tap first; fill version, URL, and
-SHA-256 only after a signed notarized release archive exists.
+See `packaging/homebrew/furtag.rb`.
+
+**How much work is it, really?**
+
+| Piece | Effort |
+| ----- | ------ |
+| Cask Ruby formula (version, URL, sha256, `app`, zap) | Small — under an hour once the zip exists |
+| Personal tap (`brew tap you/furtag`) | Small — new GitHub repo with the cask file |
+| Official `homebrew-cask` PR | Extra process/review; do personal tap first |
+| **Signed + notarized `FurTag.app` zip on a Release** | **Most of the work** — PyInstaller build, Developer ID, notarytool, staple, smoke-test keyring across upgrades |
+
+Until the signed archive exists, Homebrew is not a useful install path. Ship
+clone + `./FurTag-GUI.command` (or a plain GitHub Release with source/tag only).

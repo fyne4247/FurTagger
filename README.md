@@ -1,8 +1,27 @@
 # FurTag
 
-**FurTag** reverse-image-searches your media against furry/booru services and writes the tags and source URLs it finds into [Hydrus Network](https://hydrusnetwork.github.io/hydrus/). Point it at a folder of images, videos, and PDFs — it can push straight into a running Hydrus client (import + tags + URLs), write Hydrus-compatible sidecars, or both.
+**Point it at a folder. It finds where the art came from and tags it for [Hydrus](https://hydrusnetwork.github.io/hydrus/).**
 
-Built for large personal archives: multi-source lookups, resumable ledgers, polite per-service rate limits, and a desktop GUI or double-clickable CLI.
+FurTag reverse-image-searches your media against furry/booru sources (**e621, InkBunny, Danbooru, Gelbooru**, then **Fluffle** / **SauceNAO**), then **imports + tags + source URLs** into a running Hydrus client — or writes Hydrus-compatible sidecars if you prefer files only.
+
+| | |
+| --- | --- |
+| **For** | Big personal archives, Hydrus users, furry art libraries |
+| **Runs on** | macOS (double-click `.command` / GUI); Python engine is otherwise cross-platform |
+| **Needs** | Python 3.10+, API keys for the sites you use, optional Hydrus Client API |
+| **Repo** | [github.com/fyne4247/FurTagger](https://github.com/fyne4247/FurTagger) |
+
+Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite rate limits, PDF page rendering, desktop GUI or CLI.
+
+```bash
+# GUI
+./FurTag-GUI.command
+
+# CLI
+./FurTag.command
+```
+
+> **Screenshots:** drop a couple under `docs/` when you have them (status bar + a finished scan is enough). Discovery cares more about a clear pitch than a marketing site.
 
 ---
 
@@ -151,6 +170,14 @@ Namespaces follow Hydrus conventions (`creator:`, `character:`, `species:`, `ser
 ## Packaging
 
 See `packaging/README.md`. Build natively per OS; **sign** macOS/Windows builds before testing keyring persistence across upgrades.
+
+A Homebrew cask skeleton lives in `packaging/homebrew/` — it is **not** ready to publish until you have a signed, notarized `.app` zip on a GitHub Release (see packaging notes). Until then, clone + `./FurTag-GUI.command` is the supported install path.
+
+---
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

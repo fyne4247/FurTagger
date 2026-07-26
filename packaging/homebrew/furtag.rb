@@ -7,18 +7,20 @@
 #   3. macOS signing + notarization verified
 #   4. Credential persistence validated on the signed build
 #
-# Install from a personal tap:
-#   brew tap <you>/furtag
+# Install from a personal tap (after a real signed release exists):
+#   brew tap fyne4247/furtag
 #   brew install --cask furtag
 #
+# Real cask body (fill after notarized zip is on a GitHub Release):
+#
 # cask "furtag" do
-#   version "1.0.0"
+#   version "0.1.0"
 #   sha256 "REPLACE_WITH_SHA256_OF_RELEASE_ARCHIVE"
 #
-#   url "https://github.com/<you>/FurTag/releases/download/v#{version}/FurTag-#{version}-macOS.zip"
+#   url "https://github.com/fyne4247/FurTagger/releases/download/v#{version}/FurTag-#{version}-macOS.zip"
 #   name "FurTag"
 #   desc "Reverse-image tagger for furry/booru sources into Hydrus Network"
-#   homepage "https://github.com/<you>/FurTag"
+#   homepage "https://github.com/fyne4247/FurTagger"
 #
 #   depends_on macos: ">= :big_sur"
 #
@@ -30,19 +32,20 @@
 #   ]
 # end
 #
-# NOTE: This file is intentionally commented out so `brew` does not install a
-# placeholder. Uncomment and fill version/sha256/url when the first signed
-# release is published.
+# Work estimate: the Ruby cask itself is ~30 minutes once the zip exists.
+# The hard part is packaging + Developer ID signing + notarization + a
+# credential-persistence smoke test on the signed app (hours first time;
+# packaging/README.md). Without that, brew users get a broken unsigned app.
 
 cask "furtag" do
   version "0.0.0-dev"
   sha256 :no_check
 
   # Placeholder — replace before publishing.
-  url "https://example.com/FurTag-#{version}-macOS.zip"
+  url "https://github.com/fyne4247/FurTagger/releases/download/v#{version}/FurTag-#{version}-macOS.zip"
   name "FurTag"
   desc "Reverse-image tagger for furry/booru sources into Hydrus Network"
-  homepage "https://github.com/example/FurTag"
+  homepage "https://github.com/fyne4247/FurTagger"
 
   depends_on macos: ">= :big_sur"
 
@@ -51,5 +54,6 @@ cask "furtag" do
   caveats <<~EOS
     This cask is a development scaffold. Do not publish until a signed,
     notarized, versioned release archive with a real SHA-256 is available.
+    Until then: clone the repo and run ./FurTag-GUI.command
   EOS
 end
