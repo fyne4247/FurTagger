@@ -502,6 +502,64 @@ class TestSauceNAOQuota(unittest.TestCase):
                             for m in messages))
 
 
+class TestJunkTags(unittest.TestCase):
+    def test_keywording_policy_filtered(self):
+        from furtag import _is_junk_tag
+        self.assertTrue(_is_junk_tag("keywording policy"))
+        self.assertTrue(_is_junk_tag("Keywording_Policy"))
+        self.assertTrue(_is_junk_tag("keyword policy"))
+        self.assertTrue(_is_junk_tag("inkbunny keywording policy"))
+        self.assertFalse(_is_junk_tag("fox"))
+        self.assertFalse(_is_junk_tag("creator:scampdog"))
+
+    def test_unknown_artist_still_filtered(self):
+        from furtag import _is_junk_tag
+        self.assertTrue(_is_junk_tag("unknown artist"))
+        self.assertTrue(_is_junk_tag("creator:anonymous"))
+
+
+class TestPdfMetaTags(unittest.TestCase):
+    def test_base_tags_from_meta_file(self):
+        from furtag import TagIntegrator, PDF_META_FILE
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "Book.pdf").write_bytes(b"%PDF")
+            d = root / "Book"
+            d.mkdir()
+            (d / PDF_META_FILE).write_text(
+                '{"comic": "Renamed Comic", "creator": "Someone"}\n',
+                encoding="utf-8")
+            page = d / "Book PAGE3.PNG"
+            page.write_bytes(b"\x89PNG")
+            tags = TagIntegrator._pdf_page_base_tags(page)
+            self.assertIn("comic:Renamed Comic", tags)
+            self.assertIn("creator:Someone", tags)
+            self.assertIn("page:3", tags)
+
+    def test_base_tags_fall_back_to_folder_name(self):
+        from furtag import TagIntegrator
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "Folder Comic.pdf").write_bytes(b"%PDF")
+            d = root / "Folder Comic"
+            d.mkdir()
+            page = d / "Folder Comic PAGE1.PNG"
+            page.write_bytes(b"\x89PNG")
+            tags = TagIntegrator._pdf_page_base_tags(page)
+            self.assertIn("comic:Folder Comic", tags)
+            self.assertIn("page:1", tags)
+            self.assertFalse(any(t.startswith("creator:") for t in tags))
+
+    def test_normalize_pdf_meta_defaults(self):
+        from furtag import _normalize_pdf_meta
+        self.assertEqual(
+            _normalize_pdf_meta("", "  artist  ", "Stem"),
+            {"comic": "Stem", "creator": "artist"})
+        self.assertEqual(
+            _normalize_pdf_meta("My Comic", "", "Stem"),
+            {"comic": "My Comic"})
+
+
 class TestInkBunnyMultiFile(unittest.TestCase):
     """Multi-file IB submissions must not enter Hydrus's URL downloader."""
 

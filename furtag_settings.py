@@ -246,6 +246,9 @@ class RunOptions:
     build_already_tagged_page: bool = False
     sync_sidecars: bool = False
     pdf_dpi: Optional[int] = None  # None → use Settings.pdf.pdf_dpi
+    # Resolved PDF path → {"comic": str, "creator": str?} from pre-render prompt.
+    # Empty / missing → engine uses PDF stem as comic, no creator.
+    pdf_meta: Optional[Dict[str, Dict[str, str]]] = None
     # Optional per-run overrides of any Settings subsection (shallow replace).
     settings_override: Optional[Settings] = None
 
@@ -256,10 +259,10 @@ class RunOptions:
             result_page_limit=settings.hydrus.result_page_limit,
             build_already_tagged_page=settings.hydrus.build_already_tagged_page,
             sync_sidecars=False,
-            # pdf_dpi deliberately left None: the engine resolves it (settings →
-            # interactive prompt). Pinning it here would make the CLI's DPI
-            # question unreachable. Callers that must never block on input()
-            # (the GUI) set it explicitly.
+            # pdf_dpi / pdf_meta deliberately left None: the engine resolves them
+            # (settings → interactive prompt). Pinning them here would make the
+            # CLI's questions unreachable. Callers that must never block on
+            # input() (the GUI) set them explicitly.
         )
 
 

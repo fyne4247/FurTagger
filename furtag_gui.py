@@ -86,10 +86,61 @@ def _wrap_scroll(widget: QWidget) -> QScrollArea:
     scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
     return scroll
 
+
+class PdfMetaDialog(QDialog):
+    """Per-PDF comic name + optional artist before page rendering."""
+
+    def __init__(self, parent: Optional[QWidget], pdfs: List[Path]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("PDF comic tags")
+        self._pdfs = list(pdfs)
+        self._rows: List[Tuple[Path, QLineEdit, QLineEdit]] = []
+
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel(
+            "Set comic: and optional creator: tags applied to every page "
+            "when each PDF is rendered.\n"
+            "Comic defaults to the PDF filename; leave artist blank to skip."))
+
+        form_host = QWidget()
+        form = QFormLayout(form_host)
+        form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        for pdf in self._pdfs:
+            comic_edit = QLineEdit(pdf.stem)
+            creator_edit = QLineEdit()
+            creator_edit.setPlaceholderText("optional")
+            pair = QWidget()
+            pair_lay = QHBoxLayout(pair)
+            pair_lay.setContentsMargins(0, 0, 0, 0)
+            pair_lay.addWidget(QLabel("comic:"))
+            pair_lay.addWidget(comic_edit, 2)
+            pair_lay.addWidget(QLabel("creator:"))
+            pair_lay.addWidget(creator_edit, 2)
+            form.addRow(QLabel(pdf.name), pair)
+            self._rows.append((pdf, comic_edit, creator_edit))
+
+        root.addWidget(_wrap_scroll(form_host), 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self.resize(640, min(480, 160 + 48 * max(1, len(self._pdfs))))
+
+    def meta_map(self) -> Dict[str, Dict[str, str]]:
+        out: Dict[str, Dict[str, str]] = {}
+        for pdf, comic_edit, creator_edit in self._rows:
+            out[str(pdf.resolve())] = _normalize_pdf_meta(
+                comic_edit.text(), creator_edit.text(), pdf.stem)
+        return out
+
 from furtag import (
     TagIntegrator, prompt_for_pdf_dpi, _nuke_candidates, _pdf_render_candidates,
     _is_furtag_sidecar, LEDGER_FILE, DUPLICATES_FILE,
     is_filesystem_root, perform_nuke, set_active_observer,
+    _normalize_pdf_meta,
 )
 from furtag_settings import (
     Settings, SettingsStore, RunOptions, ScanSummary, validate_run_preflight,
@@ -560,10 +611,19 @@ class SettingsPanel(QWidget):
         self.pdf_enabled = QCheckBox("Render PDFs")
         self.pdf_dpi = QSpinBox()
         self.pdf_dpi.setRange(72, 2400)
-        self.pdf_write_sc = QCheckBox("Write comic:/page: base sidecars")
+        self.pdf_write_sc = QCheckBox("Write comic:/page:/creator: base sidecars")
+        self.pdf_write_sc.setToolTip(
+            "On render, each page gets comic: and page: tags (and creator: if "
+            "you set an artist in the pre-render dialog). Also writes "
+            ".furtag_pdf.json so later runs keep those names.")
         pf.addRow(self.pdf_enabled)
         pf.addRow("Default DPI", self.pdf_dpi)
         pf.addRow(self.pdf_write_sc)
+        note = QLabel(
+            "When a scan needs to render PDFs, FurTag asks for a comic name "
+            "and optional artist for each file before breaking them into pages.")
+        note.setWordWrap(True)
+        pf.addRow(note)
         self._add_tab("PDF", pdf)
 
         # Advanced performance
@@ -1008,9 +1068,9 @@ class MainWindow(QMainWindow):
         opts.pdf_dpi = s.pdf.pdf_dpi
         opts.settings_override = s
 
-        # PDF quality only when rendering is enabled AND jobs remain.
-        # Re-discover under current settings so a disabled PDF toggle is honored
-        # even if inventory was built while rendering was still on.
+        # PDF quality + comic/artist tags only when rendering is enabled AND
+        # jobs remain. Re-discover under current settings so a disabled PDF
+        # toggle is honored even if inventory was built while rendering was on.
         inv = self.inventory or {}
         pdf_jobs = inv.get("pdf_jobs") or []
         if s.pdf.pdf_enabled and pdf_jobs:
@@ -1021,6 +1081,10 @@ class MainWindow(QMainWindow):
             if not ok:
                 return
             opts.pdf_dpi = dpi
+            meta_dlg = PdfMetaDialog(self, list(pdf_jobs))
+            if meta_dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            opts.pdf_meta = meta_dlg.meta_map()
 
         self.cancel_event = threading.Event()
         self._set_running(True)

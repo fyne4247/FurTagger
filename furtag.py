@@ -138,16 +138,22 @@ SEARCH_SOURCES = HASH_SOURCES + ("fluffle", "saucenao")
 
 LEDGER_FILE      = ".furtag_ledger.json"
 DUPLICATES_FILE  = "duplicates.log"
+# Written beside rendered PDF page PNGs so comic:/creator: survive later runs.
+PDF_META_FILE    = ".furtag_pdf.json"
 
 # "Artist unknown" placeholder tags that every booru emits in some form — useless
 # noise in a Hydrus library, so they're dropped before writing. Compared against
 # the tag lowercased with underscores already normalised to spaces (see
 # _clean_tag_text / parsers). Bare general-tag forms plus any creator:<value>
 # whose value is one of _JUNK_CREATOR_VALUES are removed.
+#
+# InkBunny also has a sitewide "keywording policy" keyword that many artists
+# stamp on every submission — not content, just policy noise.
 _JUNK_TAGS = {
     "unknown artist", "artist request", "anonymous artist",
     "unknown_artist", "artist_request", "anonymous_artist",
     "creator:unknown", "creator:anonymous",
+    "keywording policy", "keyword policy", "inkbunny keywording policy",
 }
 _JUNK_CREATOR_VALUES = {
     "unknown", "unknown artist", "anonymous", "anonymous artist", "artist request",
@@ -155,8 +161,8 @@ _JUNK_CREATOR_VALUES = {
 
 
 def _is_junk_tag(tag: str) -> bool:
-    """True for 'artist unknown' placeholder tags that shouldn't be written."""
-    low = tag.lower().strip()
+    """True for placeholder / policy noise tags that shouldn't be written."""
+    low = tag.lower().strip().replace("_", " ")
     if low in _JUNK_TAGS:
         return True
     if low.startswith("creator:"):
@@ -763,17 +769,78 @@ def _import_fitz():
     return fitz
 
 
+def _normalize_pdf_meta(comic: Optional[str], creator: Optional[str],
+                        default_comic: str) -> Dict[str, str]:
+    """Return cleaned comic/creator strings for tagging + meta persistence."""
+    comic_name = (comic or "").strip() or default_comic
+    creator_name = (creator or "").strip()
+    meta = {"comic": comic_name}
+    if creator_name:
+        meta["creator"] = creator_name
+    return meta
+
+
+def _write_pdf_meta(out_dir: Path, meta: Dict[str, str]) -> None:
+    """Persist comic/creator next to rendered pages for later runs."""
+    try:
+        atomic_write_text(
+            out_dir / PDF_META_FILE,
+            json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
+    except OSError as e:
+        notify(f"⚠️  Couldn't write {PDF_META_FILE} in {out_dir.name}: {e}")
+
+
+def _read_pdf_meta(out_dir: Path) -> Dict[str, str]:
+    """Load ``.furtag_pdf.json`` if present; empty dict on missing/invalid."""
+    path = out_dir / PDF_META_FILE
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, str] = {}
+    comic = data.get("comic")
+    if isinstance(comic, str) and comic.strip():
+        out["comic"] = comic.strip()
+    creator = data.get("creator")
+    if isinstance(creator, str) and creator.strip():
+        out["creator"] = creator.strip()
+    return out
+
+
+def _pdf_base_tags_from_meta(meta: Dict[str, str], page: Optional[int] = None,
+                             fallback_comic: str = "") -> Set[str]:
+    """comic:/creator:/page: set from stored or prompted meta."""
+    tags: Set[str] = set()
+    comic = (meta.get("comic") or fallback_comic or "").strip()
+    if comic:
+        tags.add(f"comic:{comic}")
+    creator = (meta.get("creator") or "").strip()
+    if creator:
+        tags.add(f"creator:{creator}")
+    if page is not None and page > 0:
+        tags.add(f"page:{page}")
+    return tags
+
+
 def convert_pdf(pdf_path: Path, output_root: Path, dpi: int = PDF_DPI,
                 write_sidecars: bool = True,
                 sidecar_format: str = "txt",
                 tag_pattern: str = "{name}{ext}.txt",
                 json_pattern: str = "{name}{ext}.json",
-                should_cancel: Optional[Callable[[], bool]] = None) -> List[Path]:
+                should_cancel: Optional[Callable[[], bool]] = None,
+                comic: Optional[str] = None,
+                creator: Optional[str] = None) -> List[Path]:
     """Render every page of ``pdf_path`` to a PNG under ``output_root/<stem>/``.
 
     Returns the list of PNG paths written. When ``write_sidecars`` is True each
-    PNG also gets a ``comic:``/``page:`` base-tag sidecar (txt or json per
-    *sidecar_format*) so perceptual tags append to the same file later.
+    PNG also gets a ``comic:``/``page:`` (and optional ``creator:``) base-tag
+    sidecar (txt or json per *sidecar_format*) so perceptual tags append to the
+    same file later. Meta is also written to ``.furtag_pdf.json`` in the page
+    folder so later runs keep the same comic/artist without re-prompting.
 
     *should_cancel* is polled between pages so a cancel doesn't have to wait out
     a whole multi-hundred-page render.
@@ -782,6 +849,8 @@ def convert_pdf(pdf_path: Path, output_root: Path, dpi: int = PDF_DPI,
     stem = pdf_path.stem
     out_dir = output_root / stem
     out_dir.mkdir(parents=True, exist_ok=True)
+    meta = _normalize_pdf_meta(comic, creator, default_comic=stem)
+    _write_pdf_meta(out_dir, meta)
 
     try:
         doc = fitz.open(pdf_path)
@@ -802,7 +871,7 @@ def convert_pdf(pdf_path: Path, output_root: Path, dpi: int = PDF_DPI,
             generated.append(png_path)
 
             if write_sidecars:
-                tags = {f"comic:{stem}", f"page:{i}"}
+                tags = _pdf_base_tags_from_meta(meta, page=i)
                 if sidecar_format == "json":
                     sc_name = render_sidecar_name(json_pattern, png_path)
                     sc_path = png_path.parent / sc_name
@@ -817,7 +886,11 @@ def convert_pdf(pdf_path: Path, output_root: Path, dpi: int = PDF_DPI,
                         "\n".join(sorted(tags)) + "\n", encoding="utf-8")
     finally:
         doc.close()
-    print(f"  {pdf_path.name}: {len(generated)} page(s) at {dpi} DPI -> {out_dir}")
+    label = meta["comic"]
+    if meta.get("creator"):
+        label = f"{label} · creator:{meta['creator']}"
+    print(f"  {pdf_path.name}: {len(generated)} page(s) at {dpi} DPI "
+          f"[{label}] -> {out_dir}")
     return generated
 
 
@@ -853,6 +926,32 @@ def prompt_for_pdf_dpi(pdf_count: int) -> int:
         if 72 <= dpi <= 2400:
             return dpi
         print("‼️  Custom DPI must be between 72 and 2400.")
+
+
+def prompt_for_pdf_meta(pdfs: List[Path]) -> Dict[str, Dict[str, str]]:
+    """Interactive comic/artist tags for each PDF about to be rendered.
+
+    Returns a map of resolved PDF path → ``{"comic": …, "creator": …?}``.
+    Empty Enter keeps the PDF stem as the comic name; blank artist is skipped.
+    """
+    result: Dict[str, Dict[str, str]] = {}
+    if not pdfs:
+        return result
+    print(f"\n📚 Tag {len(pdfs)} PDF(s) before rendering "
+          f"(Enter = default; artist optional).")
+    for pdf in pdfs:
+        key = str(pdf.resolve())
+        print(f"\n  📄 {pdf.name}")
+        try:
+            comic_raw = input(f"     Comic name [{pdf.stem}]: ").strip()
+            creator_raw = input("     Artist / creator (optional): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n↩️  Using PDF filename as comic name for remaining PDFs.")
+            for rest in pdfs[pdfs.index(pdf):]:
+                result[str(rest.resolve())] = {"comic": rest.stem}
+            return result
+        result[key] = _normalize_pdf_meta(comic_raw, creator_raw, pdf.stem)
+    return result
 
 
 # ── TagIntegrator ────────────────────────────────────────────────────────────
@@ -2191,12 +2290,18 @@ class TagIntegrator(HydrusMixin):
 
     @staticmethod
     def _pdf_page_base_tags(media: Path) -> Set[str]:
-        """comic:/page: for a PDF-rendered page named like ``STEM PAGEN.PNG``."""
-        tags: Set[str] = {f"comic:{media.parent.name}"}
+        """comic:/page:/creator: for a PDF-rendered page named ``STEM PAGEN.PNG``.
+
+        Prefers ``.furtag_pdf.json`` written at render time (user-chosen comic
+        and artist). Falls back to the page folder name (= PDF stem) for comic.
+        """
+        meta = _read_pdf_meta(media.parent)
+        page_n: Optional[int] = None
         m = re.search(r"PAGE(\d+)", media.name, re.I)
         if m:
-            tags.add(f"page:{int(m.group(1))}")
-        return tags
+            page_n = int(m.group(1))
+        return _pdf_base_tags_from_meta(
+            meta, page=page_n, fallback_comic=media.parent.name)
 
     def write_results(
             self, media: Path, tags: Set[str], urls: Set[str],
@@ -2416,15 +2521,26 @@ class TagIntegrator(HydrusMixin):
             except OSError:
                 pass
 
-    def render_pdf_jobs(self, pdfs: List[Path], dpi: int,
-                        completed: Optional["queue.Queue"] = None) -> List[Path]:
-        """Render planned PDFs serially with adaptive oversized-page fallback."""
+    def render_pdf_jobs(
+            self, pdfs: List[Path], dpi: int,
+            completed: Optional["queue.Queue"] = None,
+            pdf_meta: Optional[Dict[str, Dict[str, str]]] = None,
+    ) -> List[Path]:
+        """Render planned PDFs serially with adaptive oversized-page fallback.
+
+        *pdf_meta* maps resolved PDF path → ``{"comic": …, "creator": …?}``
+        from the pre-render prompt. Missing entries default to the PDF stem.
+        """
         generated: List[Path] = []
+        meta_map = pdf_meta or {}
         for pdf in pdfs:
             if self.cancelled():
                 break
             attempt_dpi = dpi
             pdf_generated: List[Path] = []
+            entry = meta_map.get(str(pdf.resolve())) or meta_map.get(str(pdf)) or {}
+            comic = entry.get("comic") if isinstance(entry, dict) else None
+            creator = entry.get("creator") if isinstance(entry, dict) else None
             while True:
                 try:
                     out = self.settings.output
@@ -2435,7 +2551,9 @@ class TagIntegrator(HydrusMixin):
                         sidecar_format=out.sidecar_format,
                         tag_pattern=out.sidecar_tag_filename,
                         json_pattern=out.sidecar_json_filename,
-                        should_cancel=self.cancelled)
+                        should_cancel=self.cancelled,
+                        comic=comic,
+                        creator=creator)
                     break
                 except Exception as e:
                     oversized = "overly large image" in str(e).lower()
@@ -3136,8 +3254,8 @@ class TagIntegrator(HydrusMixin):
         pdf_future = None
         pdf_completed: "queue.Queue" = queue.Queue()
 
-        # Resolve PDF DPI from options / settings / prompt — only when
-        # rendering is enabled and discover actually queued jobs.
+        # Resolve PDF DPI + comic/artist meta from options / settings / prompt
+        # — only when rendering is enabled and discover actually queued jobs.
         if pdf_jobs and self.settings.pdf.pdf_enabled:
             if pdf_dpi is not None:
                 chosen_dpi = pdf_dpi
@@ -3147,11 +3265,20 @@ class TagIntegrator(HydrusMixin):
                 chosen_dpi = prompt_for_pdf_dpi(len(pdf_jobs))
             else:
                 chosen_dpi = self.settings.pdf.pdf_dpi or PDF_DPI
+
+            pdf_meta: Dict[str, Dict[str, str]] = {}
+            if options is not None and options.pdf_meta:
+                pdf_meta = dict(options.pdf_meta)
+            elif use_terminal_display and sys.stdin.isatty():
+                pdf_meta = prompt_for_pdf_meta(pdf_jobs)
+            # Non-interactive fallback: comic = PDF stem (historical default).
+
             print(f"📄 Rendering {len(pdf_jobs)} PDF(s) at {chosen_dpi} DPI in background…")
             pdf_executor = cf.ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="pdf-render")
             pdf_future = pdf_executor.submit(
-                self.render_pdf_jobs, pdf_jobs, chosen_dpi, pdf_completed)
+                self.render_pdf_jobs, pdf_jobs, chosen_dpi, pdf_completed,
+                pdf_meta)
         elif pdf_jobs and not self.settings.pdf.pdf_enabled:
             # Defensive: discover should have returned [] when disabled.
             pdf_jobs = []

@@ -13,7 +13,7 @@ Built for large personal archives: multi-source lookups, resumable ledgers, poli
 - **Multi-source hash tier** — every file’s local MD5 is looked up on **e621, InkBunny, Danbooru, and Gelbooru** concurrently; results are merged. MD5 identity is byte-exact (no false positives).
 - **Perceptual fallback** — images with no hash hit go to **Fluffle**, then **SauceNAO**. Authoritative booru re-queries fill namespaced tags when a post ID is known.
 - **Pipelined tiers** — hash and perceptual work run together; a two-track progress display shows each tier’s current file, phase, and ETA.
-- **PDF support** — pages render to PNG (with `comic:` / `page:` tags) and enter the perceptual tier. Optional if PyMuPDF is installed.
+- **PDF support** — pages render to PNG and enter the perceptual tier. Before rendering, you can set **comic name** and optional **artist** per PDF (`comic:` / `creator:` / `page:`). Choices are saved in `.furtag_pdf.json` beside the pages. Optional if PyMuPDF is installed.
 - **Exact-duplicate fan-out** — byte-identical files share one network search; copies get matching ledger records and sidecars.
 
 ### Hydrus
