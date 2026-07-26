@@ -502,5 +502,84 @@ class TestSauceNAOQuota(unittest.TestCase):
                             for m in messages))
 
 
+class TestInkBunnyMultiFile(unittest.TestCase):
+    """Multi-file IB submissions must not enter Hydrus's URL downloader."""
+
+    def test_file_count_from_pagecount_and_files(self):
+        from furtag import TagIntegrator
+        self.assertEqual(TagIntegrator._inkbunny_file_count({"pagecount": 20}), 20)
+        self.assertEqual(TagIntegrator._inkbunny_file_count({"pagecount": "3"}), 3)
+        self.assertEqual(
+            TagIntegrator._inkbunny_file_count({"files": [{}, {}, {}]}), 3)
+        # files[] wins over a stale pagecount when both are present
+        self.assertEqual(
+            TagIntegrator._inkbunny_file_count(
+                {"pagecount": 1, "files": [{}, {}]}), 2)
+        self.assertEqual(TagIntegrator._inkbunny_file_count({}), 1)
+
+    def test_multi_file_submission_url_is_force_associated(self):
+        from furtag import TagIntegrator
+        from furtag_settings import Settings
+        from tests.test_fakes import FakeResponse, FakeSession
+
+        multi_url = "https://inkbunny.net/s/999"
+        single_url = "https://inkbunny.net/s/111"
+        session = FakeSession([
+            ("GET", "inkbunny.net/api_submissions.php", FakeResponse(200, {
+                "submissions": [
+                    {
+                        "submission_id": 999,
+                        "username": "artist",
+                        "pagecount": 20,
+                        "keywords": [{"keyword_name": "fox"}],
+                    },
+                    {
+                        "submission_id": 111,
+                        "username": "solo",
+                        "pagecount": 1,
+                        "keywords": [{"keyword_name": "wolf"}],
+                    },
+                ],
+            })),
+        ])
+        ti = TagIntegrator(settings=Settings(), session=session)
+        ti.has_inkbunny = True
+        ti.ib_sid = "test-sid"
+        # Avoid real rate-limit sleeps in unit tests.
+        ti.pace["inkbunny"].wait = lambda: None
+
+        tags, urls, force = ti._inkbunny_submission_tags(["999", "111"])
+        self.assertIn("site:inkbunny", tags)
+        self.assertIn("creator:artist", tags)
+        self.assertIn("fox", tags)
+        self.assertIn("wolf", tags)
+        self.assertEqual(urls, {multi_url, single_url})
+        self.assertEqual(force, {multi_url})
+
+
+class TestUrlPartitionForceAssociate(unittest.TestCase):
+    def test_force_associate_blocks_enrichment(self):
+        from furtag_urls import UrlWritePolicy, partition_urls
+
+        ib = "https://inkbunny.net/s/42"
+        e6 = "https://e621.net/posts/99"
+        enrich, associate = partition_urls(
+            {ib, e6},
+            UrlWritePolicy.ENRICH_HASH_POSTS,
+            force_associate={ib},
+        )
+        self.assertEqual(enrich, {e6})
+        self.assertEqual(associate, {ib})
+
+    def test_single_file_ib_still_enrichable(self):
+        from furtag_urls import UrlWritePolicy, partition_urls
+
+        ib = "https://inkbunny.net/s/42"
+        enrich, associate = partition_urls(
+            {ib}, UrlWritePolicy.ENRICH_HASH_POSTS)
+        self.assertEqual(enrich, {ib})
+        self.assertEqual(associate, set())
+
+
 if __name__ == "__main__":
     unittest.main()

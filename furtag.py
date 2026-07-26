@@ -1375,13 +1375,21 @@ class TagIntegrator(HydrusMixin):
             notify(f"❌ InkBunny login request failed: {e}")
             return False
 
-    def inkbunny_lookup_by_md5(self, md5: str) -> Tuple[Set[str], Set[str]]:
-        """Search InkBunny by file MD5, then pull keywords from matching submissions."""
+    def inkbunny_lookup_by_md5(
+            self, md5: str,
+    ) -> Tuple[Set[str], Set[str], Set[str]]:
+        """Search InkBunny by file MD5, then pull keywords from matching submissions.
+
+        Returns ``(tags, urls, force_associate_urls)``. Multi-file submissions
+        still contribute their submission URL for association/sidecars, but that
+        URL is also listed in *force_associate_urls* so Hydrus enrichment will
+        not queue the whole multi-page post through the downloader.
+        """
         if not md5 or not self.has_inkbunny:
-            return set(), set()
+            return set(), set(), set()
         sub_ids = self._inkbunny_search_md5(md5)
         if not sub_ids:
-            return set(), set()
+            return set(), set(), set()
         return self._inkbunny_submission_tags(sub_ids)
 
     def _inkbunny_search_md5(self, md5: str, _retry: bool = True) -> List[str]:
@@ -1404,9 +1412,28 @@ class TagIntegrator(HydrusMixin):
             notify(f"❌ InkBunny search failed: {e}")
             return []
 
-    def _inkbunny_submission_tags(self, sub_ids: List[str]) -> Tuple[Set[str], Set[str]]:
+    @staticmethod
+    def _inkbunny_file_count(sub: Dict) -> int:
+        """How many files/pages a submission carries (1 = safe to enrich)."""
+        files = sub.get("files")
+        if isinstance(files, list) and files:
+            return len(files)
+        for key in ("pagecount", "page_count"):
+            raw = sub.get(key)
+            if raw is None or str(raw).strip() == "":
+                continue
+            try:
+                return max(1, int(raw))
+            except (TypeError, ValueError):
+                continue
+        return 1
+
+    def _inkbunny_submission_tags(
+            self, sub_ids: List[str],
+    ) -> Tuple[Set[str], Set[str], Set[str]]:
         tags: Set[str] = set()
         urls: Set[str] = set()
+        force_associate: Set[str] = set()
         self.pace["inkbunny"].wait()
         try:
             r = self.session.get(
@@ -1419,13 +1446,19 @@ class TagIntegrator(HydrusMixin):
             data = r.json() if r.status_code == 200 else {}
         except (requests.RequestException, ValueError) as e:
             notify(f"❌ InkBunny submissions fetch failed: {e}")
-            return tags, urls
+            return tags, urls, force_associate
 
         for sub in data.get("submissions", []):
             tags.add("site:inkbunny")
             sub_id = sub.get("submission_id")
             if sub_id:
-                urls.add(f"https://inkbunny.net/s/{sub_id}")
+                url = f"https://inkbunny.net/s/{sub_id}"
+                urls.add(url)
+                # Multi-file IB posts share one /s/{id} page. Queuing that
+                # URL through Hydrus's downloader imports every page, not
+                # just the MD5-matched file — associate only instead.
+                if self._inkbunny_file_count(sub) > 1:
+                    force_associate.add(url)
 
             username = (sub.get("username") or "").strip()
             if username:
@@ -1437,7 +1470,7 @@ class TagIntegrator(HydrusMixin):
                 if name:
                     tags.add(name)   # InkBunny keywords are freeform/un-namespaced
 
-        return tags, urls
+        return tags, urls, force_associate
 
     # ── Danbooru API ─────────────────────────────────────────────────────────
 
@@ -2170,6 +2203,7 @@ class TagIntegrator(HydrusMixin):
             known_sha256: Optional[str] = None,
             exact_match: bool = False,
             url_policy: Optional[UrlWritePolicy] = None,
+            force_associate_urls: Optional[Set[str]] = None,
     ) -> Optional[str]:
         """Push to Hydrus and/or write sidecars. Returns the file's SHA-256 when
         it was pushed to Hydrus (so the caller can cache it), else None.
@@ -2177,11 +2211,15 @@ class TagIntegrator(HydrusMixin):
         Prefer ``url_policy``. ``exact_match=True`` is legacy shorthand for
         :attr:`UrlWritePolicy.ENRICH_HASH_POSTS` (byte-exact MD5 hash-tier
         hits). Perceptual matches stay :attr:`UrlWritePolicy.ASSOCIATE_ONLY`.
+
+        *force_associate_urls* are never queued through Hydrus's downloader
+        (see multi-file InkBunny submissions).
         """
         # Drop "artist unknown / anonymous" placeholder tags from every source
         # before writing — they're noise in a Hydrus library.
         tags = {t for t in tags if not _is_junk_tag(t)}
         urls = {u for u in urls if u}
+        force_associate = {u for u in (force_associate_urls or set()) if u}
 
         if url_policy is None:
             url_policy = (
@@ -2190,7 +2228,8 @@ class TagIntegrator(HydrusMixin):
 
         if self.has_hydrus and (tags or urls):
             sha256 = self._hydrus_push(
-                media, tags, urls, known_sha256, url_policy=url_policy)
+                media, tags, urls, known_sha256, url_policy=url_policy,
+                force_associate_urls=force_associate)
             if self.write_sidecars:
                 self._write_sidecar_results(media, tags, urls)
             return sha256
@@ -2202,7 +2241,9 @@ class TagIntegrator(HydrusMixin):
     def _propagate_duplicate_results(
             self, root: Path, canonical: FileItem, duplicates: List[FileItem],
             tags: Set[str], urls: Set[str], sources: List[str],
-            canonical_sha256: Optional[str]) -> int:
+            canonical_sha256: Optional[str],
+            force_associate_urls: Optional[Set[str]] = None,
+    ) -> int:
         """Give byte-identical filesystem copies the canonical result too.
 
         Hydrus stores byte-identical files as one hash record, so its tag push
@@ -2214,6 +2255,7 @@ class TagIntegrator(HydrusMixin):
             return 0
         tags = {t for t in tags if not _is_junk_tag(t)}
         urls = {u for u in urls if u}
+        force_associate = {u for u in (force_associate_urls or set()) if u}
         try:
             canonical_rel = str(canonical.path.relative_to(root))
         except ValueError:
@@ -2232,7 +2274,9 @@ class TagIntegrator(HydrusMixin):
             # its earlier push failed, let this copy have one recovery attempt.
             sha256 = canonical_sha256
             if self.has_hydrus and not sha256 and (copy_tags or urls):
-                sha256 = self._hydrus_push(duplicate.path, copy_tags, urls)
+                sha256 = self._hydrus_push(
+                    duplicate.path, copy_tags, urls,
+                    force_associate_urls=force_associate)
             duplicate.ledger.record(
                 duplicate.path.name, duplicate.size, duplicate.mtime,
                 duplicate.md5, "matched", sources,
@@ -2742,29 +2786,41 @@ class TagIntegrator(HydrusMixin):
 
     # ── Hash tier (four boorus, concurrent per file) ─────────────────────────
 
-    def _hash_lookup(self, service: str, md5: str) -> Tuple[Set[str], Set[str]]:
+    def _hash_lookup(
+            self, service: str, md5: str,
+    ) -> Tuple[Set[str], Set[str], Set[str]]:
+        """Returns ``(tags, urls, force_associate_urls)`` for one hash service."""
         if service == "e621":
-            return self.e621_lookup_by_md5(md5)
+            t, u = self.e621_lookup_by_md5(md5)
+            return t, u, set()
         if service == "inkbunny":
             return self.inkbunny_lookup_by_md5(md5)
         if service == "danbooru":
-            return self.danbooru_lookup_by_md5(md5)
+            t, u = self.danbooru_lookup_by_md5(md5)
+            return t, u, set()
         if service == "gelbooru":
-            return self.gelbooru_lookup_by_md5(md5)
-        return set(), set()
+            t, u = self.gelbooru_lookup_by_md5(md5)
+            return t, u, set()
+        return set(), set(), set()
 
     def hash_tier(self, item: FileItem, ex: cf.Executor
-                  ) -> Tuple[Set[str], Set[str], List[str]]:
+                  ) -> Tuple[Set[str], Set[str], List[str], Set[str]]:
         """Query every enabled booru for this file's MD5 concurrently and merge.
         MD5 identity is byte-exact, so there is zero false-positive risk and the
-        tag sets genuinely differ — never short-circuit between them."""
+        tag sets genuinely differ — never short-circuit between them.
+
+        The fourth return value is the set of source URLs that must be
+        associated only (never queued for Hydrus downloader enrichment), e.g.
+        multi-file InkBunny submission pages.
+        """
         services = self.enabled_hash_services()
         tags: Set[str] = set()
         urls: Set[str] = set()
+        force_associate: Set[str] = set()
         hit: Set[str] = set()
         item.lookup_errors.clear()
         if not item.md5 or not services:
-            return tags, urls, []
+            return tags, urls, [], force_associate
 
         def _tick(state: Dict[str, str]) -> None:
             # Per-site ticker as a status event, so the GUI's sub-status slot
@@ -2780,7 +2836,7 @@ class TagIntegrator(HydrusMixin):
         for fut in cf.as_completed(futs):
             s = futs[fut]
             try:
-                t, u = fut.result()
+                t, u, fa = fut.result()
             except Exception as e:
                 # Network/HTTP failure — distinct from a clean "not found" miss,
                 # so surface it as ⚠ rather than ✗ (the file may still exist there).
@@ -2793,6 +2849,7 @@ class TagIntegrator(HydrusMixin):
             if t or u:
                 tags |= t
                 urls |= u
+                force_associate |= fa
                 hit.add(s)
                 state[s] = "hit"
             else:
@@ -2800,7 +2857,7 @@ class TagIntegrator(HydrusMixin):
             _tick(state)
 
         sources = [s for s in services if s in hit]   # deterministic order
-        return tags, urls, sources
+        return tags, urls, sources, force_associate
 
     # ── Perceptual tier (Fluffle → SauceNAO, sequential) ─────────────────────
 
@@ -3175,13 +3232,17 @@ class TagIntegrator(HydrusMixin):
             with counts_lock:
                 pending_review_count += 1
 
-        def _propagate_duplicates(item: FileItem, tags: Set[str], urls: Set[str],
-                                  sources: List[str], sha256: Optional[str]) -> None:
+        def _propagate_duplicates(
+                item: FileItem, tags: Set[str], urls: Set[str],
+                sources: List[str], sha256: Optional[str],
+                force_associate_urls: Optional[Set[str]] = None,
+        ) -> None:
             nonlocal duplicates_tagged
             with duplicate_lock:
                 copies = duplicate_groups.pop(item.path, [])
             copied = self._propagate_duplicate_results(
-                root, item, copies, tags, urls, sources, sha256)
+                root, item, copies, tags, urls, sources, sha256,
+                force_associate_urls=force_associate_urls)
             if copied:
                 with counts_lock:
                     duplicates_tagged += copied
@@ -3298,15 +3359,18 @@ class TagIntegrator(HydrusMixin):
                     self._emit("start_file", track="hash", index=i + 1,
                                current=item.path.name, nxt=nxt or "")
 
-                    tags, urls, sources = self.hash_tier(item, ex)
+                    tags, urls, sources, force_assoc = self.hash_tier(item, ex)
                     if tags or urls:
                         sha = self.write_results(
                             item.path, tags, urls, item.sha256,
-                            url_policy=UrlWritePolicy.ENRICH_HASH_POSTS)
+                            url_policy=UrlWritePolicy.ENRICH_HASH_POSTS,
+                            force_associate_urls=force_assoc)
                         item.ledger.record(item.path.name, item.size, item.mtime,
                                             item.md5, "matched", sources,
                                             sha256=sha)
-                        _propagate_duplicates(item, tags, urls, sources, sha)
+                        _propagate_duplicates(
+                            item, tags, urls, sources, sha,
+                            force_associate_urls=force_assoc)
                         source_totals = _bump_hit(sources)
                         result = f"{'+'.join(sources)}  ({len(tags)} tags)"
                         self._emit(

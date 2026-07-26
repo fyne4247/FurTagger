@@ -849,6 +849,7 @@ class HydrusMixin:
             known_sha256: Optional[str] = None,
             exact_match: bool = False,
             url_policy: Optional[UrlWritePolicy] = None,
+            force_associate_urls: Optional[Set[str]] = None,
     ) -> Optional[str]:
         """Import (optional) + tag + route URLs. Returns SHA-256 or None.
 
@@ -857,7 +858,8 @@ class HydrusMixin:
         """
         file_hash, _complete = self._hydrus_push_detailed(
             media, tags, urls, known_sha256=known_sha256,
-            exact_match=exact_match, url_policy=url_policy)
+            exact_match=exact_match, url_policy=url_policy,
+            force_associate_urls=force_associate_urls)
         return file_hash
 
     def _hydrus_push_detailed(
@@ -865,6 +867,7 @@ class HydrusMixin:
             known_sha256: Optional[str] = None,
             exact_match: bool = False,
             url_policy: Optional[UrlWritePolicy] = None,
+            force_associate_urls: Optional[Set[str]] = None,
     ) -> Tuple[Optional[str], bool]:
         """Hydrus push plus whether every requested metadata write completed.
 
@@ -875,8 +878,10 @@ class HydrusMixin:
         For :attr:`UrlWritePolicy.ENRICH_HASH_POSTS`, parseable Post URLs are
         queued through Hydrus's URL downloader so installed parsers can add
         notes/descriptions. Other URLs are associated directly.
+        *force_associate_urls* never enter the downloader (multi-file IB).
         """
         policy = self._resolve_url_policy(url_policy, exact_match)
+        force_associate = {u for u in (force_associate_urls or set()) if u}
         with self._hydrus_lock:
             try:
                 if known_sha256:
@@ -888,7 +893,8 @@ class HydrusMixin:
                     file_hash, import_status = added
                     if import_status == 3:
                         complete = self._hydrus_push_to_deleted_duplicates(
-                            media, file_hash, tags, urls, url_policy=policy)
+                            media, file_hash, tags, urls, url_policy=policy,
+                            force_associate_urls=force_associate)
                         if urls and not self.hydrus_can_edit_urls:
                             complete = False
                         return None, complete
@@ -904,7 +910,8 @@ class HydrusMixin:
                 urls_complete = not urls
                 if urls and self.hydrus_can_edit_urls:
                     urls_complete = self._hydrus_route_urls(
-                        media, file_hash, urls, url_policy=policy)
+                        media, file_hash, urls, url_policy=policy,
+                        force_associate_urls=force_associate)
                 if import_status == 1:
                     self._hydrus_add_to_page("new", file_hash)
                 elif tags or urls:
@@ -918,6 +925,7 @@ class HydrusMixin:
             self, media: Path, deleted_hash: str, tags: Set[str],
             urls: Set[str],
             url_policy: UrlWritePolicy = UrlWritePolicy.ASSOCIATE_ONLY,
+            force_associate_urls: Optional[Set[str]] = None,
     ) -> bool:
         """Tag only current members of a deleted file's Hydrus duplicate group.
 
@@ -954,7 +962,8 @@ class HydrusMixin:
                     self._hydrus_add_tags(target_hash, tags)
                 if urls and self.hydrus_can_edit_urls:
                     if not self._hydrus_route_urls(
-                            media, target_hash, urls, url_policy=url_policy):
+                            media, target_hash, urls, url_policy=url_policy,
+                            force_associate_urls=force_associate_urls):
                         metadata_complete = False
                 self._hydrus_add_to_page("duplicates", target_hash)
             _notify(f"✅ Hydrus: {media.name} was deleted; tagged {len(targets)} "
@@ -969,6 +978,7 @@ class HydrusMixin:
             self, media: Path, file_hash: str, urls: Set[str],
             exact_match: bool = False,
             url_policy: Optional[UrlWritePolicy] = None,
+            force_associate_urls: Optional[Set[str]] = None,
     ) -> bool:
         """Enrich safe hash-post URLs; associate everything else.
 
@@ -977,10 +987,14 @@ class HydrusMixin:
         the already-local file as fully handled and skip the page fetch that
         supplies notes/descriptions. Returns whether every URL was ultimately
         queued or associated.
+
+        *force_associate_urls* are never queued for enrichment even when they
+        match the hash-post URL pattern (multi-file InkBunny submissions).
         """
         policy = self._resolve_url_policy(url_policy, exact_match)
         remaining = set(urls)
-        enrichable, associate = partition_urls(remaining, policy)
+        enrichable, associate = partition_urls(
+            remaining, policy, force_associate=force_associate_urls)
         if (enrichable and self.hydrus_exact_url_enrichment
                 and not self.cancelled()):
             for url in sorted(enrichable):

@@ -19,7 +19,7 @@ Built for large personal archives: multi-source lookups, resumable ledgers, poli
 ### Hydrus
 
 - **Client API output** — import files, apply tags, associate URLs (default service: **downloader tags**).
-- **Exact-URL metadata enrichment** — for **byte-exact** (MD5 hash-tier) hits, FurTag can queue parseable booru Post URLs through Hydrus’s URL downloader so installed parsers can add **notes, descriptions, timestamps**, and other page metadata without re-importing a second file. Perceptual / external provenance URLs are only associated (never auto-downloaded). Toggle in Settings → Hydrus pages.
+- **Exact-URL metadata enrichment** — for **byte-exact** (MD5 hash-tier) hits, FurTag can queue parseable booru Post URLs through Hydrus’s URL downloader so installed parsers can add **notes, descriptions, timestamps**, and other page metadata without re-importing a second file. Perceptual / external provenance URLs are only associated (never auto-downloaded). **Multi-file InkBunny submissions** are always associate-only (queuing `/s/{id}` would make Hydrus download every page on that post). Toggle in Settings → Hydrus pages.
 - **Resumable sidecar sync** — push existing `<file>.txt` / `<file>.urls.txt` into Hydrus without re-searching; successful payloads are checkpointed in the ledger.
 - **Result pages** — optional New Imports / Newly Tagged / Duplicate Tagged / Already Tagged pages.
 - **Deleted-file duplicates** — when import hits a previously deleted file, tags/URLs can be applied to current Hydrus duplicate-group members (same URL policy as a normal push).
@@ -112,7 +112,8 @@ Non-secret options (thresholds, source toggles, page names, sidecar patterns, ra
 
 | Source of URLs | Hydrus behavior |
 | -------------- | ---------------- |
-| MD5 hash-tier post URLs (e621 / IB / Danbooru / Gelbooru) | May be queued for metadata enrichment when enabled |
+| MD5 hash-tier post URLs (e621 / single-file IB / Danbooru / Gelbooru) | May be queued for metadata enrichment when enabled |
+| Multi-file InkBunny submission pages (`/s/{id}` with pagecount > 1) | Associated only (never queued for download) |
 | Perceptual / external / artist “source” links | Associated only |
 
 **Ledger statuses** include `matched`, `nomatch`, `duplicate`, `hashed` (retry later after network errors), plus independent `sidecar_sync` checkpoints.

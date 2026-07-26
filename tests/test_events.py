@@ -201,7 +201,7 @@ class TestEventStream(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d, True)
         ti = TagIntegrator(settings=_offline_settings())
         ti.hash_tier = lambda _item, _executor: (
-            {"creator:test"}, set(), ["e621", "danbooru"])
+            {"creator:test"}, set(), ["e621", "danbooru"], set())
         rec = RecordingObserver()
 
         with contextlib.redirect_stdout(io.StringIO()):
@@ -273,14 +273,15 @@ class TestHashTickerReachesObserver(unittest.TestCase):
         ti = TagIntegrator(settings=s)
         ti.has_e621 = ti.has_danbooru = True
         ti._hash_lookup = lambda service, md5: (
-            ({"creator:someone"}, {"https://e621.net/posts/1"})
-            if service == "e621" else (set(), set()))
+            ({"creator:someone"}, {"https://e621.net/posts/1"}, set())
+            if service == "e621" else (set(), set(), set()))
         rec = RecordingObserver()
         ti._observer = rec
         item = FileItem(path=Path("/tmp/x.png"), relpath="x.png", size=1,
                         mtime=0.0, kind="image", md5="0" * 32)
         with cf.ThreadPoolExecutor(max_workers=2) as ex:
-            tags, urls, sources = ti.hash_tier(item, ex)
+            tags, urls, sources, force_assoc = ti.hash_tier(item, ex)
+        self.assertEqual(force_assoc, set())
         self.assertEqual(sources, ["e621"])
         statuses = rec.kinds("status", "hash")
         self.assertTrue(statuses, "no hash ticker status events")
@@ -304,8 +305,8 @@ class TestHashTickerReachesObserver(unittest.TestCase):
                         mtime=0.0, kind="video", md5="0" * 32)
         with cf.ThreadPoolExecutor(max_workers=1) as ex, \
              mock.patch("furtag.notify"):
-            tags, urls, sources = ti.hash_tier(item, ex)
-        self.assertFalse(tags or urls or sources)
+            tags, urls, sources, force_assoc = ti.hash_tier(item, ex)
+        self.assertFalse(tags or urls or sources or force_assoc)
         self.assertEqual(item.lookup_errors, {"e621"})
 
     def test_missing_ca_bundle_stops_the_scan_once(self):
@@ -388,7 +389,7 @@ class TestUrlEnrichmentBoundary(unittest.TestCase):
         policies = []
 
         def capture(media, tags, urls, known_sha256=None, exact_match=False,
-                    url_policy=None):
+                    url_policy=None, force_associate_urls=None):
             if url_policy is None:
                 url_policy = (
                     UrlWritePolicy.ENRICH_HASH_POSTS if exact_match
@@ -408,7 +409,7 @@ class TestUrlEnrichmentBoundary(unittest.TestCase):
         ti = TagIntegrator(settings=s)
         ti.has_e621 = True
         ti._hash_lookup = lambda service, md5: (
-            {"creator:exact"}, {"https://e621.net/posts/1"})
+            {"creator:exact"}, {"https://e621.net/posts/1"}, set())
         policies = self._capture_writes(ti)
 
         with contextlib.redirect_stdout(io.StringIO()):

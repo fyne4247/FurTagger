@@ -420,6 +420,40 @@ class TestHydrusExactUrlEnrichment(unittest.TestCase):
         self.assertEqual(
             len(self._matching_calls(session, "add_urls/associate_url")), 1)
 
+    def test_force_associate_url_skips_downloader(self):
+        """Multi-file InkBunny URLs must associate, not queue add_url."""
+        ib_url = "https://inkbunny.net/s/555"
+        e6_url = "https://e621.net/posts/123"
+        session = FakeSession([
+            ("POST", "add_files/add_file", FakeResponse(200, {
+                "status": 2, "hash": self.HASH,
+            })),
+            ("POST", "add_tags/add_tags", FakeResponse(200, {})),
+            ("GET", "add_urls/get_url_info", FakeResponse(200, {
+                "url_type": 0, "can_parse": True,
+            })),
+            ("POST", "add_urls/add_url", FakeResponse(200, {
+                "human_result_text": "URL added successfully.",
+            })),
+            ("POST", "add_urls/associate_url", FakeResponse(200, {})),
+        ])
+        ti = _hydrus_ti(session)
+        ti.hydrus_can_edit_urls = True
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "exact.jpg"
+            media.write_bytes(b"exact bytes")
+            ti._hydrus_push(
+                media, {"creator:test"}, {ib_url, e6_url},
+                exact_match=True,
+                force_associate_urls={ib_url})
+
+        add_calls = self._matching_calls(session, "add_urls/add_url")
+        self.assertEqual(len(add_calls), 1)
+        self.assertEqual(add_calls[0][2]["json"]["url"], e6_url)
+        associated = self._matching_calls(session, "add_urls/associate_url")
+        self.assertEqual(len(associated), 1)
+        self.assertEqual(associated[0][2]["json"]["urls_to_add"], [ib_url])
+
 
 class TestHydrusDuplicateTaggedPage(unittest.TestCase):
     """Files tagged via a deleted file's duplicate group get their own page."""
