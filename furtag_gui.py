@@ -840,9 +840,11 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(act_quit)
 
-        # Source status (always visible)
+        # Source status (always visible) — colored dots so they read as
+        # indicators, not clickable buttons.
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
+        self.status_label.setTextFormat(Qt.TextFormat.RichText)
         self.status_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(self.status_label)
@@ -995,13 +997,23 @@ class MainWindow(QMainWindow):
     def _refresh_source_status(self) -> None:
         self.integrator.apply_settings(self.settings_panel.to_settings())
         status = self.integrator.source_status_map()
+        # Green = on, red = off/unavailable — filled dots read as status lights,
+        # not radio buttons (the old white ● / empty ○ looked clickable).
+        style = {
+            "active": ("●", "#3dd68c"),
+            "disabled": ("●", "#f07178"),
+            "unavailable": ("✗", "#f07178"),
+        }
         parts = []
         for s, st in status.items():
-            symbol = {"active": "●", "disabled": "○", "unavailable": "✗"}.get(st, "?")
-            parts.append(f"{symbol} {s} ({st})")
-        hydrus = "Hydrus ✓" if self.integrator.has_hydrus else "Hydrus ✗"
-        self.status_label.setText(
-            f"{hydrus}  ·  " + "  ".join(parts))
+            symbol, color = style.get(st, ("?", "#aaa"))
+            parts.append(
+                f'<span style="color:{color}">{symbol}</span> {s} ({st})')
+        if self.integrator.has_hydrus:
+            hydrus = '<span style="color:#3dd68c">Hydrus ✓</span>'
+        else:
+            hydrus = '<span style="color:#f07178">Hydrus ✗</span>'
+        self.status_label.setText(f"{hydrus}  ·  " + "  ".join(parts))
 
     def _set_folder(self, path: str) -> None:
         self.folder = Path(path).expanduser().resolve()
