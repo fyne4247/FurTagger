@@ -543,6 +543,8 @@ class ReviewDialog(QDialog):
 class SettingsPanel(QWidget):
     """Tabbed settings editor with Save as default / Restore defaults."""
 
+    source_settings_changed = Signal()
+
     def __init__(self, settings: Settings, parent=None) -> None:
         super().__init__(parent)
         # No stored copy: the widgets are the state, and to_settings() reads it.
@@ -639,6 +641,8 @@ class SettingsPanel(QWidget):
             ("fluffle", "Fluffle"), ("saucenao", "SauceNAO"),
         ):
             cb = QCheckBox(f"Enable {label}")
+            cb.toggled.connect(
+                lambda _checked: self.source_settings_changed.emit())
             self.src_checks[name] = cb
             sf.addRow(cb)
         self._add_tab("Sources", src)
@@ -1069,6 +1073,8 @@ class MainWindow(QMainWindow):
 
         # ── Settings tab (scrollable pages) ──────────────────────────────
         self.settings_panel = SettingsPanel(self.settings)
+        self.settings_panel.source_settings_changed.connect(
+            self._refresh_source_status)
         self.main_tabs.addTab(self.settings_panel, "Settings")
 
     def _make_track_card(self, title: str) -> dict:
@@ -1287,8 +1293,14 @@ class MainWindow(QMainWindow):
 
         s = self.settings_panel.to_settings()
         self.integrator.apply_settings(s)
+        # A completed/cancelled worker leaves its event on the integrator.
+        # Credential probes (notably InkBunny login) also consult cancelled(),
+        # so clear the previous run before reloading credentials or a cancelled
+        # scan can make a healthy source look unavailable on the next run.
+        self.integrator.cancel_event.clear()
         # Reload credentials in case user updated them
         self.integrator.load_credentials_from_store(self.cred_store)
+        self._refresh_source_status()
 
         errs = validate_run_preflight(
             s,

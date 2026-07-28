@@ -1481,6 +1481,31 @@ class TagIntegrator(HydrusMixin):
                 out[s] = "active"
         return out
 
+    def enabled_pipeline_description(self) -> str:
+        """Human-readable pipeline containing only user-enabled sources."""
+        labels = {
+            "e621": "e621",
+            "inkbunny": "InkBunny",
+            "danbooru": "Danbooru",
+            "gelbooru": "Gelbooru",
+            "fluffle": "Fluffle",
+            "saucenao": "SauceNAO",
+        }
+        hash_sources = [
+            labels[name] for name in HASH_SOURCES if self.source_enabled(name)]
+        perceptual_sources = [
+            labels[name] for name in ("fluffle", "saucenao")
+            if self.source_enabled(name)]
+        tiers: List[str] = []
+        if hash_sources:
+            hash_desc = " + ".join(hash_sources) + " MD5"
+            if len(hash_sources) > 1:
+                hash_desc += " (concurrent)"
+            tiers.append(hash_desc)
+        if perceptual_sources:
+            tiers.append(" → ".join(perceptual_sources))
+        return " → ".join(tiers) or "No enabled search sources"
+
     # ── Thumbnail / MD5 helpers ──────────────────────────────────────────────
 
     @staticmethod
@@ -3846,8 +3871,7 @@ class TagIntegrator(HydrusMixin):
             ledger_mgr.save_all()
             return summary
 
-        print("🔄 Hash tier: e621 · InkBunny · Danbooru · Gelbooru (concurrent, merged)"
-              "  →  Perceptual: Fluffle → SauceNAO")
+        print(f"🔄 {self.enabled_pipeline_description()}")
         print(f"   {LiveDisplay._LEGEND}\n")
 
         counts = summary.source_hits
@@ -4021,13 +4045,24 @@ class TagIntegrator(HydrusMixin):
             hash_interval = max(
                 (self.pace[s].interval for s in self.enabled_hash_services()),
                 default=0.0)
+            hash_phase_sources = "·".join(
+                s for s in HASH_SOURCES if self.source_enabled(s))
+            perceptual_phase_sources = " → ".join(
+                {"fluffle": "Fluffle", "saucenao": "SauceNAO"}[s]
+                for s in ("fluffle", "saucenao") if self.source_enabled(s))
             self._emit(
                 "begin_phase", track="hash",
-                phase="Phase · hash lookups (e621·InkBunny·Danbooru·Gelbooru)",
+                phase=(
+                    "Phase · hash lookups ("
+                    + (hash_phase_sources or "none enabled")
+                    + ")"),
                 total=len(hash_items), extra={"interval": hash_interval})
             self._emit(
                 "begin_phase", track="perceptual",
-                phase="Phase · perceptual (Fluffle → SauceNAO)",
+                phase=(
+                    "Phase · perceptual ("
+                    + (perceptual_phase_sources or "none enabled")
+                    + ")"),
                 total=seed_count, extra={"growing": True})
 
             perc_thread = threading.Thread(
@@ -4694,13 +4729,13 @@ def _cli_review_loop(ti: TagIntegrator, root: Path) -> None:
 
 def main() -> None:
     print("🐾 Unified Furry Tag Integrator for Hydrus 🐾")
-    print("📋 e621 + InkBunny + Danbooru + Gelbooru MD5 (concurrent) → Fluffle → SauceNAO")
-    print("⏭️  Skips files already tagged or logged in .furtag_ledger.json\n")
 
     store = SettingsStore()
     settings = store.load()
     ti = TagIntegrator(settings=settings)
     ti.load_credentials_from_store(CredentialStore())
+    print(f"📋 {ti.enabled_pipeline_description()}")
+    print("⏭️  Skips files already tagged or logged in .furtag_ledger.json\n")
 
     if ti.has_hydrus:
         print(f"📝 Output → Hydrus Client API  ({ti.hydrus_mode_desc()})")

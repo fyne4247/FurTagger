@@ -243,10 +243,12 @@ class TestEventStream(unittest.TestCase):
         # The local-hash pre-pass reports itself now (the GUI used to see nothing).
         self.assertTrue(any("local hash" in e.sub
                             for e in rec.kinds("status", "perceptual")))
-        # begin_phase keeps the richer CLI labels (service lists intact).
+        # Phase labels reflect the configured pipeline without advertising
+        # sources the user explicitly disabled.
         labels = {e.track: e.phase for e in rec.kinds("begin_phase")}
-        self.assertIn("e621", labels["hash"])
-        self.assertIn("Fluffle", labels["perceptual"])
+        self.assertIn("none enabled", labels["hash"])
+        self.assertIn("none enabled", labels["perceptual"])
+        self.assertNotIn("SauceNAO", labels["perceptual"])
 
     def test_engine_never_touches_a_display_directly(self):
         """`_run_pipeline` must not hold a LiveDisplay reference any more."""

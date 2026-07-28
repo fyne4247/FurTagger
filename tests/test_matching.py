@@ -43,6 +43,27 @@ class TestSourceToggles(unittest.TestCase):
         ti._apply_source_toggles()
         self.assertEqual(ti.enabled_hash_services(), [])
 
+    def test_disabled_saucenao_is_omitted_and_never_called(self):
+        s = Settings()
+        s.sources.e621_enabled = False
+        s.sources.inkbunny_enabled = False
+        s.sources.danbooru_enabled = False
+        s.sources.gelbooru_enabled = False
+        s.sources.fluffle_enabled = False
+        s.sources.saucenao_enabled = False
+        ti = TagIntegrator(settings=s)
+        ti.has_saucenao = True
+        ti.saucenao_search = MagicMock(
+            side_effect=AssertionError("disabled SauceNAO was called"))
+        item = MagicMock()
+        item.path = Path("disabled-saucenao.png")
+
+        result = ti.perceptual_tier(item)
+
+        ti.saucenao_search.assert_not_called()
+        self.assertEqual(result.sources, [])
+        self.assertNotIn("SauceNAO", ti.enabled_pipeline_description())
+
 
 class TestFluffleMatching(unittest.TestCase):
     def _payload(self, results):
