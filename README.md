@@ -52,6 +52,7 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
 - **Permanent failures do not loop** — rejected source credentials disable only that source for the current credential load, unavailable optional Hydrus permissions degrade once, and unchanged unreadable media is checkpointed until its file changes.
 - **Safe directory fast-skip** — the sealed fingerprint includes filenames, nanosecond mtimes, and FurTag sidecar state rather than only file count and total bytes.
 - **Atomic PDF completion** — a PDF is considered rendered only when its completion manifest names every finished page; partial renders restart cleanly.
+- **Selective safe reset** — NUKE! previews generated files and lets you independently remove ledgers/reports, sidecars, or rendered PDF pages without touching source media.
 - **Per-service rate limiting** — independent pacers; SauceNAO adapts to reported quotas and backs off on repeated 429s.
 - **Secrets in the OS keyring** (or `FURTAG_*` env vars) — never in `settings.json` or project files.
 
@@ -90,6 +91,16 @@ python3 -m venv .venv
 ```
 
 On first run the launcher creates `.venv`, installs dependencies, and verifies the HTTPS CA bundle (`certifi`). If you **rename or move** the project folder while a scan is running, restart FurTag so workers pick up the new path.
+
+### Selective reset (NUKE!)
+
+Use **Reset…** in the GUI, or enter `NUKE!` at the CLI folder prompt. After choosing a folder, FurTag previews its generated files and lets you select any combination of:
+
+- ledgers and reports (`.furtag_ledger.json`, `duplicates.log`, and temporary versions)
+- FurTag tag/URL sidecars
+- rendered PDF page PNGs
+
+Ledgers/reports and sidecars are selected by default; rendered PDF pages are not. Each category is independent, so you can remove only the ledger/report state, only sidecars, or only rendered pages. FurTag requires confirmation, refuses filesystem roots, and never deletes source media or source PDFs.
 
 ---
 

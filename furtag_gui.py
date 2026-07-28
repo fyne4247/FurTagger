@@ -308,8 +308,8 @@ class ResetDialog(QDialog):
         self.root: Optional[Path] = None
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
-            "Permanently remove FurTag ledgers, sidecars, reports, and "
-            "optionally rendered PDF page PNGs. Source PDFs are never deleted."))
+            "Choose which FurTag-generated data to permanently remove. "
+            "Source media and source PDFs are never deleted."))
         row = QHBoxLayout()
         self.path_edit = QLineEdit()
         browse = QPushButton("Browse…")
@@ -320,8 +320,17 @@ class ResetDialog(QDialog):
         self.preview = QLabel("Select a folder to preview.")
         self.preview.setWordWrap(True)
         layout.addWidget(self.preview)
-        self.include_pdf_pages = QCheckBox("Also remove rendered PDF page PNGs")
-        layout.addWidget(self.include_pdf_pages)
+        self.include_ledgers_reports = QCheckBox("Remove ledgers and reports")
+        self.include_ledgers_reports.setChecked(True)
+        self.include_sidecars = QCheckBox("Remove sidecars")
+        self.include_sidecars.setChecked(True)
+        self.include_pdf_pages = QCheckBox("Remove rendered PDF page PNGs")
+        for option in (
+                self.include_ledgers_reports,
+                self.include_sidecars,
+                self.include_pdf_pages):
+            option.toggled.connect(self._update_preview)
+            layout.addWidget(option)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
             QDialogButtonBox.StandardButton.Cancel)
@@ -351,11 +360,17 @@ class ResetDialog(QDialog):
             return
         ledgers, sidecars = _nuke_candidates(p, self.settings)
         pages, _ = _pdf_render_candidates(p)
+        selected = (
+            (len(ledgers) if self.include_ledgers_reports.isChecked() else 0)
+            + (len(sidecars) if self.include_sidecars.isChecked() else 0)
+            + (len(pages) if self.include_pdf_pages.isChecked() else 0)
+        )
         self.preview.setText(
-            f"Would remove:\n"
+            f"Found:\n"
             f"  · {len(ledgers)} ledger/report file(s)\n"
             f"  · {len(sidecars)} sidecar file(s)\n"
-            f"  · {len(pages)} rendered PDF page file(s) (if checked)")
+            f"  · {len(pages)} rendered PDF page file(s)\n"
+            f"Selected for removal: {selected} file(s)")
 
     def _confirm(self) -> None:
         p = Path(self.path_edit.text().strip()).expanduser().resolve()
@@ -365,10 +380,22 @@ class ResetDialog(QDialog):
         if is_filesystem_root(p):
             QMessageBox.warning(self, "Reset", "Refusing filesystem root.")
             return
+        selected = []
+        if self.include_ledgers_reports.isChecked():
+            selected.append("ledgers and reports")
+        if self.include_sidecars.isChecked():
+            selected.append("sidecars")
+        if self.include_pdf_pages.isChecked():
+            selected.append("rendered PDF page PNGs")
+        if not selected:
+            QMessageBox.warning(
+                self, "Reset", "Select at least one category to remove.")
+            return
         # Two confirmations, second typed
         if QMessageBox.question(
                 self, "Confirm reset",
-                f"Reset all FurTag data under:\n{p}\n\nContinue?") != QMessageBox.StandardButton.Yes:
+                f"Permanently remove {', '.join(selected)} under:\n"
+                f"{p}\n\nContinue?") != QMessageBox.StandardButton.Yes:
             return
         text, ok = QInputDialog.getText(
             self, "Type to confirm",
@@ -385,7 +412,9 @@ class ResetDialog(QDialog):
             return 0, []
         return perform_nuke(
             self.root, include_pdf_pages=self.include_pdf_pages.isChecked(),
-            settings=self.settings)
+            settings=self.settings,
+            include_ledgers_reports=self.include_ledgers_reports.isChecked(),
+            include_sidecars=self.include_sidecars.isChecked())
 
 
 # ── Review dialog ────────────────────────────────────────────────────────────

@@ -4431,20 +4431,31 @@ def is_filesystem_root(path: Path) -> bool:
 
 
 def perform_nuke(root: Path, include_pdf_pages: bool = False,
-                 settings: Optional[Settings] = None
+                 settings: Optional[Settings] = None, *,
+                 include_ledgers_reports: bool = True,
+                 include_sidecars: bool = True,
                  ) -> Tuple[int, List[Tuple[Path, OSError]]]:
     """Delete FurTag-generated state under *root*.
 
     The single implementation behind both the CLI ``NUKE!`` prompt and the GUI
-    Reset dialog, so the two can't drift. Returns ``(removed, failures)``;
-    callers own how failures are reported.
+    Reset dialog, so the two can't drift. Each generated-data category can be
+    selected independently. Returns ``(removed, failures)``; callers own how
+    failures are reported.
     """
     ledgers, sidecars = _nuke_candidates(root, settings)
     pdf_pages, pdf_page_dirs = _pdf_render_candidates(root)
 
+    candidates: List[Path] = []
+    if include_ledgers_reports:
+        candidates.extend(ledgers)
+    if include_sidecars:
+        candidates.extend(sidecars)
+    if include_pdf_pages:
+        candidates.extend(pdf_pages)
+
     removed = 0
     failures: List[Tuple[Path, OSError]] = []
-    for path in ledgers + sidecars + (pdf_pages if include_pdf_pages else []):
+    for path in candidates:
         try:
             path.unlink()
             removed += 1
@@ -4466,7 +4477,8 @@ def _prompt_for_nuke(settings: Optional[Settings] = None) -> Optional[Path]:
     Blank input and cancellation return to the normal folder prompt. The
     filesystem root is deliberately refused even with confirmation.
     """
-    print("\n💣 NUKE mode — remove FurTag ledgers and sidecars, then rescan.")
+    print("\n💣 NUKE mode — choose which FurTag-generated data to remove, "
+          "then rescan.")
     try:
         raw = input("Folder to reset (drag it here, blank = cancel): ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -4485,11 +4497,34 @@ def _prompt_for_nuke(settings: Optional[Settings] = None) -> Optional[Path]:
         return None
 
     ledgers, sidecars = _nuke_candidates(root, settings)
-    pdf_pages, pdf_page_dirs = _pdf_render_candidates(root)
+    pdf_pages, _ = _pdf_render_candidates(root)
     print(f"\nTarget:   {root}")
     print(f"Ledgers/reports: {len(ledgers)}")
     print(f"Sidecars: {len(sidecars)}")
-    print(f"Rendered PDF pages: {len(pdf_pages)} (optional second question)")
+    print(f"Rendered PDF pages: {len(pdf_pages)}")
+
+    def choose(prompt: str, *, default: bool) -> bool:
+        suffix = "[Y/n]" if default else "[y/N]"
+        try:
+            answer = input(f"{prompt} {suffix}: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if not answer:
+            return default
+        return answer == "y"
+
+    print("\nChoose what to remove:")
+    remove_ledgers_reports = choose(
+        f"  Remove {len(ledgers)} ledger/report file(s)?", default=True)
+    remove_sidecars = choose(
+        f"  Remove {len(sidecars)} sidecar file(s)?", default=True)
+    remove_pdf_pages = choose(
+        f"  Remove {len(pdf_pages)} rendered PDF page file(s)?", default=False)
+
+    if not any((remove_ledgers_reports, remove_sidecars, remove_pdf_pages)):
+        print("↩️  Nuke cancelled; no categories were selected.\n")
+        return None
+
     try:
         answer = input("\nARE YOU SURE? [y/N]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -4498,18 +4533,13 @@ def _prompt_for_nuke(settings: Optional[Settings] = None) -> Optional[Path]:
         print("↩️  Nuke cancelled; nothing was deleted.\n")
         return None
 
-    reexport_pdfs = False
-    if pdf_pages:
-        try:
-            answer = input(
-                f"Also delete {len(pdf_pages)} rendered PDF page(s) so they "
-                "are re-exported? [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            answer = ""
-        reexport_pdfs = answer == "y"
-
-    removed, failures = perform_nuke(root, include_pdf_pages=reexport_pdfs,
-                                     settings=settings)
+    removed, failures = perform_nuke(
+        root,
+        include_pdf_pages=remove_pdf_pages,
+        settings=settings,
+        include_ledgers_reports=remove_ledgers_reports,
+        include_sidecars=remove_sidecars,
+    )
     for path, err in failures:
         print(f"⚠️  Could not delete {path}: {err}")
     print(f"\n💥 Reset complete — removed {removed} generated file(s).")

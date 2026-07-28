@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from furtag import TagIntegrator, _nuke_candidates
+from furtag import TagIntegrator, _nuke_candidates, perform_nuke
 from furtag_settings import Settings
 
 
@@ -180,6 +180,83 @@ class TestNukeCandidateClassification(unittest.TestCase):
             (root / "d.jpg.json").write_text("not json at all", encoding="utf-8")
             names = self._candidates(root, Settings())
             self.assertEqual(names, set())
+
+
+class TestSelectiveNuke(unittest.TestCase):
+    def _tree(self, root: Path):
+        (root / ".furtag_ledger.json").write_text("{}", encoding="utf-8")
+        (root / "duplicates.log").write_text("report", encoding="utf-8")
+        (root / "image.jpg").write_bytes(b"img")
+        (root / "image.jpg.txt").write_text(
+            "creator:alice\n", encoding="utf-8")
+        pdf = root / "comic.pdf"
+        pdf.write_bytes(b"pdf")
+        page_dir = root / "comic"
+        page_dir.mkdir()
+        page = page_dir / "comic PAGE1.PNG"
+        page.write_bytes(b"png")
+        return page
+
+    def test_can_remove_only_ledgers_and_reports(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            page = self._tree(root)
+
+            removed, failures = perform_nuke(
+                root,
+                include_pdf_pages=False,
+                include_ledgers_reports=True,
+                include_sidecars=False,
+                settings=Settings(),
+            )
+
+            self.assertEqual(removed, 2)
+            self.assertEqual(failures, [])
+            self.assertFalse((root / ".furtag_ledger.json").exists())
+            self.assertFalse((root / "duplicates.log").exists())
+            self.assertTrue((root / "image.jpg.txt").exists())
+            self.assertTrue(page.exists())
+
+    def test_can_remove_only_sidecars(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            page = self._tree(root)
+
+            removed, failures = perform_nuke(
+                root,
+                include_pdf_pages=False,
+                include_ledgers_reports=False,
+                include_sidecars=True,
+                settings=Settings(),
+            )
+
+            self.assertEqual(removed, 1)
+            self.assertEqual(failures, [])
+            self.assertTrue((root / ".furtag_ledger.json").exists())
+            self.assertTrue((root / "duplicates.log").exists())
+            self.assertFalse((root / "image.jpg.txt").exists())
+            self.assertTrue(page.exists())
+
+    def test_can_remove_only_rendered_pdf_pages(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            page = self._tree(root)
+
+            removed, failures = perform_nuke(
+                root,
+                include_pdf_pages=True,
+                include_ledgers_reports=False,
+                include_sidecars=False,
+                settings=Settings(),
+            )
+
+            self.assertEqual(removed, 1)
+            self.assertEqual(failures, [])
+            self.assertTrue((root / ".furtag_ledger.json").exists())
+            self.assertTrue((root / "duplicates.log").exists())
+            self.assertTrue((root / "image.jpg.txt").exists())
+            self.assertFalse(page.exists())
+            self.assertFalse(page.parent.exists())
 
 
 class TestForeignJsonNotOurSidecar(unittest.TestCase):
