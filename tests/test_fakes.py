@@ -5,11 +5,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import requests
 
-from furtag import Ledger, TagIntegrator
+from furtag import Ledger, RetryableLookupError, TagIntegrator
 from furtag_settings import Settings
 
 
@@ -105,6 +105,160 @@ class TestHydrusRouting(unittest.TestCase):
             media.write_bytes(b"data2")
             h2 = ti._hydrus_push(media, {"creator:test2"}, set())
             self.assertIn(h2, ti.hydrus_result_pages["updated"]["hashes"])
+
+
+class TestDirectSourceNotes(unittest.TestCase):
+    def test_permission_seven_enables_direct_note_capability(self):
+        session = FakeSession([
+            ("GET", "verify_access_key", FakeResponse(200, {
+                "basic_permissions": [7],
+                "permits_everything": False,
+            })),
+            ("GET", "get_services", FakeResponse(200, {
+                "services_v2": [{
+                    "name": "downloader tags",
+                    "type": 5,
+                    "service_key": "svc123",
+                }],
+            })),
+        ])
+        ti = TagIntegrator(settings=Settings(), session=session)
+        ti._init_hydrus({
+            "hydrus_api_url": "http://127.0.0.1:45869",
+            "hydrus_access_key": "test-key",
+        })
+        self.assertTrue(ti.hydrus_can_edit_notes)
+
+    def test_e621_description_has_stable_note_name(self):
+        ti = TagIntegrator(settings=Settings())
+        ti.has_hydrus = True
+        ti.hydrus_can_edit_notes = True
+        metadata = ti._parse_e6_metadata({
+            "id": 123,
+            "description": "  DText body  ",
+            "tags": {},
+        })
+        self.assertEqual(
+            metadata.notes,
+            {"e621 description — post 123": "DText body"})
+
+    def test_disabled_direct_notes_drops_e621_note_payload(self):
+        settings = Settings()
+        settings.hydrus.direct_source_notes = False
+        ti = TagIntegrator(settings=settings)
+        metadata = ti._parse_e6_metadata({
+            "id": 123,
+            "description": "DText body",
+            "tags": {},
+        })
+        self.assertEqual(metadata.notes, {})
+
+    def test_inkbunny_requests_and_collects_description_and_title(self):
+        session = FakeSession([
+            ("GET", "api_submissions.php", FakeResponse(200, {
+                "submissions": [{
+                    "submission_id": 456,
+                    "title": "A title",
+                    "description": "[b]BBCode body[/b]",
+                    "keywords": [],
+                }],
+            })),
+        ])
+        ti = TagIntegrator(settings=Settings(), session=session)
+        ti.has_hydrus = True
+        ti.hydrus_can_edit_notes = True
+        ti.pace["inkbunny"].wait = lambda: None
+        metadata = ti._inkbunny_submission_metadata(["456"])
+
+        params = session.calls[0][2]["params"]
+        self.assertEqual(params["show_description"], "yes")
+        self.assertEqual(metadata.notes, {
+            "Inkbunny title — submission 456": "A title",
+            "Inkbunny description — submission 456": "[b]BBCode body[/b]",
+        })
+
+    def test_disabled_direct_notes_uses_lightweight_inkbunny_request(self):
+        session = FakeSession([
+            ("GET", "api_submissions.php", FakeResponse(200, {
+                "submissions": [],
+            })),
+        ])
+        ti = TagIntegrator(settings=Settings(), session=session)
+        ti.hydrus_direct_notes_enabled = False
+        ti.pace["inkbunny"].wait = lambda: None
+        ti._inkbunny_submission_metadata(["456"])
+        self.assertEqual(
+            session.calls[0][2]["params"]["show_description"], "no")
+
+    def test_hydrus_notes_are_idempotent_upserts(self):
+        file_hash = "a" * 64
+        session = FakeSession([
+            ("POST", "add_files/add_file", FakeResponse(200, {
+                "status": 2, "hash": file_hash,
+            })),
+            ("POST", "add_notes/set_notes", FakeResponse(200, {})),
+        ])
+        ti = _hydrus_ti(session)
+        ti.hydrus_can_edit_notes = True
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "notes.jpg"
+            media.write_bytes(b"notes")
+            result = ti._hydrus_push(
+                media, set(), set(),
+                notes={"e621 description — post 123": "body"})
+
+        self.assertEqual(result, file_hash)
+        calls = [call for call in session.calls
+                 if "add_notes/set_notes" in call[1]]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][2]["json"], {
+            "hash": file_hash,
+            "notes": {"e621 description — post 123": "body"},
+            "merge_cleverly": False,
+        })
+
+    def test_missing_optional_metadata_permissions_do_not_force_retries(self):
+        file_hash = "a" * 64
+        session = FakeSession([
+            ("POST", "add_files/add_file", FakeResponse(200, {
+                "status": 2, "hash": file_hash,
+            })),
+            ("POST", "add_tags/add_tags", FakeResponse(200, {})),
+        ])
+        ti = _hydrus_ti(session)
+        ti.hydrus_can_edit_notes = False
+        ti.hydrus_can_edit_urls = False
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "limited-key.jpg"
+            media.write_bytes(b"data")
+            sha256, complete = ti._hydrus_push_detailed(
+                media, {"creator:test"}, {"https://example.test/post/1"},
+                notes={"e621 description — post 1": "body"})
+        self.assertEqual(sha256, file_hash)
+        self.assertTrue(complete)
+        self.assertFalse(any(
+            "add_notes/set_notes" in url or "add_urls/" in url
+            for _method, url, _kwargs in session.calls))
+
+    def test_deleted_hash_writes_notes_to_current_duplicate(self):
+        session = FakeSession(_deleted_dup_routes([DUP_OK]) + [
+            ("POST", "add_notes/set_notes", FakeResponse(200, {})),
+        ])
+        ti = _hydrus_ti(session)
+        ti.hydrus_tag_deleted_duplicates = True
+        ti.hydrus_can_manage_relationships = True
+        ti.hydrus_can_edit_notes = True
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "deleted.jpg"
+            media.write_bytes(b"deleted")
+            self.assertIsNone(ti._hydrus_push(
+                media, set(), set(),
+                notes={"e621 description — post 1": "survives"}))
+
+        calls = [call for call in session.calls
+                 if "add_notes/set_notes" in call[1]]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][2]["json"]["hash"], DUP_OK)
 
 
 class _RecordingObserver:
@@ -290,6 +444,11 @@ class TestHydrusExactUrlEnrichment(unittest.TestCase):
     HASH = "a" * 64
 
     def _push(self, routes, *, exact_match=True, settings=None):
+        if settings is None:
+            settings = Settings()
+            # URL-downloader enrichment is now an opt-in legacy path; these
+            # tests verify it remains available when explicitly enabled.
+            settings.hydrus.exact_url_enrichment = True
         session = FakeSession([
             ("POST", "add_files/add_file", FakeResponse(200, {
                 "status": 2, "hash": self.HASH,
@@ -368,6 +527,7 @@ class TestHydrusExactUrlEnrichment(unittest.TestCase):
         ])
         ti = _hydrus_ti(session)
         ti.hydrus_can_edit_urls = True
+        ti.hydrus_exact_url_enrichment = True
         with tempfile.TemporaryDirectory() as td:
             media = Path(td) / "exact.jpg"
             media.write_bytes(b"exact bytes")
@@ -439,6 +599,7 @@ class TestHydrusExactUrlEnrichment(unittest.TestCase):
         ])
         ti = _hydrus_ti(session)
         ti.hydrus_can_edit_urls = True
+        ti.hydrus_exact_url_enrichment = True
         with tempfile.TemporaryDirectory() as td:
             media = Path(td) / "exact.jpg"
             media.write_bytes(b"exact bytes")
@@ -575,6 +736,42 @@ class TestNoLiveCalls(unittest.TestCase):
         tags, urls = ti.e621_lookup_by_md5("0" * 32)
         self.assertEqual(tags, set())
         self.assertTrue(any("e621" in c[1] for c in session.calls))
+
+    def test_e621_http_failure_is_retryable_not_a_clean_miss(self):
+        session = FakeSession(routes=[
+            ("GET", "e621.net", FakeResponse(503, {"error": "busy"})),
+        ])
+        ti = TagIntegrator(settings=Settings(), session=session)
+        ti.has_e621 = True
+        ti.e621_username = "u"
+        ti.e621_api_key = "k"
+        ti.headers_e6 = {"User-Agent": "test"}
+        ti.pace["e621"].wait = lambda: None
+        with self.assertRaises(RetryableLookupError):
+            ti.e621_lookup_by_md5("0" * 32)
+
+    def test_inkbunny_search_http_failure_is_retryable_not_a_clean_miss(self):
+        session = FakeSession(routes=[
+            ("GET", "api_search.php", FakeResponse(503, {"error": "busy"})),
+        ])
+        ti = TagIntegrator(settings=Settings(), session=session)
+        ti.has_inkbunny = True
+        ti.ib_sid = "sid"
+        ti.pace["inkbunny"].wait = lambda: None
+        with self.assertRaises(RetryableLookupError):
+            ti._inkbunny_search_md5("0" * 32)
+
+    def test_inkbunny_login_outage_does_not_abort_credential_reload(self):
+        session = FakeSession(routes=[
+            ("GET", "api_login.php", FakeResponse(503, {"error": "busy"})),
+        ])
+        ti = TagIntegrator(settings=Settings(), session=session)
+        with patch("furtag.notify"):
+            ti.load_credentials({
+                "inkbunny_username": "user",
+                "inkbunny_password": "password",
+            })
+        self.assertFalse(ti.has_inkbunny)
 
 
 if __name__ == "__main__":

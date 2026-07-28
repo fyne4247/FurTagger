@@ -7,7 +7,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from furtag import Ledger, LedgerManager, TagIntegrator, RESOLVED_LEDGER_STATUSES
+from furtag import (
+    LEDGER_METADATA_VERSION, Ledger, LedgerManager, TagIntegrator,
+    RESOLVED_LEDGER_STATUSES,
+)
 from furtag_settings import Settings
 from furtag_review import ReviewQueue, PendingReview
 
@@ -21,6 +24,68 @@ class TestLedgerSkip(unittest.TestCase):
             self.assertEqual(led.status_for("a.jpg", 100, 1.0), "matched")
             self.assertIsNone(led.status_for("a.jpg", 101, 1.0))  # size change
             self.assertIsNone(led.status_for("a.jpg", 100, 2.0))  # mtime change
+
+    def test_old_resolved_record_is_retried_for_metadata_backfill(self):
+        with tempfile.TemporaryDirectory() as td:
+            led = Ledger(Path(td))
+            led.records["old.jpg"] = {
+                "size": 100,
+                "mtime": 1.0,
+                "md5": "abc",
+                "status": "matched",
+                "sources": ["e621"],
+                "metadata_version": LEDGER_METADATA_VERSION - 1,
+            }
+            self.assertIsNone(led.status_for("old.jpg", 100, 1.0))
+            # The expensive disk hash remains reusable during the backfill.
+            self.assertEqual(led.md5_for("old.jpg", 100, 1.0), "abc")
+
+    def test_direct_note_backfill_waits_until_capability_is_available(self):
+        with tempfile.TemporaryDirectory() as td:
+            led = Ledger(Path(td))
+            led.record(
+                "offline.jpg", 100, 1.0, "abc", "matched", ["e621"],
+                direct_notes_applied=False)
+            self.assertEqual(
+                led.status_for(
+                    "offline.jpg", 100, 1.0,
+                    require_direct_notes=False),
+                "matched")
+            self.assertIsNone(
+                led.status_for(
+                    "offline.jpg", 100, 1.0,
+                    require_direct_notes=True))
+
+    def test_sidecar_does_not_hide_deferred_direct_note_backfill(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            media = root / "offline.jpg"
+            media.write_bytes(b"image")
+            st = media.stat()
+            settings = Settings()
+            settings.output.hydrus_enabled = False
+            settings.output.sidecars_enabled = True
+            ti = TagIntegrator(settings=settings)
+            ti._write_sidecar_results(media, {"creator:test"}, set())
+            led = Ledger(root)
+            led.record(
+                media.name, st.st_size, st.st_mtime, "abc",
+                "matched", ["e621"], direct_notes_applied=False)
+            led.mark_dir_complete(
+                1, st.st_size,
+                ti._directory_manifest(root, {media.name: st}),
+                direct_notes_applied=False)
+            led.save()
+
+            # Sidecar/offline mode accepts the resolved record without wasting
+            # source calls. Once note capability appears, both the directory
+            # fingerprint and per-file sidecar skip reopen it.
+            self.assertEqual(
+                ti.index(root, LedgerManager(), set())[0], [])
+            ti.has_hydrus = True
+            ti.hydrus_can_edit_notes = True
+            items, _ = ti.index(root, LedgerManager(), set())
+            self.assertEqual([item.path for item in items], [media])
 
     def test_pending_review_not_resolved(self):
         self.assertNotIn("pending_review", RESOLVED_LEDGER_STATUSES)
@@ -64,6 +129,7 @@ class TestLedgerSkip(unittest.TestCase):
             led.save()
 
             ti = TagIntegrator(settings=Settings())
+            ti._write_sidecar_results(img, {"creator:test"}, set())
             mgr = LedgerManager()
             items, cand = ti.index(root, mgr, set())
             self.assertEqual(len(items), 0)  # already matched
@@ -74,6 +140,49 @@ class TestLedgerSkip(unittest.TestCase):
             ti.finalize_dir_fingerprints(cand, set(), mgr)
             led2 = mgr.get(root)
             self.assertIsNotNone(led2.dir_count)
+
+    def test_directory_manifest_detects_same_size_rename(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            original = root / "a.jpg"
+            original.write_bytes(b"same-size")
+            st = original.stat()
+            ti = TagIntegrator(settings=Settings())
+            led = Ledger(root)
+            led.record(
+                original.name, st.st_size, st.st_mtime, "abc",
+                "matched", ["e621"])
+            stats = {original.name: st}
+            manifest = ti._directory_manifest(root, stats)
+            led.mark_dir_complete(1, st.st_size, manifest)
+            led.save()
+
+            original.rename(root / "b.jpg")
+            items, _candidate_dirs = ti.index(
+                root, LedgerManager(), set())
+            self.assertEqual([item.path.name for item in items], ["b.jpg"])
+
+    def test_missing_active_sidecar_reopens_matched_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            media = root / "x.jpg"
+            media.write_bytes(b"image")
+            st = media.stat()
+            settings = Settings()
+            settings.output.hydrus_enabled = False
+            settings.output.sidecars_enabled = True
+            ti = TagIntegrator(settings=settings)
+            ti._write_sidecar_results(media, {"creator:test"}, set())
+            led = Ledger(root)
+            led.record(
+                media.name, st.st_size, st.st_mtime, "abc",
+                "matched", ["e621"])
+            led.save()
+
+            ti.tag_sidecar_path(media).unlink()
+            items, _candidate_dirs = ti.index(
+                root, LedgerManager(), set())
+            self.assertEqual([item.path for item in items], [media])
 
     def test_md5_cache_reuse(self):
         with tempfile.TemporaryDirectory() as td:
@@ -184,6 +293,15 @@ class TestDedup(unittest.TestCase):
             survivors, n_dup, groups = ti.deduplicate(root, items, mgr)
             self.assertEqual(n_dup, 1)
             self.assertEqual(len(survivors), 1)
+            duplicate = next(iter(groups.values()))[0]
+            self.assertEqual(
+                duplicate.ledger.status_for(
+                    duplicate.path.name, duplicate.size, duplicate.mtime),
+                "duplicate_pending")
+            self.assertFalse((root / "duplicates.log").exists())
+            ti._resolve_duplicate_nomatches(
+                root, survivors[0], [duplicate])
+            ti._write_duplicates_log(root, mgr)
             self.assertTrue((root / "duplicates.log").exists())
 
 

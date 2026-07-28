@@ -31,16 +31,15 @@ checkpointed as soon as they are calculated, so an interrupted lookup pass
 does not make the next run hash the same bytes again. Living inside the folder
 it describes rather than
 the scan root, a subfolder's ledger is honored no matter which ancestor
-directory a later run scans. Each ledger also seals a directory-level
-fingerprint (file count + total size) once every file in it is accounted for,
-so an unchanged folder can be skipped wholesale on the next run without
-checking any individual file. A file/folder is only re-checked if something
-in it actually changed (size, mtime, or membership).
+directory a later run scans. Each ledger also seals a directory manifest
+(names, sizes, nanosecond mtimes, and sidecar state) once every file in it is
+accounted for, so an unchanged folder can be skipped wholesale on the next run
+without checking individual records.
 
 Output — choose one or both in Settings:
 
   A) Hydrus Client API (preferred when configured):
-        import file → add tags → associate source URLs
+        import file → add tags + direct source notes → associate source URLs
         No sidecar files. Tags land on a local tag service
         (default: "downloader tags").
 
@@ -129,7 +128,9 @@ PDF_ARCHIVAL_DPI = DEFAULT_PDF_ARCHIVAL_DPI
 
 # Ledger statuses treated as "resolved" for skip / fingerprint sealing.
 # pending_review is intentionally absent — those files stay eligible.
-RESOLVED_LEDGER_STATUSES = frozenset({"matched", "nomatch", "duplicate"})
+RESOLVED_LEDGER_STATUSES = frozenset({
+    "matched", "nomatch", "duplicate", "unreadable",
+})
 
 # Exact-hash (MD5) sources, then every search source. One ordered definition so
 # the toggle lookups and the per-tier service lists can't drift apart.
@@ -138,8 +139,14 @@ SEARCH_SOURCES = HASH_SOURCES + ("fluffle", "saucenao")
 
 LEDGER_FILE      = ".furtag_ledger.json"
 DUPLICATES_FILE  = "duplicates.log"
+LEDGER_VERSION = 5
+# Increment when a completed match needs source metadata backfilled. Version 2
+# adds direct e621/Inkbunny notes, so old resolved records are retried once
+# while retaining their cached MD5.
+LEDGER_METADATA_VERSION = 2
 # Written beside rendered PDF page PNGs so comic:/creator: survive later runs.
 PDF_META_FILE    = ".furtag_pdf.json"
+PDF_COMPLETE_FILE = ".furtag_pdf_complete.json"
 
 # "Artist unknown" placeholder tags that every booru emits in some form — useless
 # noise in a Hydrus library, so they're dropped before writing. Compared against
@@ -515,6 +522,69 @@ class FileItem:
     # at ``hashed`` so a later run retries the network work without re-hashing.
 
 
+@dataclass
+class SourceMetadata:
+    """Metadata collected for one source match.
+
+    Notes are keyed by their final, stable Hydrus note name. Keeping them next
+    to tags and URLs prevents descriptions from being lost between a source
+    lookup and the eventual SHA-256 Hydrus write.
+    """
+    tags: Set[str] = field(default_factory=set)
+    urls: Set[str] = field(default_factory=set)
+    notes: Dict[str, str] = field(default_factory=dict)
+    force_associate_urls: Set[str] = field(default_factory=set)
+
+    def merge(self, other: "SourceMetadata") -> None:
+        self.tags |= other.tags
+        self.urls |= other.urls
+        self.force_associate_urls |= other.force_associate_urls
+        self.notes.update(other.notes)
+
+
+class RetryableLookupError(RuntimeError):
+    """A source did not produce a trustworthy hit-or-miss answer."""
+
+
+class UnusableMediaError(RuntimeError):
+    """An unchanged local file cannot be prepared for perceptual search."""
+
+
+@dataclass
+class HashTierResult:
+    """Typed hash-tier result with legacy four-value tuple unpacking."""
+    metadata: SourceMetadata
+    sources: List[str]
+
+    def __iter__(self):
+        yield self.metadata.tags
+        yield self.metadata.urls
+        yield self.sources
+        yield self.metadata.force_associate_urls
+
+
+@dataclass
+class PerceptualTierResult:
+    """Typed perceptual result with legacy four-value tuple unpacking."""
+    metadata: SourceMetadata
+    sources: List[str]
+    review_raw: Optional[Dict]
+
+    def __iter__(self):
+        yield self.metadata.tags
+        yield self.metadata.urls
+        yield self.sources
+        yield self.review_raw
+
+
+@dataclass(frozen=True)
+class WriteOutcome:
+    """Result of writing every configured metadata sink for one file."""
+
+    sha256: Optional[str]
+    complete: bool
+
+
 # ── Session ledger ───────────────────────────────────────────────────────────
 
 class Ledger:
@@ -525,13 +595,13 @@ class Ledger:
     folder and is picked up no matter which ancestor directory a later run
     scans from.
 
-    Also carries a directory-level fingerprint (media file count + total
-    size). Once every file in the directory has a resolved record, that
+    Also carries a directory-level manifest fingerprint. Once every file in
+    the directory has a resolved record, that
     fingerprint is "sealed" (`mark_dir_complete`) — a future run can then
     skip the entire folder on one count/size comparison, without touching
     any individual file, as long as the fingerprint still matches."""
 
-    MTIME_EPS = 1e-3
+    MTIME_EPS = 1e-6
 
     def __init__(self, dir_path: Path) -> None:
         self.dir = dir_path
@@ -539,6 +609,9 @@ class Ledger:
         self.records: Dict[str, Dict] = {}
         self.dir_count: Optional[int] = None
         self.dir_size: Optional[int] = None
+        self.dir_manifest: Optional[str] = None
+        self.dir_metadata_version: Optional[int] = None
+        self.dir_direct_notes_applied: Optional[bool] = None
         self._dirty = 0
         self._lock = threading.Lock()
 
@@ -554,6 +627,10 @@ class Ledger:
                 if isinstance(fp, dict):
                     self.dir_count = fp.get("count")
                     self.dir_size = fp.get("size")
+                    self.dir_manifest = fp.get("manifest")
+                    self.dir_metadata_version = fp.get("metadata_version")
+                    self.dir_direct_notes_applied = fp.get(
+                        "direct_notes_applied")
         except Exception as e:
             notify(f"⚠️  Couldn't read ledger {self.path} ({e}); starting fresh.")
 
@@ -570,10 +647,32 @@ class Ledger:
             return None
         return rec
 
-    def status_for(self, name: str, size: int, mtime: float) -> Optional[str]:
+    def status_for(
+            self, name: str, size: int, mtime: float,
+            require_direct_notes: bool = True) -> Optional[str]:
         """'matched' / 'nomatch' if this exact file was already processed, else None."""
         rec = self._fresh_record(name, size, mtime)
-        return rec.get("status") if rec else None
+        if not rec:
+            return None
+        status = rec.get("status")
+        if (status in RESOLVED_LEDGER_STATUSES
+                and require_direct_notes
+                and rec.get("metadata_version") != LEDGER_METADATA_VERSION):
+            return None
+        if (status == "matched" and require_direct_notes
+                and self.needs_direct_notes(name, size, mtime)):
+            return None
+        return status
+
+    def needs_direct_notes(self, name: str, size: int, mtime: float) -> bool:
+        """Whether this exact prior match still needs source-note backfill."""
+        rec = self._fresh_record(name, size, mtime)
+        return bool(
+            rec
+            and rec.get("status") == "matched"
+            and set(rec.get("sources") or ()) & {"e621", "inkbunny"}
+            and (rec.get("metadata_version") != LEDGER_METADATA_VERSION
+                 or rec.get("direct_notes_applied") is not True))
 
     def md5_for(self, name: str, size: int, mtime: float) -> Optional[str]:
         """Reuse a previously-computed MD5 for an unchanged file even if its
@@ -599,7 +698,7 @@ class Ledger:
                 return
             self.records[name] = {
                 "size": size,
-                "mtime": round(mtime, 3),
+                "mtime": mtime,
                 "md5": md5,
                 "status": "hashed",
                 "sources": [],
@@ -647,7 +746,7 @@ class Ledger:
             if rec is None:
                 rec = {
                     "size": size,
-                    "mtime": round(mtime, 3),
+                    "mtime": mtime,
                     "md5": None,
                     "status": "sidecar_only",
                     "sources": [],
@@ -666,16 +765,26 @@ class Ledger:
 
     def record(self, name: str, size: int, mtime: float, md5: Optional[str],
                status: str, sources: List[str], duplicate_of: str = "",
-               sha256: Optional[str] = None) -> None:
+               sha256: Optional[str] = None,
+               direct_notes_applied: Optional[bool] = None) -> None:
         with self._lock:
             previous = self._fresh_record(name, size, mtime) or {}
             record = {
                 "size": size,
-                "mtime": round(mtime, 3),
+                "mtime": mtime,
                 "md5": md5,
                 "status": status,
                 "sources": sources,
+                "metadata_version": LEDGER_METADATA_VERSION,
             }
+            if status == "matched" and direct_notes_applied is None:
+                # Compatibility for direct Ledger callers: a newly-written
+                # current-version match historically meant all requested
+                # metadata completed. The pipeline passes an explicit False
+                # when Hydrus notes are unavailable.
+                direct_notes_applied = True
+            if direct_notes_applied is not None:
+                record["direct_notes_applied"] = bool(direct_notes_applied)
             if not sha256:
                 # No fresh hash from this write (sidecar-only mode, or unmatched
                 # files with hydrus_import_unmatched off) — keep the one already
@@ -701,17 +810,39 @@ class Ledger:
             self.records[name] = record
             self._dirty += 1
 
-    def fingerprint_matches(self, count: int, total_size: int) -> bool:
-        return self.dir_count is not None and (self.dir_count, self.dir_size) == (count, total_size)
+    def fingerprint_matches(
+            self, count: int, total_size: int,
+            manifest: Optional[str] = None,
+            require_direct_notes: bool = True) -> bool:
+        return (
+            self.dir_count is not None
+            and (not require_direct_notes
+                 or self.dir_metadata_version == LEDGER_METADATA_VERSION)
+            and (not require_direct_notes
+                 or self.dir_direct_notes_applied is True)
+            and (self.dir_count, self.dir_size) == (count, total_size)
+            and (manifest is None or self.dir_manifest == manifest)
+        )
 
-    def mark_dir_complete(self, count: int, total_size: int) -> None:
+    def mark_dir_complete(
+            self, count: int, total_size: int,
+            manifest: Optional[str] = None,
+            direct_notes_applied: bool = True) -> None:
         """Seal the directory-level fingerprint. Only call once every current
         media file in the directory has a sidecar or a matched/nomatch record —
         otherwise an interrupted run could make a future scan wrongly skip
         files that were never actually processed."""
         with self._lock:
-            if (self.dir_count, self.dir_size) != (count, total_size):
-                self.dir_count, self.dir_size = count, total_size
+            state = (
+                count, total_size, manifest, LEDGER_METADATA_VERSION,
+                bool(direct_notes_applied))
+            current = (
+                self.dir_count, self.dir_size, self.dir_manifest,
+                self.dir_metadata_version, self.dir_direct_notes_applied)
+            if current != state:
+                (self.dir_count, self.dir_size, self.dir_manifest,
+                 self.dir_metadata_version,
+                 self.dir_direct_notes_applied) = state
                 self._dirty += 1
 
     def save(self) -> None:
@@ -719,9 +850,19 @@ class Ledger:
             if self._dirty == 0 and self.path.exists():
                 return
             try:
-                payload: Dict = {"version": 4, "records": self.records}
+                payload: Dict = {
+                    "version": LEDGER_VERSION,
+                    "records": self.records,
+                }
                 if self.dir_count is not None:
-                    payload["dir_fingerprint"] = {"count": self.dir_count, "size": self.dir_size}
+                    payload["dir_fingerprint"] = {
+                        "count": self.dir_count,
+                        "size": self.dir_size,
+                        "manifest": self.dir_manifest,
+                        "metadata_version": self.dir_metadata_version,
+                        "direct_notes_applied":
+                            self.dir_direct_notes_applied,
+                    }
                 atomic_write_text(
                     self.path, json.dumps(payload, ensure_ascii=False, indent=0))
                 self._dirty = 0
@@ -1007,6 +1148,7 @@ class TagIntegrator(HydrusMixin):
         self.gelbooru_api_key = ""
         self.has_gelbooru = False
         self.enabled_gelbooru = True
+        self._gelbooru_tag_type_cache: Dict[str, object] = {}
 
         # SauceNAO
         self.saucenao_api_key = ""
@@ -1025,6 +1167,10 @@ class TagIntegrator(HydrusMixin):
         self.hydrus_access_key = ""
         self.hydrus_tag_service_key = ""
         self.hydrus_can_edit_urls = False   # access key has "Import and Edit URLs"
+        self.hydrus_can_edit_notes = False  # access key has "Edit File Notes"
+        # Safe default for callers predating the settings toggle. The settings
+        # layer may override this in apply_settings().
+        self.hydrus_direct_notes_enabled = True
         self.hydrus_can_search_files = False  # MD5 → current SHA-256 lookup
         self.hydrus_can_manage_relationships = False
         self.hydrus_exact_url_enrichment = True
@@ -1075,6 +1221,7 @@ class TagIntegrator(HydrusMixin):
             self._reresolve_tag_service()
         self.hydrus_import_unmatched = out.hydrus_import_unmatched
         hy = self.settings.hydrus
+        self.hydrus_direct_notes_enabled = bool(hy.direct_source_notes)
         self.hydrus_exact_url_enrichment = bool(hy.exact_url_enrichment)
         self.hydrus_exact_url_enrichment_page_name = (
             hy.exact_url_enrichment_page_name.strip() or "FurTag Metadata")
@@ -1164,6 +1311,28 @@ class TagIntegrator(HydrusMixin):
             cfg = CredentialStore().load_all().as_cfg()
         print("🔑 Loading credentials from secure store / environment")
 
+        # Credential editing is live in the GUI. Clear every capability derived
+        # from the previous snapshot before probing the new one, or removing a
+        # key could leave the old source/session/Hydrus permissions active.
+        self.has_e621 = False
+        self.has_inkbunny = False
+        self.has_danbooru = False
+        self.has_gelbooru = False
+        self.has_saucenao = False
+        self.ib_sid = ""
+        self.danbooru_anon = False
+        self.saucenao_exhausted = False
+        self._saucenao_consecutive_429 = 0
+        self.has_hydrus = False
+        self.hydrus_tag_service_key = ""
+        self.hydrus_can_edit_urls = False
+        self.hydrus_can_edit_notes = False
+        self.hydrus_can_search_files = False
+        self.hydrus_can_manage_relationships = False
+        for page in self.hydrus_result_pages.values():
+            page["enabled"] = False
+        self.hydrus_already_tagged_page_enabled = False
+
         # Non-secret Hydrus preferences always come from Settings.
         out = self.settings.output
         hy = self.settings.hydrus
@@ -1217,8 +1386,15 @@ class TagIntegrator(HydrusMixin):
         if not (self.ib_username and self.ib_password):
             notify("‼️  InkBunny credentials incomplete – InkBunny disabled.")
             return
-        if self.inkbunny_login():
-            self.has_inkbunny = True
+        try:
+            if self.inkbunny_login():
+                self.has_inkbunny = True
+        except RetryableLookupError as e:
+            # Credential loading runs during GUI startup. A temporary InkBunny
+            # outage should disable only this source, not prevent FurTag from
+            # opening or using every other source.
+            notify(f"‼️  InkBunny temporarily unavailable – disabled for this "
+                   f"credential load ({e}).")
 
     def _init_danbooru(self, cfg: Dict[str, str]) -> None:
         self.danbooru_username = cfg.get("danbooru_username", "")
@@ -1259,10 +1435,20 @@ class TagIntegrator(HydrusMixin):
         # by preflight). Prefer writing over silent data loss.
         return True
 
+    def direct_notes_effective(self) -> bool:
+        """Whether this run can actually persist source descriptions."""
+        return bool(
+            self.hydrus_direct_notes_enabled
+            and self.has_hydrus
+            and self.hydrus_can_edit_notes)
+
     def source_available(self, name: str) -> bool:
         """Credentials present. Called per file per service — no dict building."""
         if name == "saucenao":
-            return self.has_saucenao and not self.saucenao_exhausted
+            # Quota exhaustion is a retryable/deferred state, not missing
+            # credentials. Keep the source active so remaining files are not
+            # incorrectly sealed as clean misses.
+            return self.has_saucenao
         return name in SEARCH_SOURCES and getattr(self, f"has_{name}", False)
 
     def source_enabled(self, name: str) -> bool:
@@ -1356,8 +1542,10 @@ class TagIntegrator(HydrusMixin):
     # ── e621 API ─────────────────────────────────────────────────────────────
 
     def _e621_get(self, url: str) -> Optional[Dict]:
-        """GET from e621 with auth (rate-paced). Returns parsed JSON or None."""
+        """GET from e621 with auth; failures remain retryable, never misses."""
         self.pace["e621"].wait()
+        if self.cancelled():
+            raise RetryableLookupError("e621 lookup cancelled")
         try:
             r = self.session.get(
                 url, headers=self.headers_e6,
@@ -1366,37 +1554,62 @@ class TagIntegrator(HydrusMixin):
             if r.status_code == 429:
                 notify("⚠️  e621 rate limit (429) – backing off 10s")
                 self.pace["e621"].backoff(10)
-                return None
+                raise RetryableLookupError("e621 rate limited (HTTP 429)")
+            if r.status_code in (401, 403):
+                self.has_e621 = False
+                notify("‼️  e621 authentication rejected – disabled until "
+                       "credentials are reloaded.")
+                return {}
+            if r.status_code == 404:
+                return {}
             if r.status_code != 200:
-                notify(f"⚠️  e621 returned {r.status_code} for {url}")
-                return None
+                raise RetryableLookupError(
+                    f"e621 returned HTTP {r.status_code}")
             return r.json()
         except (requests.RequestException, ValueError) as e:
-            notify(f"❌ e621 request failed: {e}")
-            return None
+            raise RetryableLookupError(f"e621 request failed: {e}") from e
 
     def e621_lookup_by_md5(self, md5: str) -> Tuple[Set[str], Set[str]]:
+        metadata = self._e621_metadata_by_md5(md5)
+        return metadata.tags, metadata.urls
+
+    def _e621_metadata_by_md5(self, md5: str) -> SourceMetadata:
         if not md5 or not self.has_e621:
-            return set(), set()
+            return SourceMetadata()
         data = self._e621_get(f"https://e621.net/posts.json?tags=md5:{md5}")
         posts = data.get("posts", []) if data else []
-        return self._parse_e6_post(posts[0]) if posts else (set(), set())
+        return self._parse_e6_metadata(posts[0]) if posts else SourceMetadata()
 
     def e621_lookup_by_id(self, pid: str) -> Tuple[Set[str], Set[str]]:
+        metadata = self._e621_metadata_by_id(pid)
+        return metadata.tags, metadata.urls
+
+    def _e621_metadata_by_id(self, pid: str) -> SourceMetadata:
         if not pid or not self.has_e621:
-            return set(), set()
+            return SourceMetadata()
         data = self._e621_get(f"https://e621.net/posts/{pid}.json")
         post = data.get("post", {}) if data else {}
-        return self._parse_e6_post(post) if post else (set(), set())
+        return self._parse_e6_metadata(post) if post else SourceMetadata()
 
     def _parse_e6_post(self, post: Dict) -> Tuple[Set[str], Set[str]]:
         """Convert an e621 post into (tags, urls). Includes pool/comic tags."""
+        metadata = self._parse_e6_metadata(post)
+        return metadata.tags, metadata.urls
+
+    def _parse_e6_metadata(self, post: Dict) -> SourceMetadata:
+        """Convert an e621 post into tags, URLs, and its source description."""
         tags: Set[str] = {"site:e621"}
         urls: Set[str] = set()
+        notes: Dict[str, str] = {}
 
         post_id = post.get("id")
         if post_id:
             urls.add(f"https://e621.net/posts/{post_id}")
+            description = post.get("description")
+            if (self.direct_notes_effective()
+                    and isinstance(description, str)
+                    and description.strip()):
+                notes[f"e621 description — post {post_id}"] = description.strip()
 
         for ns, lst in post.get("tags", {}).items():
             if not isinstance(lst, list):
@@ -1421,7 +1634,7 @@ class TagIntegrator(HydrusMixin):
         if pool_ids and post_id:
             tags |= self._e621_pool_tags(pool_ids, post_id)
 
-        return tags, urls
+        return SourceMetadata(tags=tags, urls=urls, notes=notes)
 
     def _e621_pool_tags(self, pool_ids: List[int], post_id: int) -> Set[str]:
         """
@@ -1456,18 +1669,24 @@ class TagIntegrator(HydrusMixin):
 
     def inkbunny_login(self) -> bool:
         self.pace["inkbunny"].wait()
+        if self.cancelled():
+            raise RetryableLookupError("InkBunny lookup cancelled")
         try:
             r = self.session.get(
                 "https://inkbunny.net/api_login.php",
                 params={"username": self.ib_username, "password": self.ib_password},
                 timeout=15,
             )
-            data = r.json() if r.status_code == 200 else {}
+            if r.status_code != 200:
+                raise RetryableLookupError(
+                    f"InkBunny search returned HTTP {r.status_code}")
+            data = r.json()
             sid = data.get("sid", "")
             if sid:
                 self.ib_sid = sid
                 print(f"✅ InkBunny logged in as {self.ib_username}")
                 return True
+            self.has_inkbunny = False
             notify(f"‼️  InkBunny login failed: {data.get('error_message', data)}")
             return False
         except (requests.RequestException, ValueError) as e:
@@ -1489,7 +1708,8 @@ class TagIntegrator(HydrusMixin):
         sub_ids = self._inkbunny_search_md5(md5)
         if not sub_ids:
             return set(), set(), set()
-        return self._inkbunny_submission_tags(sub_ids)
+        metadata = self._inkbunny_submission_metadata(sub_ids)
+        return metadata.tags, metadata.urls, metadata.force_associate_urls
 
     def _inkbunny_search_md5(self, md5: str, _retry: bool = True) -> List[str]:
         """InkBunny's `md5` param is a boolean toggle — the hash goes in `text`,
@@ -1501,15 +1721,29 @@ class TagIntegrator(HydrusMixin):
                 params={"sid": self.ib_sid, "text": md5, "md5": "yes"},
                 timeout=15,
             )
-            data = r.json() if r.status_code == 200 else {}
+            if r.status_code == 429:
+                self.pace["inkbunny"].backoff(10)
+                raise RetryableLookupError(
+                    "InkBunny rate limited (HTTP 429)")
+            if r.status_code != 200:
+                raise RetryableLookupError(
+                    f"InkBunny search returned HTTP {r.status_code}")
+            data = r.json()
             # Expired/invalid session → re-login once and retry.
-            if data.get("error_code") in ("2", 2) and _retry and self.inkbunny_login():
-                return self._inkbunny_search_md5(md5, _retry=False)
+            if data.get("error_code") in ("2", 2) and _retry:
+                if self.inkbunny_login():
+                    return self._inkbunny_search_md5(md5, _retry=False)
+                self.has_inkbunny = False
+                return []
+            if data.get("error_code"):
+                raise RetryableLookupError(
+                    "InkBunny search error: "
+                    f"{data.get('error_message') or data.get('error_code')}")
             return [str(s.get("submission_id")) for s in data.get("submissions", [])
                     if s.get("submission_id")]
         except (requests.RequestException, ValueError) as e:
-            notify(f"❌ InkBunny search failed: {e}")
-            return []
+            raise RetryableLookupError(
+                f"InkBunny search failed: {e}") from e
 
     @staticmethod
     def _inkbunny_file_count(sub: Dict) -> int:
@@ -1530,22 +1764,39 @@ class TagIntegrator(HydrusMixin):
     def _inkbunny_submission_tags(
             self, sub_ids: List[str],
     ) -> Tuple[Set[str], Set[str], Set[str]]:
+        metadata = self._inkbunny_submission_metadata(sub_ids)
+        return metadata.tags, metadata.urls, metadata.force_associate_urls
+
+    def _inkbunny_submission_metadata(
+            self, sub_ids: List[str],
+    ) -> SourceMetadata:
         tags: Set[str] = set()
         urls: Set[str] = set()
+        notes: Dict[str, str] = {}
         force_associate: Set[str] = set()
+        collect_notes = self.direct_notes_effective()
         self.pace["inkbunny"].wait()
+        if self.cancelled():
+            raise RetryableLookupError("InkBunny submission fetch cancelled")
         try:
             r = self.session.get(
                 "https://inkbunny.net/api_submissions.php",
                 params={"sid": self.ib_sid,
                         "submission_ids": ",".join(sub_ids),
-                        "show_description": "no"},
+                        "show_description": "yes" if collect_notes else "no"},
                 timeout=20,
             )
-            data = r.json() if r.status_code == 200 else {}
+            if r.status_code != 200:
+                raise RetryableLookupError(
+                    f"InkBunny submissions returned HTTP {r.status_code}")
+            data = r.json()
         except (requests.RequestException, ValueError) as e:
-            notify(f"❌ InkBunny submissions fetch failed: {e}")
-            return tags, urls, force_associate
+            raise RetryableLookupError(
+                f"InkBunny submissions fetch failed: {e}") from e
+        if data.get("error_code"):
+            raise RetryableLookupError(
+                "InkBunny submissions error: "
+                f"{data.get('error_message') or data.get('error_code')}")
 
         for sub in data.get("submissions", []):
             tags.add("site:inkbunny")
@@ -1553,6 +1804,15 @@ class TagIntegrator(HydrusMixin):
             if sub_id:
                 url = f"https://inkbunny.net/s/{sub_id}"
                 urls.add(url)
+                if collect_notes:
+                    title = sub.get("title")
+                    if isinstance(title, str) and title.strip():
+                        notes[f"Inkbunny title — submission {sub_id}"] = (
+                            title.strip())
+                    description = sub.get("description")
+                    if isinstance(description, str) and description.strip():
+                        notes[f"Inkbunny description — submission {sub_id}"] = (
+                            description.strip())
                 # Multi-file IB posts share one /s/{id} page. Queuing that
                 # URL through Hydrus's downloader imports every page, not
                 # just the MD5-matched file — associate only instead.
@@ -1569,7 +1829,7 @@ class TagIntegrator(HydrusMixin):
                 if name:
                     tags.add(name)   # InkBunny keywords are freeform/un-namespaced
 
-        return tags, urls, force_associate
+        return SourceMetadata(tags, urls, notes, force_associate)
 
     # ── Danbooru API ─────────────────────────────────────────────────────────
 
@@ -1577,6 +1837,8 @@ class TagIntegrator(HydrusMixin):
         auth = {} if self.danbooru_anon else {"login": self.danbooru_username,
                                               "api_key": self.danbooru_api_key}
         self.pace["danbooru"].wait()
+        if self.cancelled():
+            raise RetryableLookupError("Danbooru lookup cancelled")
         try:
             r = self.session.get(
                 url, params={**params, **auth},
@@ -1588,13 +1850,20 @@ class TagIntegrator(HydrusMixin):
                 notify("⚠️  Danbooru auth rejected – falling back to anonymous access.")
                 self.danbooru_anon = True
                 return self._danbooru_get(url, params)
+            if r.status_code in (401, 403):
+                self.has_danbooru = False
+                notify("‼️  Danbooru anonymous access rejected – disabled "
+                       "until credentials are reloaded.")
+                return []
+            if r.status_code == 404:
+                return {}
             if r.status_code != 200:
-                notify(f"⚠️  Danbooru returned {r.status_code}")
-                return None
+                raise RetryableLookupError(
+                    f"Danbooru returned HTTP {r.status_code}")
             return r.json()
         except (requests.RequestException, ValueError) as e:
-            notify(f"❌ Danbooru request failed: {e}")
-            return None
+            raise RetryableLookupError(
+                f"Danbooru request failed: {e}") from e
 
     def danbooru_lookup_by_md5(self, md5: str) -> Tuple[Set[str], Set[str]]:
         if not md5 or not self.has_danbooru:
@@ -1641,6 +1910,8 @@ class TagIntegrator(HydrusMixin):
 
     def _gelbooru_get(self, params: Dict) -> Optional[object]:
         self.pace["gelbooru"].wait()
+        if self.cancelled():
+            raise RetryableLookupError("Gelbooru lookup cancelled")
         try:
             r = self.session.get(
                 "https://gelbooru.com/index.php",
@@ -1649,13 +1920,20 @@ class TagIntegrator(HydrusMixin):
                 headers={"User-Agent": "HydrusIntegrator/5.0"},
                 timeout=15,
             )
+            if r.status_code in (401, 403):
+                self.has_gelbooru = False
+                notify("‼️  Gelbooru authentication rejected – disabled until "
+                       "credentials are reloaded.")
+                return []
+            if r.status_code == 404:
+                return []
             if r.status_code != 200:
-                notify(f"⚠️  Gelbooru returned {r.status_code}")
-                return None
+                raise RetryableLookupError(
+                    f"Gelbooru returned HTTP {r.status_code}")
             return r.json()
         except (requests.RequestException, ValueError) as e:
-            notify(f"❌ Gelbooru request failed: {e}")
-            return None
+            raise RetryableLookupError(
+                f"Gelbooru request failed: {e}") from e
 
     def gelbooru_lookup_by_md5(self, md5: str) -> Tuple[Set[str], Set[str]]:
         if not md5 or not self.has_gelbooru:
@@ -1700,27 +1978,46 @@ class TagIntegrator(HydrusMixin):
         return tags, urls
 
     def _gelbooru_categorize(self, names: List[str]) -> Dict[str, object]:
-        """One batched call mapping tag name → Gelbooru type int. {} on failure."""
+        """Resolve tag types in one batched call, caching across file hits."""
         if not names:
             return {}
+        result = {
+            name: self._gelbooru_tag_type_cache[name]
+            for name in names if name in self._gelbooru_tag_type_cache
+        }
+        missing = [
+            name for name in names
+            if name not in self._gelbooru_tag_type_cache
+        ]
+        if not missing:
+            return result
         data = self._gelbooru_get(
             {"page": "dapi", "s": "tag", "q": "index", "json": "1",
-             "names": " ".join(names)})
+             "names": " ".join(missing)})
         tags = data.get("tag", []) if isinstance(data, dict) else data
         if isinstance(tags, dict):
             tags = [tags]
         if not isinstance(tags, list):
-            return {}
-        return {t.get("name"): t.get("type")
-                for t in tags if isinstance(t, dict) and t.get("name") is not None}
+            return result
+        fetched = {
+            t.get("name"): t.get("type")
+            for t in tags
+            if isinstance(t, dict) and t.get("name") is not None
+        }
+        self._gelbooru_tag_type_cache.update(fetched)
+        result.update(fetched)
+        return result
 
     # ── Fluffle API ──────────────────────────────────────────────────────────
 
     def fluffle_search(self, img: Path) -> Optional[Dict]:
         thumb = self._prepare_thumb(img)
         if not thumb:
-            return None
+            raise UnusableMediaError(
+                f"Fluffle could not prepare thumbnail for {img.name}")
         self.pace["fluffle"].wait()
+        if self.cancelled():
+            raise RetryableLookupError("Fluffle lookup cancelled")
         try:
             r = self.session.post(
                 self.fluffle_api, headers=self.headers_fluf,
@@ -1730,14 +2027,14 @@ class TagIntegrator(HydrusMixin):
             if r.status_code == 429:
                 notify("⚠️  Fluffle rate limit (429) – backing off 30s")
                 self.pace["fluffle"].backoff(30)
-                return None
+                raise RetryableLookupError("Fluffle rate limited (HTTP 429)")
             if r.status_code != 200:
-                notify(f"⚠️  Fluffle returned {r.status_code}")
-                return None
+                raise RetryableLookupError(
+                    f"Fluffle returned HTTP {r.status_code}")
             return r.json()
         except (requests.RequestException, ValueError) as e:
-            notify(f"❌ Fluffle request failed: {e}")
-            return None
+            raise RetryableLookupError(
+                f"Fluffle request failed: {e}") from e
 
     #: Fluffle match slots, strictly highest confidence first. Each row is a
     #: ``(match class, is-e621)`` pair; ``_fluffle_slot_verdict()`` turns a row
@@ -1889,15 +2186,21 @@ class TagIntegrator(HydrusMixin):
         SauceNAO's own thinner tags. own_tags/own_urls are the fallback for
         matches that resolve to sites we can't re-query.
         """
-        if not self.source_active("saucenao") or self.saucenao_exhausted:
+        if not self.source_active("saucenao"):
             return None, None, set(), set()
+        if self.saucenao_exhausted:
+            raise RetryableLookupError(
+                "SauceNAO quota exhausted; retry on a later run")
         if similarity_threshold is None:
             similarity_threshold = self.saucenao_min_similarity
         thumb = self._prepare_thumb(img)
         if not thumb:
-            return None, None, set(), set()
+            raise UnusableMediaError(
+                f"SauceNAO could not prepare thumbnail for {img.name}")
 
         self.pace["saucenao"].wait()
+        if self.cancelled():
+            raise RetryableLookupError("SauceNAO lookup cancelled")
         try:
             r = self.session.post(
                 "https://saucenao.com/search.php",
@@ -1912,7 +2215,8 @@ class TagIntegrator(HydrusMixin):
                 if self._saucenao_consecutive_429 >= 2:
                     self._disable_saucenao(
                         "repeatedly returned HTTP 429")
-                    return None, None, set(), set()
+                    raise RetryableLookupError(
+                        "SauceNAO repeatedly rate limited")
                 try:
                     retry_after = max(
                         30.0, float(r.headers.get("Retry-After", 30)))
@@ -1922,7 +2226,8 @@ class TagIntegrator(HydrusMixin):
                     f"⚠️  SauceNAO rate limit (429) – pausing "
                     f"{int(retry_after)}s; another 429 will disable it.")
                 self.pace["saucenao"].backoff(retry_after)
-                return None, None, set(), set()
+                raise RetryableLookupError(
+                    "SauceNAO rate limited; retry later")
             self._saucenao_consecutive_429 = 0
             if r.status_code != 200:
                 # SauceNAO normally puts quota state in a successful JSON
@@ -1930,17 +2235,20 @@ class TagIntegrator(HydrusMixin):
                 # error instead. Do not keep spending time retrying it.
                 if "daily" in r.text.lower() and "limit" in r.text.lower():
                     self._disable_saucenao("daily search limit reached")
-                return None, None, set(), set()
+                raise RetryableLookupError(
+                    f"SauceNAO returned HTTP {r.status_code}")
             j = r.json()
             self._saucenao_check_quota(j.get("header", {}))
             if j.get("header", {}).get("status", 0) != 0:
-                return None, None, set(), set()
+                raise RetryableLookupError(
+                    "SauceNAO returned a non-success API status")
             service, post_id = self._saucenao_best_authoritative(
                 j, self.saucenao_auth_similarity)
             tags, urls = self._extract_saucenao_tags(j, similarity_threshold)
             return service, post_id, tags, urls
-        except (requests.RequestException, ValueError):
-            return None, None, set(), set()
+        except (requests.RequestException, ValueError) as e:
+            raise RetryableLookupError(
+                f"SauceNAO request failed: {e}") from e
 
     def _disable_saucenao(self, reason: str) -> None:
         """Disable SauceNAO for the rest of this launcher session once."""
@@ -2015,6 +2323,14 @@ class TagIntegrator(HydrusMixin):
         if service == "gelbooru":
             return self.gelbooru_lookup_by_id(post_id)
         return set(), set()
+
+    def _authoritative_metadata(
+            self, service: str, post_id: str) -> SourceMetadata:
+        """Authoritative lookup retaining richer source metadata when known."""
+        if service == "e621":
+            return self._e621_metadata_by_id(post_id)
+        tags, urls = self._authoritative_lookup(service, post_id)
+        return SourceMetadata(tags=tags, urls=urls)
 
     @staticmethod
     def _is_url(text: str) -> bool:
@@ -2239,7 +2555,7 @@ class TagIntegrator(HydrusMixin):
         return tags, urls
 
     @staticmethod
-    def _append_lines(path: Path, lines: Set[str]) -> int:
+    def _append_lines(path: Path, lines: Set[str]) -> Optional[int]:
         """Append only lines not already present. Returns count written."""
         try:
             existing = set(path.read_text("utf-8").splitlines()) if path.exists() else set()
@@ -2252,17 +2568,17 @@ class TagIntegrator(HydrusMixin):
             return len(diff)
         except Exception as e:
             notify(f"❌ Write failed for {path.name}: {e}")
-            return 0
+            return None
 
     def _write_sidecar_results(self, media: Path, tags: Set[str],
-                               urls: Set[str]) -> None:
+                               urls: Set[str]) -> bool:
         """Write an already-cleaned result payload without touching Hydrus."""
         if not tags and not urls:
             # Nothing to record. Creating an empty ``{"tags": [], "urls": []}``
             # would make has_sidecar() true forever, so index() would count the
             # file as already tagged and never retry it. Leave any existing
             # sidecar (and its content) exactly as it is.
-            return
+            return True
         fmt = (self.settings.output.sidecar_format or "txt").lower()
         if fmt == "json":
             path = self.json_sidecar_path(media)
@@ -2282,11 +2598,18 @@ class TagIntegrator(HydrusMixin):
                     json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
             except Exception as e:
                 notify(f"❌ Write failed for {path.name}: {e}")
-            return
+                return False
+            return True
+        complete = True
         if tags:
-            self._append_lines(self.tag_sidecar_path(media), tags)
+            complete = (
+                self._append_lines(self.tag_sidecar_path(media), tags)
+                is not None) and complete
         if urls:
-            self._append_lines(self.url_sidecar_path(media), urls)
+            complete = (
+                self._append_lines(self.url_sidecar_path(media), urls)
+                is not None) and complete
+        return complete
 
     @staticmethod
     def _pdf_page_base_tags(media: Path) -> Set[str]:
@@ -2309,6 +2632,7 @@ class TagIntegrator(HydrusMixin):
             exact_match: bool = False,
             url_policy: Optional[UrlWritePolicy] = None,
             force_associate_urls: Optional[Set[str]] = None,
+            notes: Optional[Dict[str, str]] = None,
     ) -> Optional[str]:
         """Push to Hydrus and/or write sidecars. Returns the file's SHA-256 when
         it was pushed to Hydrus (so the caller can cache it), else None.
@@ -2320,34 +2644,56 @@ class TagIntegrator(HydrusMixin):
         *force_associate_urls* are never queued through Hydrus's downloader
         (see multi-file InkBunny submissions).
         """
+        return self.write_results_detailed(
+            media, tags, urls, known_sha256=known_sha256,
+            exact_match=exact_match, url_policy=url_policy,
+            force_associate_urls=force_associate_urls,
+            notes=notes).sha256
+
+    def write_results_detailed(
+            self, media: Path, tags: Set[str], urls: Set[str],
+            known_sha256: Optional[str] = None,
+            exact_match: bool = False,
+            url_policy: Optional[UrlWritePolicy] = None,
+            force_associate_urls: Optional[Set[str]] = None,
+            notes: Optional[Dict[str, str]] = None,
+    ) -> WriteOutcome:
+        """Write configured sinks and retain whether every write succeeded."""
         # Drop "artist unknown / anonymous" placeholder tags from every source
         # before writing — they're noise in a Hydrus library.
         tags = {t for t in tags if not _is_junk_tag(t)}
         urls = {u for u in urls if u}
         force_associate = {u for u in (force_associate_urls or set()) if u}
+        notes = {str(name): str(text) for name, text in (notes or {}).items()
+                 if str(name).strip() and str(text).strip()}
 
         if url_policy is None:
             url_policy = (
                 UrlWritePolicy.ENRICH_HASH_POSTS if exact_match
                 else UrlWritePolicy.ASSOCIATE_ONLY)
 
-        if self.has_hydrus and (tags or urls):
-            sha256 = self._hydrus_push(
+        if self.has_hydrus and (tags or urls or notes):
+            sha256, hydrus_complete = self._hydrus_push_detailed(
                 media, tags, urls, known_sha256, url_policy=url_policy,
-                force_associate_urls=force_associate)
+                force_associate_urls=force_associate, notes=notes)
+            sidecar_complete = True
             if self.write_sidecars:
-                self._write_sidecar_results(media, tags, urls)
-            return sha256
+                sidecar_complete = self._write_sidecar_results(
+                    media, tags, urls)
+            return WriteOutcome(
+                sha256, hydrus_complete and sidecar_complete)
 
         if self.write_sidecars:
-            self._write_sidecar_results(media, tags, urls)
-        return None
+            return WriteOutcome(
+                None, self._write_sidecar_results(media, tags, urls))
+        return WriteOutcome(None, not (tags or urls))
 
     def _propagate_duplicate_results(
             self, root: Path, canonical: FileItem, duplicates: List[FileItem],
             tags: Set[str], urls: Set[str], sources: List[str],
             canonical_sha256: Optional[str],
             force_associate_urls: Optional[Set[str]] = None,
+            notes: Optional[Dict[str, str]] = None,
     ) -> int:
         """Give byte-identical filesystem copies the canonical result too.
 
@@ -2366,27 +2712,50 @@ class TagIntegrator(HydrusMixin):
         except ValueError:
             canonical_rel = str(canonical.path)
 
+        completed = 0
         for duplicate in duplicates:
             copy_tags = tags
             if canonical.perceptual_only:
                 # Each rendered PDF page already owns its own comic:/page:
                 # sidecar. Do not append the canonical page number to a copy.
                 copy_tags = tags - self._pdf_page_base_tags(canonical.path)
+            complete = True
             if self.write_sidecars:
-                self._write_sidecar_results(duplicate.path, copy_tags, urls)
+                complete = self._write_sidecar_results(
+                    duplicate.path, copy_tags, urls)
             # Normally this is the canonical's Hydrus SHA-256, which proves
             # the tags already belong to this same byte-identical record. If
             # its earlier push failed, let this copy have one recovery attempt.
             sha256 = canonical_sha256
-            if self.has_hydrus and not sha256 and (copy_tags or urls):
-                sha256 = self._hydrus_push(
+            if self.has_hydrus and not sha256 and (copy_tags or urls or notes):
+                sha256, hydrus_complete = self._hydrus_push_detailed(
                     duplicate.path, copy_tags, urls,
-                    force_associate_urls=force_associate)
+                    force_associate_urls=force_associate, notes=notes)
+                complete = complete and hydrus_complete
+            if not complete:
+                continue
             duplicate.ledger.record(
                 duplicate.path.name, duplicate.size, duplicate.mtime,
                 duplicate.md5, "matched", sources,
-                duplicate_of=canonical_rel, sha256=sha256)
-        return len(duplicates)
+                duplicate_of=canonical_rel, sha256=sha256,
+                direct_notes_applied=self.direct_notes_effective())
+            completed += 1
+        return completed
+
+    @staticmethod
+    def _resolve_duplicate_nomatches(
+            root: Path, canonical: FileItem,
+            duplicates: List[FileItem]) -> None:
+        """Promote pending copies once their canonical is a clean no-match."""
+        try:
+            canonical_rel = str(canonical.path.relative_to(root))
+        except ValueError:
+            canonical_rel = str(canonical.path)
+        for duplicate in duplicates:
+            duplicate.ledger.record(
+                duplicate.path.name, duplicate.size, duplicate.mtime,
+                duplicate.md5, "duplicate", [],
+                duplicate_of=canonical_rel)
 
     @staticmethod
     def _read_result_sidecar(path: Path) -> Set[str]:
@@ -2407,7 +2776,9 @@ class TagIntegrator(HydrusMixin):
             except OSError:
                 continue
             ledger = ledger_mgr.get(canonical_path.parent)
-            if ledger.status_for(canonical_path.name, st.st_size, st.st_mtime) != "matched":
+            if ledger.status_for(
+                    canonical_path.name, st.st_size, st.st_mtime,
+                    self.direct_notes_effective()) != "matched":
                 continue
             rec = ledger.records.get(canonical_path.name) or {}
             canonical = FileItem(
@@ -2480,12 +2851,33 @@ class TagIntegrator(HydrusMixin):
         for pdf in pdfs:
             out_dir = pdf.parent / pdf.stem
             page_dirs.add(out_dir)
-            already = out_dir.is_dir() and any(
-                f.suffix.lower() == ".png" for f in out_dir.iterdir())
-            if already:
+            if self._valid_pdf_render(pdf, out_dir):
                 continue                        # rendered on a previous run
             jobs.append(pdf)
         return page_dirs, jobs
+
+    @staticmethod
+    def _valid_pdf_render(pdf: Path, out_dir: Path) -> bool:
+        """True only for an atomically completed render of these PDF bytes."""
+        manifest_path = out_dir / PDF_COMPLETE_FILE
+        try:
+            data = json.loads(manifest_path.read_text("utf-8"))
+            source = data.get("source") if isinstance(data, dict) else None
+            pages = data.get("pages") if isinstance(data, dict) else None
+            st = pdf.stat()
+            if not isinstance(source, dict) or not isinstance(pages, list):
+                return False
+            if (source.get("size") != st.st_size
+                    or source.get("mtime_ns") != st.st_mtime_ns
+                    or not pages):
+                return False
+            return all(
+                isinstance(name, str)
+                and Path(name).name == name
+                and (out_dir / name).is_file()
+                for name in pages)
+        except (OSError, ValueError, TypeError):
+            return False
 
     def _pdf_sidecar_patterns(self) -> List[str]:
         """Sidecar name patterns a PDF page render could have written.
@@ -2520,6 +2912,12 @@ class TagIntegrator(HydrusMixin):
                 path.unlink()
             except OSError:
                 pass
+        try:
+            (out_dir / PDF_COMPLETE_FILE).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
     def render_pdf_jobs(
             self, pdfs: List[Path], dpi: int,
@@ -2536,6 +2934,9 @@ class TagIntegrator(HydrusMixin):
         for pdf in pdfs:
             if self.cancelled():
                 break
+            # Jobs are scheduled only when no valid completion manifest exists.
+            # Clear stale/partial page files before rendering from page 1.
+            self._clear_partial_pdf_render(pdf)
             attempt_dpi = dpi
             pdf_generated: List[Path] = []
             entry = meta_map.get(str(pdf.resolve())) or meta_map.get(str(pdf)) or {}
@@ -2554,6 +2955,22 @@ class TagIntegrator(HydrusMixin):
                         should_cancel=self.cancelled,
                         comic=comic,
                         creator=creator)
+                    if self.cancelled() or not pdf_generated:
+                        self._clear_partial_pdf_render(pdf)
+                        pdf_generated = []
+                    else:
+                        st = pdf.stat()
+                        atomic_write_text(
+                            pdf.parent / pdf.stem / PDF_COMPLETE_FILE,
+                            json.dumps({
+                                "version": 1,
+                                "source": {
+                                    "size": st.st_size,
+                                    "mtime_ns": st.st_mtime_ns,
+                                },
+                                "dpi": attempt_dpi,
+                                "pages": [path.name for path in pdf_generated],
+                            }, ensure_ascii=False, indent=2) + "\n")
                     break
                 except Exception as e:
                     oversized = "overly large image" in str(e).lower()
@@ -2583,6 +3000,44 @@ class TagIntegrator(HydrusMixin):
             return "video"
         return None
 
+    def _directory_manifest(
+            self, directory: Path,
+            stats: Dict[str, os.stat_result]) -> str:
+        """Digest the exact directory state used by the wholesale-skip path.
+
+        Count + total bytes cannot distinguish renames, swaps, same-size edits,
+        or deleted sidecars. This manifest includes names, nanosecond mtimes,
+        and recognized FurTag sidecar state while storing no absolute paths.
+        """
+        entries: List[object] = []
+        for name in sorted(stats):
+            media = directory / name
+            st = stats[name]
+            sidecars: List[Tuple[str, int, int]] = []
+            candidates = (
+                self._tag_sidecar_candidates(media)
+                + self._url_sidecar_candidates(media)
+                + self._json_sidecar_candidates(media)
+            )
+            for sidecar in dict.fromkeys(candidates):
+                try:
+                    sidecar_st = sidecar.stat()
+                except OSError:
+                    continue
+                if (sidecar in self._json_sidecar_candidates(media)
+                        and not _looks_like_furtag_json_sidecar(sidecar)):
+                    continue
+                sidecars.append((
+                    sidecar.name,
+                    sidecar_st.st_size,
+                    sidecar_st.st_mtime_ns,
+                ))
+            entries.append((
+                name, st.st_size, st.st_mtime_ns, sorted(sidecars)))
+        encoded = json.dumps(
+            entries, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     def index(self, root: Path, ledger_mgr: LedgerManager,
               pdf_page_dirs: Set[Path],
               excluded_dirs: Optional[Set[Path]] = None
@@ -2592,9 +3047,9 @@ class TagIntegrator(HydrusMixin):
         (for `finalize_dir_fingerprints` to potentially seal afterwards).
 
         Each directory carries its own Ledger (found in-place, or created).
-        Before checking any individual file, a directory whose ledger has a
-        sealed fingerprint (`file_count`, `total_size`) matching the current
-        listing is skipped wholesale — no stat, hash, or lookup work at all.
+        Before checking any individual record, a directory whose ledger has a
+        sealed manifest matching names, sizes, mtimes, and sidecar state is
+        skipped wholesale — no hash or lookup work at all.
         Otherwise it falls back to the old per-file check: skip files with an
         existing tag sidecar, then ones the ledger already recorded as
         matched/no-match (unchanged size+mtime). PNGs inside a `pdf_page_dirs`
@@ -2638,7 +3093,10 @@ class TagIntegrator(HydrusMixin):
                 stats[fn] = st
                 total_size += st.st_size
             count = len(stats)
-            if count and dir_ledger.fingerprint_matches(count, total_size):
+            manifest = self._directory_manifest(dp_path, stats)
+            if count and dir_ledger.fingerprint_matches(
+                    count, total_size, manifest,
+                    self.direct_notes_effective()):
                 media += count
                 seen += count
                 skipped_dirs += 1
@@ -2653,11 +3111,24 @@ class TagIntegrator(HydrusMixin):
                 p = dp_path / fn
                 kind = self._media_kind(fn)
                 is_pdf_page = kind == "image" and p.suffix.lower() == ".png" and p.parent in pdf_page_dirs
-                if self.has_sidecar(p) and not is_pdf_page:
+                has_sidecar = self.has_sidecar(p)
+                note_backfill = (
+                    self.direct_notes_effective()
+                    and dir_ledger.needs_direct_notes(
+                        fn, st.st_size, st.st_mtime))
+                if has_sidecar and not is_pdf_page and not note_backfill:
                     tagged += 1
                     continue
 
-                status = dir_ledger.status_for(fn, st.st_size, st.st_mtime)
+                status = dir_ledger.status_for(
+                    fn, st.st_size, st.st_mtime,
+                    self.direct_notes_effective())
+                # A successful matched record is not enough when sidecars are
+                # an active output sink and its sidecar disappeared. Retry the
+                # idempotent lookup/write so user-deleted metadata is restored.
+                if (status == "matched" and self.write_sidecars
+                        and not has_sidecar and not is_pdf_page):
+                    status = None
                 if status == "duplicate":
                     canonical = dir_ledger.records.get(fn, {}).get("duplicate_of", "")
                     if canonical and not (root / canonical).is_file():
@@ -2698,7 +3169,9 @@ class TagIntegrator(HydrusMixin):
             except (OSError, ValueError):
                 continue
             ledger = ledger_mgr.get(path.parent)
-            status = ledger.status_for(path.name, st.st_size, st.st_mtime)
+            status = ledger.status_for(
+                path.name, st.st_size, st.st_mtime,
+                self.direct_notes_effective())
             if status in RESOLVED_LEDGER_STATUSES:
                 continue
             items.append(FileItem(
@@ -2728,6 +3201,7 @@ class TagIntegrator(HydrusMixin):
             count = 0
             total_size = 0
             complete = True
+            stats: Dict[str, os.stat_result] = {}
             for fn in names:
                 kind = self._media_kind(fn)
                 if kind is None:
@@ -2740,16 +3214,27 @@ class TagIntegrator(HydrusMixin):
                     break
                 count += 1
                 total_size += st.st_size
+                stats[fn] = st
                 is_pdf_page = kind == "image" and p.suffix.lower() == ".png" and p.parent in pdf_page_dirs
-                if self.has_sidecar(p) and not is_pdf_page:
+                note_backfill = (
+                    self.direct_notes_effective()
+                    and dir_ledger.needs_direct_notes(
+                        fn, st.st_size, st.st_mtime))
+                if (self.has_sidecar(p) and not is_pdf_page
+                        and not note_backfill):
                     continue
-                if dir_ledger.status_for(fn, st.st_size, st.st_mtime) not in (
+                if dir_ledger.status_for(
+                        fn, st.st_size, st.st_mtime,
+                        self.direct_notes_effective()) not in (
                         RESOLVED_LEDGER_STATUSES):
                     complete = False
                     break
 
             if complete and count:
-                dir_ledger.mark_dir_complete(count, total_size)
+                dir_ledger.mark_dir_complete(
+                    count, total_size,
+                    self._directory_manifest(dp_path, stats),
+                    self.direct_notes_effective())
 
     # ── Progress events ──────────────────────────────────────────────────────
 
@@ -2810,9 +3295,10 @@ class TagIntegrator(HydrusMixin):
 
         An unchanged earlier matched/no-match ledger record wins over a new
         candidate. Otherwise the first item in the stable videos/images +
-        natural-path order is canonical. Skipped copies receive a `duplicate`
-        ledger status and `duplicate_of` path, then all valid duplicate records
-        are rendered to ``duplicates.log`` in the scan root.
+        natural-path order is canonical. Skipped copies remain
+        ``duplicate_pending`` until the canonical's output succeeds (or it is a
+        clean no-match), preventing failed sidecar propagation from being
+        checkpointed as complete.
         """
         canonical_by_md5: Dict[str, Path] = {}
         for ledger in sorted(ledger_mgr.touched(), key=lambda led: str(led.dir)):
@@ -2825,7 +3311,9 @@ class TagIntegrator(HydrusMixin):
                     st = path.stat()
                 except OSError:
                     continue
-                if ledger.status_for(name, st.st_size, st.st_mtime) not in (
+                if ledger.status_for(
+                        name, st.st_size, st.st_mtime,
+                        self.direct_notes_effective()) not in (
                         "matched", "nomatch"):
                     continue
                 md5 = rec.get("md5")
@@ -2855,7 +3343,8 @@ class TagIntegrator(HydrusMixin):
             except ValueError:
                 canonical_rel = str(canonical)
             item.ledger.record(item.path.name, item.size, item.mtime, item.md5,
-                               "duplicate", [], duplicate_of=canonical_rel)
+                               "duplicate_pending", [],
+                               duplicate_of=canonical_rel)
             duplicate_groups.setdefault(canonical, []).append(item)
             duplicate_count += 1
 
@@ -2906,23 +3395,39 @@ class TagIntegrator(HydrusMixin):
 
     def _hash_lookup(
             self, service: str, md5: str,
-    ) -> Tuple[Set[str], Set[str], Set[str]]:
-        """Returns ``(tags, urls, force_associate_urls)`` for one hash service."""
+    ) -> SourceMetadata:
+        """Return the complete metadata payload for one exact-hash source."""
         if service == "e621":
-            t, u = self.e621_lookup_by_md5(md5)
-            return t, u, set()
+            return self._e621_metadata_by_md5(md5)
         if service == "inkbunny":
-            return self.inkbunny_lookup_by_md5(md5)
+            if not md5 or not self.has_inkbunny:
+                return SourceMetadata()
+            sub_ids = self._inkbunny_search_md5(md5)
+            return (self._inkbunny_submission_metadata(sub_ids)
+                    if sub_ids else SourceMetadata())
         if service == "danbooru":
             t, u = self.danbooru_lookup_by_md5(md5)
-            return t, u, set()
+            return SourceMetadata(tags=t, urls=u)
         if service == "gelbooru":
             t, u = self.gelbooru_lookup_by_md5(md5)
-            return t, u, set()
-        return set(), set(), set()
+            return SourceMetadata(tags=t, urls=u)
+        return SourceMetadata()
+
+    @staticmethod
+    def _coerce_source_metadata(value) -> SourceMetadata:
+        """Accept pre-payload test hooks and third-party overrides."""
+        if isinstance(value, SourceMetadata):
+            return value
+        if isinstance(value, tuple):
+            tags = set(value[0]) if len(value) > 0 else set()
+            urls = set(value[1]) if len(value) > 1 else set()
+            force = set(value[2]) if len(value) > 2 else set()
+            notes = dict(value[3]) if len(value) > 3 else {}
+            return SourceMetadata(tags, urls, notes, force)
+        return SourceMetadata()
 
     def hash_tier(self, item: FileItem, ex: cf.Executor
-                  ) -> Tuple[Set[str], Set[str], List[str], Set[str]]:
+                  ) -> HashTierResult:
         """Query every enabled booru for this file's MD5 concurrently and merge.
         MD5 identity is byte-exact, so there is zero false-positive risk and the
         tag sets genuinely differ — never short-circuit between them.
@@ -2932,13 +3437,11 @@ class TagIntegrator(HydrusMixin):
         multi-file InkBunny submission pages.
         """
         services = self.enabled_hash_services()
-        tags: Set[str] = set()
-        urls: Set[str] = set()
-        force_associate: Set[str] = set()
+        metadata = SourceMetadata()
         hit: Set[str] = set()
         item.lookup_errors.clear()
         if not item.md5 or not services:
-            return tags, urls, [], force_associate
+            return HashTierResult(metadata, [])
 
         def _tick(state: Dict[str, str]) -> None:
             # Per-site ticker as a status event, so the GUI's sub-status slot
@@ -2954,7 +3457,7 @@ class TagIntegrator(HydrusMixin):
         for fut in cf.as_completed(futs):
             s = futs[fut]
             try:
-                t, u, fa = fut.result()
+                found = self._coerce_source_metadata(fut.result())
             except Exception as e:
                 # Network/HTTP failure — distinct from a clean "not found" miss,
                 # so surface it as ⚠ rather than ✗ (the file may still exist there).
@@ -2964,10 +3467,8 @@ class TagIntegrator(HydrusMixin):
                 state[s] = "err"
                 _tick(state)
                 continue
-            if t or u:
-                tags |= t
-                urls |= u
-                force_associate |= fa
+            if found.tags or found.urls or found.notes:
+                metadata.merge(found)
                 hit.add(s)
                 state[s] = "hit"
             else:
@@ -2975,19 +3476,18 @@ class TagIntegrator(HydrusMixin):
             _tick(state)
 
         sources = [s for s in services if s in hit]   # deterministic order
-        return tags, urls, sources, force_associate
+        return HashTierResult(metadata, sources)
 
     # ── Perceptual tier (Fluffle → SauceNAO, sequential) ─────────────────────
 
     def perceptual_tier(self, item: FileItem
-                        ) -> Tuple[Set[str], Set[str], List[str], Optional[Dict]]:
+                        ) -> PerceptualTierResult:
         """Run Fluffle → SauceNAO. Returns (tags, urls, sources, review_raw).
 
         When *review_raw* is set, the caller should queue a PendingReview and
         not write final results / nomatch for this file.
         """
-        tags: Set[str] = set()
-        urls: Set[str] = set()
+        metadata = SourceMetadata()
         sources: List[str] = []
         review_raw: Optional[Dict] = None
         fp = item.path
@@ -3001,24 +3501,23 @@ class TagIntegrator(HydrusMixin):
             if js:
                 f_tags, f_urls, md5_u, pid, review_raw = self.find_best_exact_match(js)
                 if f_tags or f_urls:
-                    tags |= f_tags
-                    urls |= f_urls
+                    metadata.tags |= f_tags
+                    metadata.urls |= f_urls
                     # A perceptual hit only tells us which post this is — re-query
                     # e621 by ID for the full, properly-namespaced tag set.
                     if self.source_active("e621") and (pid or md5_u):
                         _status("Fluffle → e621 enrich…")
-                        e_tags, e_urls = (self.e621_lookup_by_id(pid)
-                                          if pid else (set(), set()))
-                        if not e_tags and md5_u:
-                            e_tags, e_urls = self.e621_lookup_by_md5(md5_u)
-                        tags |= e_tags
-                        urls |= e_urls
+                        e_metadata = (self._e621_metadata_by_id(pid)
+                                      if pid else SourceMetadata())
+                        if not (e_metadata.tags or e_metadata.urls) and md5_u:
+                            e_metadata = self._e621_metadata_by_md5(md5_u)
+                        metadata.merge(e_metadata)
                     sources.append("fluffle")
                     review_raw = None  # auto-accepted; no review needed
 
         # SauceNAO is the slowest stage (6s pace, longer after a quota backoff),
         # so don't start it for a file the user has already cancelled out of.
-        if (not (tags or urls) and review_raw is None
+        if (not (metadata.tags or metadata.urls) and review_raw is None
                 and not self.cancelled() and self.source_active("saucenao")):
             _status("SauceNAO…")
             service, rid, s_tags, s_urls = self.saucenao_search(fp)
@@ -3026,23 +3525,23 @@ class TagIntegrator(HydrusMixin):
                 # High-confidence booru match → pull the authoritative,
                 # properly-namespaced tag set instead of SauceNAO's own.
                 _status(f"SauceNAO → {service} enrich…")
-                a_tags, a_urls = self._authoritative_lookup(service, rid)
-                if a_tags or a_urls:
-                    tags |= a_tags
-                    urls |= a_urls | s_urls
+                authoritative = self._authoritative_metadata(service, rid)
+                if authoritative.tags or authoritative.urls:
+                    metadata.merge(authoritative)
+                    metadata.urls |= s_urls
                     sources.append("saucenao")
                 elif s_tags or s_urls:      # post gone — use own tags
-                    tags |= s_tags
-                    urls |= s_urls
+                    metadata.tags |= s_tags
+                    metadata.urls |= s_urls
                     sources.append("saucenao")
             elif s_tags or s_urls:
                 # Resolved to a site we can't re-query (FA/Twitter/...) —
                 # SauceNAO's own thinner tags are the best we've got.
-                tags |= s_tags
-                urls |= s_urls
+                metadata.tags |= s_tags
+                metadata.urls |= s_urls
                 sources.append("saucenao")
 
-        return tags, urls, sources, review_raw
+        return PerceptualTierResult(metadata, sources, review_raw)
 
     def _queue_pending_review(self, item: FileItem, root: Path,
                               review_raw: Dict) -> PendingReview:
@@ -3087,23 +3586,35 @@ class TagIntegrator(HydrusMixin):
         if approve:
             tags: Set[str] = set(pending.fluffle_tags or [])
             urls: Set[str] = set(pending.fluffle_urls or [])
+            notes: Dict[str, str] = {}
             sources = ["fluffle"]
             pid = pending.post_id
             md5_u = pending.md5_from_url
             if self.source_active("e621") and (pid or md5_u):
-                e_tags, e_urls = (self.e621_lookup_by_id(pid)
-                                  if pid else (set(), set()))
-                if not e_tags and md5_u:
-                    e_tags, e_urls = self.e621_lookup_by_md5(md5_u)
-                tags |= e_tags
-                urls |= e_urls
+                e_metadata = (self._e621_metadata_by_id(pid)
+                              if pid else SourceMetadata())
+                if not (e_metadata.tags or e_metadata.urls) and md5_u:
+                    e_metadata = self._e621_metadata_by_md5(md5_u)
+                tags |= e_metadata.tags
+                urls |= e_metadata.urls
+                notes.update(e_metadata.notes)
+                if e_metadata.tags or e_metadata.urls:
+                    sources.append("e621")
             # Only a genuine rendered PDF page gets comic:/page: — an ordinary
             # PNG would otherwise pick up comic:<its folder name>.
             if _is_pdf_page_render(path):
                 tags |= self._pdf_page_base_tags(path)
-            sha = self.write_results(path, tags, urls)
+            outcome = self.write_results_detailed(
+                path, tags, urls, notes=notes)
+            if not outcome.complete:
+                notify(
+                    f"⚠️  Metadata output incomplete for {path.name}; "
+                    "keeping it in the review queue for retry.")
+                return False
+            sha = outcome.sha256
             ledger.record(path.name, st.st_size, st.st_mtime, pending.md5,
-                          "matched", sources, sha256=sha)
+                          "matched", sources, sha256=sha,
+                          direct_notes_applied=self.direct_notes_effective())
         else:
             sha = self.write_unmatched(path)
             ledger.record(path.name, st.st_size, st.st_mtime, pending.md5,
@@ -3215,8 +3726,12 @@ class TagIntegrator(HydrusMixin):
                       pdf_dpi: Optional[int]) -> ScanSummary:
         if options and options.settings_override is not None:
             self.apply_settings(options.settings_override)
-        self.cancel_event = cancel_event or threading.Event()
-        self.cancel_event.clear()
+        if cancel_event is None:
+            self.cancel_event = threading.Event()
+        else:
+            # A caller owns this event. If it was set between worker creation
+            # and pipeline entry, clearing it here would lose the cancellation.
+            self.cancel_event = cancel_event
         self._fatal_network_error = False
         self._bind_cancel_to_pacers()
         summary = ScanSummary(
@@ -3363,16 +3878,22 @@ class TagIntegrator(HydrusMixin):
                 item: FileItem, tags: Set[str], urls: Set[str],
                 sources: List[str], sha256: Optional[str],
                 force_associate_urls: Optional[Set[str]] = None,
+                notes: Optional[Dict[str, str]] = None,
         ) -> None:
             nonlocal duplicates_tagged
             with duplicate_lock:
                 copies = duplicate_groups.pop(item.path, [])
             copied = self._propagate_duplicate_results(
                 root, item, copies, tags, urls, sources, sha256,
-                force_associate_urls=force_associate_urls)
+                force_associate_urls=force_associate_urls, notes=notes)
             if copied:
                 with counts_lock:
                     duplicates_tagged += copied
+
+        def _resolve_duplicate_nomatches(item: FileItem) -> None:
+            with duplicate_lock:
+                copies = duplicate_groups.pop(item.path, [])
+            self._resolve_duplicate_nomatches(root, item, copies)
 
         save_lock = threading.Lock()
         save_counter = 0
@@ -3415,7 +3936,11 @@ class TagIntegrator(HydrusMixin):
                     self._emit("start_file", track="perceptual", index=idx,
                                current=item.path.name,
                                nxt=f"{perceptual_q.qsize()} queued")
-                    tags, urls, sources, review_raw = self.perceptual_tier(item)
+                    perceptual_result = self.perceptual_tier(item)
+                    tags, urls, sources, review_raw = perceptual_result
+                    notes = (perceptual_result.metadata.notes
+                             if isinstance(perceptual_result, PerceptualTierResult)
+                             else {})
                     if review_raw is not None and not (tags or urls):
                         self._queue_pending_review(item, root, review_raw)
                         _bump_pending()
@@ -3425,12 +3950,30 @@ class TagIntegrator(HydrusMixin):
                     elif tags or urls:
                         if item.perceptual_only:
                             tags = set(tags) | self._pdf_page_base_tags(item.path)
-                        sha = self.write_results(
-                            item.path, tags, urls, item.sha256)
+                        outcome = self.write_results_detailed(
+                            item.path, tags, urls, item.sha256,
+                            **({"notes": notes} if notes else {}))
+                        if not outcome.complete:
+                            item.lookup_errors.add("output")
+                            if outcome.sha256:
+                                item.ledger.cache_sha256(
+                                    item.path.name, item.size, item.mtime,
+                                    outcome.sha256)
+                            self._emit(
+                                "finish_file", track="perceptual",
+                                result="retry later — output incomplete",
+                                extra={"retryable": True,
+                                       "failed_sources": ["output"]})
+                            _maybe_save_ledgers()
+                            continue
+                        sha = outcome.sha256
                         item.ledger.record(item.path.name, item.size, item.mtime,
                                             item.md5, "matched", sources,
-                                            sha256=sha)
-                        _propagate_duplicates(item, tags, urls, sources, sha)
+                                            sha256=sha,
+                                            direct_notes_applied=
+                                                self.direct_notes_effective())
+                        _propagate_duplicates(
+                            item, tags, urls, sources, sha, notes=notes)
                         source_totals = _bump_hit(sources)
                         result = f"{'+'.join(sources)}  ({len(tags)} tags)"
                         self._emit("finish_file", track="perceptual",
@@ -3449,9 +3992,22 @@ class TagIntegrator(HydrusMixin):
                             item.ledger.record(
                                 item.path.name, item.size, item.mtime,
                                 item.md5, "nomatch", [], sha256=sha)
+                            _resolve_duplicate_nomatches(item)
                             _bump_miss()
                             self._emit("finish_file", track="perceptual",
                                        result="— no match")
+                    _maybe_save_ledgers()
+                except UnusableMediaError as e:
+                    item.ledger.record(
+                        item.path.name, item.size, item.mtime,
+                        item.md5, "unreadable", [])
+                    _resolve_duplicate_nomatches(item)
+                    self._emit(
+                        "finish_file", track="perceptual",
+                        result="skipped — unreadable media",
+                        extra={"retryable": False,
+                               "failed_sources": ["local_media"]})
+                    notify(f"⚠️  {e}; marked unreadable until the file changes.")
                     _maybe_save_ledgers()
                 except Exception as e:
                     if not self._stop_for_broken_ca_bundle(e):
@@ -3486,30 +4042,79 @@ class TagIntegrator(HydrusMixin):
                     self._emit("start_file", track="hash", index=i + 1,
                                current=item.path.name, nxt=nxt or "")
 
-                    tags, urls, sources, force_assoc = self.hash_tier(item, ex)
+                    hash_result = self.hash_tier(item, ex)
+                    tags, urls, sources, force_assoc = hash_result
+                    notes = (hash_result.metadata.notes
+                             if isinstance(hash_result, HashTierResult) else {})
                     if tags or urls:
-                        sha = self.write_results(
+                        # Hash sources are additive: an e621 hit does not make a
+                        # failed InkBunny/Danbooru/Gelbooru lookup irrelevant.
+                        # Committing the partial hit would permanently skip the
+                        # failed source on later scans and could lose its tags or
+                        # description. Keep the cached MD5 unresolved and retry
+                        # the complete fan-out later.
+                        if item.lookup_errors:
+                            failed = "+".join(sorted(item.lookup_errors))
+                            self._emit(
+                                "finish_file", track="hash",
+                                result=(
+                                    f"partial match — retry later ({failed})"),
+                                extra={"retryable": True,
+                                       "failed_sources":
+                                           sorted(item.lookup_errors)})
+                            _maybe_save_ledgers()
+                            continue
+                        outcome = self.write_results_detailed(
                             item.path, tags, urls, item.sha256,
                             url_policy=UrlWritePolicy.ENRICH_HASH_POSTS,
-                            force_associate_urls=force_assoc)
+                            force_associate_urls=force_assoc,
+                            **({"notes": notes} if notes else {}))
+                        if not outcome.complete:
+                            item.lookup_errors.add("output")
+                            if outcome.sha256:
+                                item.ledger.cache_sha256(
+                                    item.path.name, item.size, item.mtime,
+                                    outcome.sha256)
+                            self._emit(
+                                "finish_file", track="hash",
+                                result="retry later — output incomplete",
+                                extra={"retryable": True,
+                                       "failed_sources": ["output"]})
+                            _maybe_save_ledgers()
+                            continue
+                        sha = outcome.sha256
                         item.ledger.record(item.path.name, item.size, item.mtime,
                                             item.md5, "matched", sources,
-                                            sha256=sha)
+                                            sha256=sha,
+                                            direct_notes_applied=
+                                                self.direct_notes_effective())
                         _propagate_duplicates(
                             item, tags, urls, sources, sha,
-                            force_associate_urls=force_assoc)
+                            force_associate_urls=force_assoc, notes=notes)
                         source_totals = _bump_hit(sources)
                         result = f"{'+'.join(sources)}  ({len(tags)} tags)"
                         self._emit(
                             "finish_file", track="hash", result=result,
                             source_hits=source_totals)
                     elif item.kind == "image":
-                        perceptual_q.put(item)
-                        # One grow per queued file — the observer is the only
-                        # write path, so the perceptual total can't double-count.
-                        self._emit("grow", track="perceptual")
-                        self._emit("finish_file", track="hash",
-                                   result="no hash match → perceptual")
+                        if item.lookup_errors:
+                            # Do not spend slow perceptual quota—or commit a
+                            # weaker match—while any exact, additive hash source
+                            # still has an unknown result.
+                            failed = "+".join(sorted(item.lookup_errors))
+                            self._emit(
+                                "finish_file", track="hash",
+                                result=f"retry later — {failed} error",
+                                extra={"retryable": True,
+                                       "failed_sources":
+                                           sorted(item.lookup_errors)})
+                        else:
+                            perceptual_q.put(item)
+                            # One grow per queued file — the observer is the only
+                            # write path, so the perceptual total can't double-count.
+                            self._emit("grow", track="perceptual")
+                            self._emit("finish_file", track="hash",
+                                       result="no hash match → perceptual")
                     else:                                  # video: hash-only
                         if item.lookup_errors:
                             failed = "+".join(sorted(item.lookup_errors))
@@ -3524,6 +4129,7 @@ class TagIntegrator(HydrusMixin):
                             item.ledger.record(
                                 item.path.name, item.size, item.mtime,
                                 item.md5, "nomatch", [], sha256=sha)
+                            _resolve_duplicate_nomatches(item)
                             _bump_miss()
                             self._emit("finish_file", track="hash",
                                        result="— no match")

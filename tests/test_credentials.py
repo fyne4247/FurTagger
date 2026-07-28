@@ -65,6 +65,29 @@ class TestSecureStoreMerge(unittest.TestCase):
         self.assertEqual(cfg.get("e621_api_key"), "fake-test-e621-key")
         self.assertEqual(cfg.get("hydrus_tag_service"), "my gui tags")
 
+    def test_reload_clears_stale_source_and_hydrus_capabilities(self):
+        from furtag import TagIntegrator
+        from furtag_settings import Settings
+
+        ti = TagIntegrator(settings=Settings())
+        ti.has_e621 = True
+        ti.has_inkbunny = True
+        ti.ib_sid = "stale-session"
+        ti.has_hydrus = True
+        ti.hydrus_tag_service_key = "stale-service"
+        ti.hydrus_can_edit_urls = True
+        ti.hydrus_can_edit_notes = True
+
+        ti.load_credentials({})
+
+        self.assertFalse(ti.has_e621)
+        self.assertFalse(ti.has_inkbunny)
+        self.assertEqual(ti.ib_sid, "")
+        self.assertFalse(ti.has_hydrus)
+        self.assertEqual(ti.hydrus_tag_service_key, "")
+        self.assertFalse(ti.hydrus_can_edit_urls)
+        self.assertFalse(ti.hydrus_can_edit_notes)
+
 
 class TestFieldMap(unittest.TestCase):
     def test_all_env_names(self):

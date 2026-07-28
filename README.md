@@ -38,7 +38,8 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
 ### Hydrus
 
 - **Client API output** — import files, apply tags, associate URLs (default service: **downloader tags**).
-- **Exact-URL metadata enrichment** — for **byte-exact** (MD5 hash-tier) hits, FurTag can queue parseable booru Post URLs through Hydrus’s URL downloader so installed parsers can add **notes, descriptions, timestamps**, and other page metadata without re-importing a second file. Perceptual / external provenance URLs are only associated (never auto-downloaded). **Multi-file InkBunny submissions** are always associate-only (queuing `/s/{id}` would make Hydrus download every page on that post). Toggle in Settings → Hydrus pages.
+- **Direct source notes** — e621 descriptions and InkBunny titles/descriptions are reused from source API responses FurTag already fetched, then written straight to Hydrus notes by SHA-256. This is the default and does **not** queue a downloader job per URL.
+- **Optional legacy URL enrichment** — exact post URLs can still be queued through Hydrus for parser-only metadata such as timestamps. It is off by default because it is substantially slower. Perceptual/external URLs and multi-file InkBunny submissions remain associate-only.
 - **Resumable sidecar sync** — push existing `<file>.txt` / `<file>.urls.txt` into Hydrus without re-searching; successful payloads are checkpointed in the ledger.
 - **Result pages** — optional New Imports / Newly Tagged / Duplicate Tagged / Already Tagged pages.
 - **Deleted-file duplicates** — when import hits a previously deleted file, tags/URLs can be applied to current Hydrus duplicate-group members (same URL policy as a normal push).
@@ -46,7 +47,11 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
 ### Reliability
 
 - **Session ledger** — `.furtag_ledger.json` per folder, keyed by path + size + mtime; interrupted runs resume without re-querying finished files.
-- **Transient network errors stay retryable** — source failures are not recorded as clean `nomatch`.
+- **Transient network errors stay retryable** — source failures are not recorded as clean `nomatch`; partial hash hits wait for every additive source instead of permanently losing metadata.
+- **Incomplete output stays retryable** — failed Hydrus tag/URL/note writes are not recorded as completed matches.
+- **Permanent failures do not loop** — rejected source credentials disable only that source for the current credential load, unavailable optional Hydrus permissions degrade once, and unchanged unreadable media is checkpointed until its file changes.
+- **Safe directory fast-skip** — the sealed fingerprint includes filenames, nanosecond mtimes, and FurTag sidecar state rather than only file count and total bytes.
+- **Atomic PDF completion** — a PDF is considered rendered only when its completion manifest names every finished page; partial renders restart cleanly.
 - **Per-service rate limiting** — independent pacers; SauceNAO adapts to reported quotas and backs off on repeated 429s.
 - **Secrets in the OS keyring** (or `FURTAG_*` env vars) — never in `settings.json` or project files.
 
@@ -103,11 +108,13 @@ Open **Credentials** in the GUI, or set environment variables:
 
 Resolution order: **environment → OS keyring**. Missing credentials disable only that source.
 
-Non-secret options (thresholds, source toggles, page names, sidecar patterns, rate limits, exact-URL enrichment) live in platform-specific `settings.json` via `platformdirs`.
+Non-secret options (thresholds, source toggles, page names, sidecar patterns, rate limits, direct notes, optional URL enrichment) live in platform-specific `settings.json` via `platformdirs`.
+
+The GUI also remembers up to 12 recently selected scan folders there, including temporarily disconnected volumes; the **Clear** button forgets the list. This history is local machine state: it is never written into the repository, media ledgers, or sidecars, and local settings/state filenames are gitignored.
 
 **InkBunny:** enable API access and adult ratings in account settings.  
 **Danbooru:** verified-email account for auth; FurTag falls back to anonymous MD5 lookup if the key is rejected.  
-**Hydrus Client API:** enable under *services → manage services*; access key needs import files, edit tags, edit URLs, and manage pages. Add **Search for and Fetch Files** for MD5→SHA-256 caching / sidecar resume. Add **Manage File Relationships** for deleted-duplicate tagging. Install site URL classes/parsers in Hydrus if you want notes/descriptions from enrichment.
+**Hydrus Client API:** enable under *services → manage services*; access key needs import files, edit tags, edit URLs, **Add Notes / Edit File Notes**, and manage pages. Add **Search for and Fetch Files** for MD5→SHA-256 caching / sidecar resume. Add **Manage File Relationships** for deleted-duplicate tagging. URL classes/parsers are needed only if you enable the optional slow URL-enrichment path.
 
 ---
 
@@ -125,17 +132,19 @@ Non-secret options (thresholds, source toggles, page names, sidecar patterns, ra
 2. **Hash** — MD5 (and optional Hydrus SHA-256 cache) in a thread pool.
 3. **Hash tier** — e621 / InkBunny / Danbooru / Gelbooru by MD5, concurrent.
 4. **Perceptual tier** — Fluffle → SauceNAO for images that missed every hash lookup.
-5. **Write** — Hydrus push and/or sidecars; hash-tier hits may **enrich** Post URLs through Hydrus downloaders.
+5. **Write** — Hydrus push and/or sidecars; source descriptions go directly to Hydrus notes. Exact URLs may optionally enter the legacy downloader-enrichment path.
 
 **URL write policy**
 
 | Source of URLs | Hydrus behavior |
 | -------------- | ---------------- |
-| MD5 hash-tier post URLs (e621 / single-file IB / Danbooru / Gelbooru) | May be queued for metadata enrichment when enabled |
+| MD5 hash-tier post URLs (e621 / single-file IB / Danbooru / Gelbooru) | Associated normally; may also be queued for optional legacy enrichment |
 | Multi-file InkBunny submission pages (`/s/{id}` with pagecount > 1) | Associated only (never queued for download) |
 | Perceptual / external / artist “source” links | Associated only |
 
 **Ledger statuses** include `matched`, `nomatch`, `duplicate`, `hashed` (retry later after network errors), plus independent `sidecar_sync` checkpoints.
+
+The metadata ledger version was bumped for direct notes. Once Hydrus has note-editing permission, the next scan intentionally revisits older e621/Inkbunny matches once, reusing cached MD5s. If Hydrus is offline, notes are disabled, or the key lacks permission, that backfill is deferred without repeatedly querying sources.
 
 ---
 

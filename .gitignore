@@ -9,6 +9,12 @@ credentials.txt
 .env
 .env.*
 
+# Local Codex/app state — may contain conversation memory or machine paths
+.Codex/
+.codex/
+settings.json
+recent-paths.json
+
 # Signing / certificates / private keys (packaging)
 certs/*
 !certs/README.md
@@ -49,6 +55,8 @@ packaging/build/
 .furtag_ledger.json
 *.furtag_ledger.json.tmp
 .furtag_review.json
+.furtag_pdf.json
+.furtag_pdf_complete.json
 duplicates.log
 
 # Local test media + generated sidecars

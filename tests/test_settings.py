@@ -12,6 +12,8 @@ from furtag_settings import (
     validate_run_preflight,
     validate_sidecar_pattern,
     render_sidecar_name,
+    normalize_recent_scan_paths,
+    remember_scan_path,
     DEFAULT_SAUCENAO_MIN_SIMILARITY,
     DEFAULT_SAUCENAO_AUTH_SIMILARITY,
 )
@@ -87,9 +89,11 @@ class TestSettingsStore(unittest.TestCase):
         self.assertEqual(s.output.sidecar_format, "txt")
         self.assertEqual(s.hydrus.duplicate_tagged_page_name,
                          "FurTag Duplicate Tagged")
-        self.assertTrue(s.hydrus.exact_url_enrichment)
+        self.assertTrue(s.hydrus.direct_source_notes)
+        self.assertFalse(s.hydrus.exact_url_enrichment)
         self.assertEqual(s.hydrus.exact_url_enrichment_page_name,
                          "FurTag Metadata")
+        self.assertEqual(s.history.recent_scan_paths, [])
 
     def test_roundtrip(self):
         with tempfile.TemporaryDirectory() as td:
@@ -99,17 +103,43 @@ class TestSettingsStore(unittest.TestCase):
             s.matching.saucenao_min_similarity = 75.0
             s.sources.e621_enabled = False
             s.hydrus.duplicate_tagged_page_name = "Dupe Review"
-            s.hydrus.exact_url_enrichment = False
+            s.hydrus.direct_source_notes = False
+            s.hydrus.exact_url_enrichment = True
             s.hydrus.exact_url_enrichment_page_name = "Source Metadata"
+            s.history.recent_scan_paths = ["/Volumes/Art", "/tmp/archive"]
             store.save(s)
             loaded = store.load()
             self.assertEqual(loaded.matching.saucenao_min_similarity, 75.0)
             self.assertFalse(loaded.sources.e621_enabled)
             self.assertEqual(loaded.hydrus.duplicate_tagged_page_name,
                              "Dupe Review")
-            self.assertFalse(loaded.hydrus.exact_url_enrichment)
+            self.assertFalse(loaded.hydrus.direct_source_notes)
+            self.assertTrue(loaded.hydrus.exact_url_enrichment)
             self.assertEqual(loaded.hydrus.exact_url_enrichment_page_name,
                              "Source Metadata")
+            self.assertEqual(
+                loaded.history.recent_scan_paths,
+                [str(Path("/Volumes/Art").resolve(strict=False)),
+                 str(Path("/tmp/archive").resolve(strict=False))])
+
+    def test_v1_migrates_from_downloader_scraping_to_direct_notes(self):
+        loaded = Settings.from_dict({
+            "version": 1,
+            "hydrus": {"exact_url_enrichment": True},
+        })
+        self.assertTrue(loaded.hydrus.direct_source_notes)
+        self.assertFalse(loaded.hydrus.exact_url_enrichment)
+
+    def test_current_version_respects_legacy_enrichment_choice(self):
+        loaded = Settings.from_dict({
+            "version": 2,
+            "hydrus": {
+                "direct_source_notes": True,
+                "exact_url_enrichment": True,
+            },
+        })
+        self.assertTrue(loaded.hydrus.direct_source_notes)
+        self.assertTrue(loaded.hydrus.exact_url_enrichment)
 
     def test_forward_compat_unknown_keys(self):
         with tempfile.TemporaryDirectory() as td:
@@ -134,6 +164,20 @@ class TestSettingsStore(unittest.TestCase):
         self.assertGreaterEqual(
             s.matching.saucenao_auth_similarity,
             s.matching.saucenao_min_similarity)
+
+    def test_recent_paths_are_absolute_deduped_and_bounded(self):
+        base = Path(tempfile.gettempdir()).resolve()
+        path_a = str(base / "A")
+        paths = [path_a, path_a + "/", "", "relative/path", 42]
+        self.assertEqual(normalize_recent_scan_paths(paths), [path_a])
+        many = [str(base / str(i)) for i in range(20)]
+        self.assertEqual(len(normalize_recent_scan_paths(many)), 12)
+
+    def test_remember_scan_path_moves_existing_path_to_front(self):
+        base = Path(tempfile.gettempdir()).resolve()
+        first, second = str(base / "first"), str(base / "second")
+        remembered = remember_scan_path([first, second], second)
+        self.assertEqual(remembered, [second, first])
 
 
 class TestPreflight(unittest.TestCase):

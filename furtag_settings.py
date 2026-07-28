@@ -10,6 +10,7 @@ Three tiers (resolution order: RunOptions override → Settings → shipped defa
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from copy import deepcopy
@@ -44,7 +45,8 @@ DEFAULT_FLUFFLE_TOSSUP_E621 = True
 DEFAULT_PDF_DPI = 300
 DEFAULT_PDF_ARCHIVAL_DPI = 600
 
-SETTINGS_VERSION = 1
+SETTINGS_VERSION = 2
+RECENT_SCAN_PATH_LIMIT = 12
 APP_NAME = "FurTag"
 APP_AUTHOR = "FurTag"
 # The keyring service name lives in furtag_credentials.KEYRING_SERVICE — this
@@ -77,10 +79,15 @@ class OutputSettings:
 
 @dataclass
 class HydrusSettings:
+    # Pull source descriptions from API responses FurTag already fetched and
+    # write them straight to Hydrus notes. This is dramatically cheaper than
+    # asking Hydrus to download and parse every matched post URL.
+    direct_source_notes: bool = True
     # Send byte-exact booru Post URLs through Hydrus's URL downloader so its
     # installed parsers can add notes/descriptions/timestamps without importing
-    # a second file. Unparseable URLs fall back to plain URL association.
-    exact_url_enrichment: bool = True
+    # a second file. Kept as an optional legacy/extra-metadata path; direct
+    # source notes make it unnecessary for descriptions.
+    exact_url_enrichment: bool = False
     exact_url_enrichment_page_name: str = "FurTag Metadata"
     results_pages_enabled: bool = True
     new_imports_page_name: str = "FurTag New Imports"
@@ -133,6 +140,15 @@ class PerformanceSettings:
 
 
 @dataclass
+class HistorySettings:
+    """Non-secret local GUI state stored in the user config directory."""
+
+    # Absolute paths, most-recent first. These never belong in the repository,
+    # ledgers, sidecars, or logs produced beside scanned media.
+    recent_scan_paths: List[str] = field(default_factory=list)
+
+
+@dataclass
 class Settings:
     """Tier-2 persistent preferences. Never stores secrets."""
     version: int = SETTINGS_VERSION
@@ -142,6 +158,7 @@ class Settings:
     matching: MatchingSettings = field(default_factory=MatchingSettings)
     pdf: PdfSettings = field(default_factory=PdfSettings)
     performance: PerformanceSettings = field(default_factory=PerformanceSettings)
+    history: HistorySettings = field(default_factory=HistorySettings)
 
     def clone(self) -> "Settings":
         return deepcopy(self)
@@ -155,14 +172,27 @@ class Settings:
         if not isinstance(data, dict):
             return cls()
         base = cls()
-        base.version = int(data.get("version") or SETTINGS_VERSION)
+        try:
+            loaded_version = int(data.get("version") or 1)
+        except (TypeError, ValueError):
+            loaded_version = 1
+        base.version = SETTINGS_VERSION
         base.output = _merge_dataclass(OutputSettings, data.get("output"))
-        base.hydrus = _merge_dataclass(HydrusSettings, data.get("hydrus"))
+        hydrus_data = data.get("hydrus")
+        base.hydrus = _merge_dataclass(HydrusSettings, hydrus_data)
+        # v1 used downloader scraping as the only description path and shipped
+        # it enabled. v2 imports source descriptions directly, so migrate old
+        # installs away from the unexpectedly slow per-URL downloader queue.
+        if (loaded_version < 2 and isinstance(hydrus_data, dict)
+                and "direct_source_notes" not in hydrus_data):
+            base.hydrus.direct_source_notes = True
+            base.hydrus.exact_url_enrichment = False
         base.sources = _merge_dataclass(SourceSettings, data.get("sources"))
         base.matching = _merge_dataclass(MatchingSettings, data.get("matching"))
         base.pdf = _merge_dataclass(PdfSettings, data.get("pdf"))
         base.performance = _merge_dataclass(
             PerformanceSettings, data.get("performance"))
+        base.history = _merge_dataclass(HistorySettings, data.get("history"))
         _normalize_settings(base)
         return base
 
@@ -236,6 +266,59 @@ def _normalize_settings(s: Settings) -> None:
             0, int(s.performance.hash_worker_count))
     except (TypeError, ValueError):
         s.performance.hash_worker_count = 0
+    s.history.recent_scan_paths = normalize_recent_scan_paths(
+        s.history.recent_scan_paths)
+
+
+def normalize_recent_scan_paths(
+        values: Any, limit: int = RECENT_SCAN_PATH_LIMIT) -> List[str]:
+    """Return bounded, de-duplicated absolute paths, newest first.
+
+    Existence is deliberately not required: folders on removable/network
+    volumes should remain remembered while temporarily disconnected.
+    """
+    if not isinstance(values, (list, tuple)):
+        return []
+    try:
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        limit = RECENT_SCAN_PATH_LIMIT
+    if limit == 0:
+        return []
+
+    result: List[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        candidate = Path(raw.strip()).expanduser()
+        if not candidate.is_absolute():
+            continue
+        try:
+            candidate = candidate.resolve(strict=False)
+        except OSError:
+            pass
+        normalized = os.path.normpath(str(candidate))
+        # normcase is a no-op on case-sensitive POSIX filesystems, where
+        # /Art and /art may genuinely be different folders.
+        key = os.path.normcase(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def remember_scan_path(
+        values: Any, path: Path | str,
+        limit: int = RECENT_SCAN_PATH_LIMIT) -> List[str]:
+    """Prepend one selected scan folder to persistent recent-path history."""
+    candidate = Path(path).expanduser().resolve(strict=False)
+    return normalize_recent_scan_paths(
+        [str(candidate), *(values if isinstance(values, (list, tuple)) else [])],
+        limit=limit)
 
 
 @dataclass

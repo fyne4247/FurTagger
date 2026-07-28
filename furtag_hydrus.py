@@ -108,6 +108,9 @@ class HydrusMixin:
             # Hydrus permission 0 = "Import and Edit URLs"; associate_url 403s
             # without it, so know up front rather than failing per file.
             self.hydrus_can_edit_urls = everything or 0 in permissions
+            # Permission 7 = "Edit File Notes". Source descriptions can be
+            # written directly once add_file gives us the canonical SHA-256.
+            self.hydrus_can_edit_notes = everything or 7 in permissions
             # Permission 3 lets us batch-check local MD5s and skip redundant
             # add_file calls for files Hydrus already has.
             self.hydrus_can_search_files = everything or 3 in permissions
@@ -118,6 +121,11 @@ class HydrusMixin:
             if not self.hydrus_can_edit_urls:
                 _notify("⚠️  Hydrus URLs disabled – access key needs the "
                        "'Import and Edit URLs' permission; tags still work.")
+            if (getattr(self, "hydrus_direct_notes_enabled", True)
+                    and not self.hydrus_can_edit_notes):
+                _notify("⚠️  Hydrus direct notes disabled – access key needs "
+                       "'Add Notes / Edit File Notes'; legacy URL enrichment "
+                       "still works.")
             if not self.hydrus_can_search_files:
                 _notify("⚠️  Hydrus hash cache disabled – access key needs "
                        "'Search for and Fetch Files'; imports still work.")
@@ -148,6 +156,9 @@ class HydrusMixin:
     def hydrus_mode_desc(self) -> str:
         """e.g. "import+tag" / "tag-only + sidecars" — used in startup banners."""
         mode = "import+tag" if self.hydrus_import else "tag-only"
+        if (getattr(self, "hydrus_direct_notes_enabled", True)
+                and self.hydrus_can_edit_notes):
+            mode += " + direct notes"
         if (self.hydrus_exact_url_enrichment
                 and self.hydrus_can_edit_urls):
             mode += " + exact-URL enrichment"
@@ -582,6 +593,26 @@ class HydrusMixin:
         if r.status_code != 200:
             raise RuntimeError(f"add_tags HTTP {r.status_code}: {r.text[:200]}")
 
+    def _hydrus_set_notes(
+            self, file_hash: str, notes: Dict[str, str]) -> None:
+        """Idempotently upsert source notes without touching unrelated notes."""
+        cleaned = {str(name).strip(): str(text).strip()
+                   for name, text in notes.items()
+                   if str(name).strip() and str(text).strip()}
+        if not cleaned:
+            return
+        body = {
+            "hash": file_hash,
+            "notes": cleaned,
+            # Stable source-specific names make a rerun an update, not a
+            # duplicate. False also avoids accidentally merging personal notes.
+            "merge_cleverly": False,
+        }
+        r = self._hydrus_post("add_notes/set_notes", body, 30)
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"set_notes HTTP {r.status_code}: {r.text[:200]}")
+
 
     def _hydrus_get_url_info(self, url: str) -> Dict:
         """Return Hydrus's URL-class decision for one verified source URL."""
@@ -850,6 +881,7 @@ class HydrusMixin:
             exact_match: bool = False,
             url_policy: Optional[UrlWritePolicy] = None,
             force_associate_urls: Optional[Set[str]] = None,
+            notes: Optional[Dict[str, str]] = None,
     ) -> Optional[str]:
         """Import (optional) + tag + route URLs. Returns SHA-256 or None.
 
@@ -859,7 +891,7 @@ class HydrusMixin:
         file_hash, _complete = self._hydrus_push_detailed(
             media, tags, urls, known_sha256=known_sha256,
             exact_match=exact_match, url_policy=url_policy,
-            force_associate_urls=force_associate_urls)
+            force_associate_urls=force_associate_urls, notes=notes)
         return file_hash
 
     def _hydrus_push_detailed(
@@ -868,6 +900,7 @@ class HydrusMixin:
             exact_match: bool = False,
             url_policy: Optional[UrlWritePolicy] = None,
             force_associate_urls: Optional[Set[str]] = None,
+            notes: Optional[Dict[str, str]] = None,
     ) -> Tuple[Optional[str], bool]:
         """Hydrus push plus whether every requested metadata write completed.
 
@@ -883,6 +916,8 @@ class HydrusMixin:
         policy = self._resolve_url_policy(url_policy, exact_match)
         force_associate = {u for u in (force_associate_urls or set()) if u}
         with self._hydrus_lock:
+            file_hash: Optional[str] = None
+            import_status: Optional[int] = None
             try:
                 if known_sha256:
                     file_hash, import_status = known_sha256, 2
@@ -894,9 +929,7 @@ class HydrusMixin:
                     if import_status == 3:
                         complete = self._hydrus_push_to_deleted_duplicates(
                             media, file_hash, tags, urls, url_policy=policy,
-                            force_associate_urls=force_associate)
-                        if urls and not self.hydrus_can_edit_urls:
-                            complete = False
+                            force_associate_urls=force_associate, notes=notes)
                         return None, complete
                 else:
                     file_hash = self._sha256_local(media)
@@ -907,32 +940,51 @@ class HydrusMixin:
 
                 if tags:
                     self._hydrus_add_tags(file_hash, tags)
-                urls_complete = not urls
+                # A missing permission disables that optional metadata channel
+                # for this session; it is not a transient per-file failure.
+                # Retrying every booru lookup forever cannot make the key gain
+                # a permission. Actual attempted writes still remain retryable.
+                notes_complete = (
+                    not notes
+                    or not getattr(self, "hydrus_direct_notes_enabled", True)
+                    or not self.hydrus_can_edit_notes)
+                if (notes and getattr(self, "hydrus_direct_notes_enabled", True)
+                        and self.hydrus_can_edit_notes):
+                    try:
+                        self._hydrus_set_notes(file_hash, notes)
+                        notes_complete = True
+                    except Exception as e:
+                        _notify(f"⚠️  Hydrus direct-note write failed for "
+                               f"{media.name}; other metadata was kept ({e})")
+                urls_complete = not urls or not self.hydrus_can_edit_urls
                 if urls and self.hydrus_can_edit_urls:
                     urls_complete = self._hydrus_route_urls(
                         media, file_hash, urls, url_policy=policy,
                         force_associate_urls=force_associate)
                 if import_status == 1:
                     self._hydrus_add_to_page("new", file_hash)
-                elif tags or urls:
+                elif tags or urls or notes:
                     self._hydrus_add_to_page("updated", file_hash)
-                return file_hash, urls_complete
+                return file_hash, urls_complete and notes_complete
             except Exception as e:
                 _notify(f"❌ Hydrus push failed for {media.name}: {e}")
-                return None, False
+                # If import/hash resolution already succeeded, retain the hash
+                # so an idempotent metadata retry can skip add_file next run.
+                return file_hash, False
 
     def _hydrus_push_to_deleted_duplicates(
             self, media: Path, deleted_hash: str, tags: Set[str],
             urls: Set[str],
             url_policy: UrlWritePolicy = UrlWritePolicy.ASSOCIATE_ONLY,
             force_associate_urls: Optional[Set[str]] = None,
+            notes: Optional[Dict[str, str]] = None,
     ) -> bool:
         """Tag only current members of a deleted file's Hydrus duplicate group.
 
         Uses the same URL routing policy as a normal push so exact hash-tier
         post URLs can still enrich notes/descriptions on surviving members.
         """
-        if not tags and not urls:
+        if not tags and not urls and not notes:
             return False
         if not (self.hydrus_tag_deleted_duplicates and
                 self.hydrus_can_manage_relationships):
@@ -960,6 +1012,15 @@ class HydrusMixin:
             for target_hash in targets:
                 if tags:
                     self._hydrus_add_tags(target_hash, tags)
+                if (notes and getattr(self, "hydrus_direct_notes_enabled", True)
+                        and self.hydrus_can_edit_notes):
+                    try:
+                        self._hydrus_set_notes(target_hash, notes)
+                    except Exception as e:
+                        metadata_complete = False
+                        _notify(f"⚠️  Hydrus direct-note write failed for a "
+                               f"duplicate of {media.name}; other metadata was "
+                               f"kept ({e})")
                 if urls and self.hydrus_can_edit_urls:
                     if not self._hydrus_route_urls(
                             media, target_hash, urls, url_policy=url_policy,
@@ -1016,4 +1077,3 @@ class HydrusMixin:
                        f"{media.name}: {e}")
                 return False
         return True
-

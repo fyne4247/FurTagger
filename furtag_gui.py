@@ -146,7 +146,7 @@ from furtag_settings import (
     Settings, SettingsStore, RunOptions, ScanSummary, validate_run_preflight,
     validate_output_patterns, SidecarPatternError, PACE_FLOORS,
     FLUFFLE_MATCH_CLASSES, FLUFFLE_REVIEW_MODES, DEFAULT_PDF_DPI,
-    DEFAULT_PDF_ARCHIVAL_DPI,
+    DEFAULT_PDF_ARCHIVAL_DPI, remember_scan_path,
 )
 from furtag_credentials import CredentialStore, ALL_FIELDS, SECRET_FIELDS, FIELD_MAP
 from furtag_events import RunEvent, RunObserver
@@ -162,6 +162,7 @@ class QtEventBridge(QObject):
     failed = Signal(str)
     log_line = Signal(str)
     inventory_ready = Signal(object)
+    inventory_failed = Signal(object)
     review_changed = Signal(int)
 
 
@@ -201,18 +202,21 @@ class ScanWorker(QThread):
 
 class DiscoverWorker(QThread):
     def __init__(self, integrator: TagIntegrator, root: Path,
-                 bridge: QtEventBridge) -> None:
+                 bridge: QtEventBridge, generation: int) -> None:
         super().__init__()
         self.integrator = integrator
         self.root = root
         self.bridge = bridge
+        self.generation = generation
 
     def run(self) -> None:
         try:
             inv = self.integrator.discover(self.root)
-            self.bridge.inventory_ready.emit(inv)
+            self.bridge.inventory_ready.emit(
+                (self.generation, self.root, inv))
         except Exception as e:
-            self.bridge.failed.emit(str(e))
+            self.bridge.inventory_failed.emit(
+                (self.generation, self.root, str(e)))
 
 
 # ── Credentials dialog ───────────────────────────────────────────────────────
@@ -468,13 +472,36 @@ class ReviewDialog(QDialog):
         p = self._current()
         if not p:
             return
-        self.integrator.resolve_pending_review(p, approve=approve, root=self.root)
+        try:
+            completed = self.integrator.resolve_pending_review(
+                p, approve=approve, root=self.root)
+        except Exception as e:
+            completed = False
+            QMessageBox.warning(
+                self, "Review item deferred",
+                f"Could not finish this item yet; it remains in the review "
+                f"queue.\n\n{e}")
+        if not completed:
+            self._reload()
+            return
         self._reload()
 
     def _bulk(self, approve: bool) -> None:
+        failed = 0
         for p in list(self.queue.list_items()):
-            self.integrator.resolve_pending_review(p, approve=approve, root=self.root)
+            try:
+                completed = self.integrator.resolve_pending_review(
+                    p, approve=approve, root=self.root)
+            except Exception:
+                completed = False
+            if not completed:
+                failed += 1
         self._reload()
+        if failed:
+            QMessageBox.warning(
+                self, "Some review items were deferred",
+                f"{failed} item(s) could not be completed and remain queued. "
+                "This is usually a temporary source or output failure.")
 
     def _open_url(self) -> None:
         p = self._current()
@@ -539,11 +566,17 @@ class SettingsPanel(QWidget):
         hy = QWidget()
         hf = QFormLayout(hy)
         self.exact_url_enrichment = QCheckBox(
-            "Enrich exact matches through Hydrus downloaders")
+            "Also scrape exact URLs through Hydrus (slow)")
         self.exact_url_enrichment.setToolTip(
-            "For byte-exact booru matches, queue parseable Post URLs so Hydrus "
-            "can import notes, descriptions, and other parser metadata. "
-            "Unparseable URLs are associated normally.")
+            "Optional legacy enrichment for timestamps and other parser-only "
+            "metadata. Descriptions can be imported directly without this "
+            "slow downloader queue.")
+        self.direct_source_notes = QCheckBox(
+            "Import e621 / InkBunny descriptions directly")
+        self.direct_source_notes.setToolTip(
+            "Reuse source API responses FurTag already fetched and write their "
+            "descriptions straight to Hydrus notes. Requires the Hydrus "
+            "'Add Notes / Edit File Notes' permission.")
         self.exact_url_enrichment_page_name = QLineEdit()
         self.results_pages = QCheckBox("Enable result pages")
         self.new_imports_name = QLineEdit()
@@ -554,6 +587,7 @@ class SettingsPanel(QWidget):
         self.page_limit = QSpinBox()
         self.page_limit.setRange(0, 1_000_000)
         self.page_limit.setSpecialValueText("Unlimited")
+        hf.addRow(self.direct_source_notes)
         hf.addRow(self.exact_url_enrichment)
         hf.addRow("Metadata downloader page",
                   self.exact_url_enrichment_page_name)
@@ -673,6 +707,7 @@ class SettingsPanel(QWidget):
         self.sidecar_url_fn.setText(o.sidecar_url_filename)
         self.sidecar_json_fn.setText(o.sidecar_json_filename)
         self.results_pages.setChecked(h.results_pages_enabled)
+        self.direct_source_notes.setChecked(h.direct_source_notes)
         self.exact_url_enrichment.setChecked(h.exact_url_enrichment)
         self.exact_url_enrichment_page_name.setText(
             h.exact_url_enrichment_page_name)
@@ -700,7 +735,10 @@ class SettingsPanel(QWidget):
         self.hash_workers.setValue(perf.hash_worker_count)
 
     def to_settings(self) -> Settings:
-        s = Settings()
+        # Preserve persistent state not represented by widgets (recent scan
+        # folders today, and future settings tomorrow) instead of rebuilding a
+        # lossy object from defaults on every save.
+        s = self._initial.clone()
         s.output.hydrus_enabled = self.hydrus_enabled.isChecked()
         s.output.hydrus_import = self.hydrus_import.isChecked()
         s.output.hydrus_import_unmatched = self.hydrus_import_unmatched.isChecked()
@@ -711,6 +749,7 @@ class SettingsPanel(QWidget):
         s.output.sidecar_tag_filename = self.sidecar_tag_fn.text().strip()
         s.output.sidecar_url_filename = self.sidecar_url_fn.text().strip()
         s.output.sidecar_json_filename = self.sidecar_json_fn.text().strip()
+        s.hydrus.direct_source_notes = self.direct_source_notes.isChecked()
         s.hydrus.exact_url_enrichment = (
             self.exact_url_enrichment.isChecked())
         s.hydrus.exact_url_enrichment_page_name = (
@@ -739,6 +778,10 @@ class SettingsPanel(QWidget):
         s.performance.hash_worker_count = self.hash_workers.value()
         return s
 
+    def set_recent_scan_paths(self, paths: List[str]) -> None:
+        """Keep hidden persistent history in sync with the main window."""
+        self._initial.history.recent_scan_paths = list(paths)
+
     def _save_defaults(self) -> None:
         try:
             s = self.to_settings()
@@ -747,6 +790,7 @@ class SettingsPanel(QWidget):
             QMessageBox.warning(self, "Invalid pattern", str(e))
             return
         SettingsStore().save(s)
+        self._initial = s.clone()
         QMessageBox.information(self, "Settings", "Defaults saved.")
 
     def _restore_defaults(self) -> None:
@@ -798,13 +842,15 @@ class MainWindow(QMainWindow):
         self.folder: Optional[Path] = None
         self.inventory: Optional[dict] = None
         self.scan_worker: Optional[ScanWorker] = None
-        self.discover_worker: Optional[DiscoverWorker] = None
+        self.discover_workers: List[DiscoverWorker] = []
+        self._folder_generation = 0
         self.cancel_event = threading.Event()
         self.bridge = QtEventBridge()
         self.bridge.event.connect(self._on_event)
         self.bridge.finished.connect(self._on_finished)
         self.bridge.failed.connect(self._on_failed)
         self.bridge.inventory_ready.connect(self._on_inventory)
+        self.bridge.inventory_failed.connect(self._on_inventory_failed)
         self._closing = False
         self._review_count = 0
 
@@ -863,11 +909,28 @@ class MainWindow(QMainWindow):
         folder_row = QHBoxLayout()
         self.drop = DropFolderLabel()
         self.drop.folder_dropped.connect(self._set_folder)
-        browse = QPushButton("Browse…")
-        browse.clicked.connect(self._browse_folder)
+        self.browse_btn = QPushButton("Browse…")
+        self.browse_btn.clicked.connect(self._browse_folder)
         folder_row.addWidget(self.drop, stretch=1)
-        folder_row.addWidget(browse)
+        folder_row.addWidget(self.browse_btn)
         scan_lay.addLayout(folder_row)
+
+        recent_row = QHBoxLayout()
+        recent_row.addWidget(QLabel("Recent:"))
+        self.recent_folders = QComboBox()
+        self.recent_folders.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.recent_folders.setMinimumContentsLength(28)
+        self.recent_folders.activated.connect(self._select_recent_folder)
+        self.clear_recents_btn = QPushButton("Clear")
+        self.clear_recents_btn.setToolTip(
+            "Forget the local recent-folder list. No media or scan results "
+            "are removed.")
+        self.clear_recents_btn.clicked.connect(self._clear_recent_folders)
+        recent_row.addWidget(self.recent_folders, stretch=1)
+        recent_row.addWidget(self.clear_recents_btn)
+        scan_lay.addLayout(recent_row)
+        self._refresh_recent_folders()
 
         self.inventory_label = QLabel("Choose a folder to scan.")
         self.inventory_label.setWordWrap(True)
@@ -875,6 +938,7 @@ class MainWindow(QMainWindow):
 
         # Session options — wrap on narrow windows via a flow-like row
         opts = QHBoxLayout()
+        opts.addWidget(QLabel("This run:"))
         self.opt_import_unmatched = QCheckBox("Import unmatched")
         self.opt_sync_sidecars = QCheckBox("Sync sidecars first")
         self.opt_already = QCheckBox("Already Tagged page")
@@ -885,6 +949,12 @@ class MainWindow(QMainWindow):
         self.opt_page_limit.setValue(self.settings.hydrus.result_page_limit)
         self.opt_import_unmatched.setChecked(self.settings.output.hydrus_import_unmatched)
         self.opt_already.setChecked(self.settings.hydrus.build_already_tagged_page)
+        for option in (
+                self.opt_import_unmatched, self.opt_sync_sidecars,
+                self.opt_already, self.opt_page_limit):
+            option.setToolTip(
+                "Session-only override for this scan; saved defaults remain "
+                "on the Settings tab.")
         opts.addWidget(self.opt_import_unmatched)
         opts.addWidget(self.opt_sync_sidecars)
         opts.addWidget(self.opt_already)
@@ -1015,25 +1085,118 @@ class MainWindow(QMainWindow):
             hydrus = '<span style="color:#f07178">Hydrus ✗</span>'
         self.status_label.setText(f"{hydrus}  ·  " + "  ".join(parts))
 
+    def _refresh_recent_folders(self) -> None:
+        self.recent_folders.blockSignals(True)
+        self.recent_folders.clear()
+        self.recent_folders.addItem("Choose a recent folder…", "")
+        for raw in self.settings.history.recent_scan_paths:
+            path = Path(raw)
+            label = str(path)
+            if not path.is_dir():
+                label += "  (unavailable)"
+            self.recent_folders.addItem(label, str(path))
+            self.recent_folders.setItemData(
+                self.recent_folders.count() - 1, str(path),
+                Qt.ItemDataRole.ToolTipRole)
+        self.recent_folders.setCurrentIndex(0)
+        self.clear_recents_btn.setEnabled(
+            bool(self.settings.history.recent_scan_paths))
+        self.recent_folders.blockSignals(False)
+
+    def _remember_folder(self, folder: Path) -> None:
+        """Persist MRU history without saving unsaved Settings-tab edits."""
+        persisted = self.settings_store.load()
+        paths = remember_scan_path(
+            persisted.history.recent_scan_paths, folder)
+        persisted.history.recent_scan_paths = paths
+        self.settings.history.recent_scan_paths = list(paths)
+        self.settings_panel.set_recent_scan_paths(paths)
+        try:
+            self.settings_store.save(persisted)
+        except OSError as e:
+            self._add_issue(f"Could not save recent folders: {e}")
+        self._refresh_recent_folders()
+
+    def _clear_recent_folders(self) -> None:
+        answer = QMessageBox.question(
+            self, "Clear recent folders",
+            "Forget all recently selected scan folders?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        persisted = self.settings_store.load()
+        persisted.history.recent_scan_paths = []
+        try:
+            self.settings_store.save(persisted)
+        except OSError as e:
+            self._add_issue(f"Could not clear recent folders: {e}")
+            return
+        self.settings.history.recent_scan_paths = []
+        self.settings_panel.set_recent_scan_paths([])
+        self._refresh_recent_folders()
+
+    @Slot(int)
+    def _select_recent_folder(self, index: int) -> None:
+        path = self.recent_folders.itemData(index)
+        self.recent_folders.setCurrentIndex(0)
+        if not path:
+            return
+        if not Path(path).is_dir():
+            QMessageBox.information(
+                self, "Folder unavailable",
+                "That recent folder is not currently available. It will remain "
+                "in the list in case a removable or network volume reconnects.")
+            return
+        self._set_folder(str(path))
+
     def _set_folder(self, path: str) -> None:
-        self.folder = Path(path).expanduser().resolve()
+        if self.scan_worker and self.scan_worker.isRunning():
+            QMessageBox.information(
+                self, "Scan running",
+                "Finish or cancel the current scan before changing folders.")
+            return
+        folder = Path(path).expanduser().resolve(strict=False)
+        if not folder.is_dir():
+            QMessageBox.warning(
+                self, "Folder unavailable",
+                f"Cannot scan this folder because it is not available:\n{folder}")
+            return
+        self.folder = folder
+        self._folder_generation += 1
+        generation = self._folder_generation
         self.drop.setText(str(self.folder))
+        self._remember_folder(self.folder)
         self._refresh_review_badge()
         self.inventory_label.setText("Indexing…")
         self.start_btn.setEnabled(False)
+        self._set_indexing(True)
         # Honor current Settings-tab toggles (e.g. PDF off) during discovery.
         self.integrator.apply_settings(self.settings_panel.to_settings())
-        self.discover_worker = DiscoverWorker(
-            self.integrator, self.folder, self.bridge)
-        self.discover_worker.start()
+        worker = DiscoverWorker(
+            self.integrator, self.folder, self.bridge, generation)
+        self.discover_workers.append(worker)
+        worker.finished.connect(
+            lambda worker=worker: self._discovery_finished(worker))
+        worker.start()
 
     def _browse_folder(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Folder to scan")
+        start = self.folder if self.folder and self.folder.is_dir() else None
+        if start is None:
+            start = next((
+                Path(raw) for raw in self.settings.history.recent_scan_paths
+                if Path(raw).is_dir()), Path.home())
+        d = QFileDialog.getExistingDirectory(
+            self, "Folder to scan", str(start))
         if d:
             self._set_folder(d)
 
     @Slot(object)
-    def _on_inventory(self, inv: dict) -> None:
+    def _on_inventory(self, payload: object) -> None:
+        generation, root, inv = payload
+        if generation != self._folder_generation or root != self.folder:
+            return
         self.inventory = inv
         n = len(inv["items"])
         pdf_on = self.settings_panel.pdf_enabled.isChecked()
@@ -1048,6 +1211,43 @@ class MainWindow(QMainWindow):
         self._log(
             f"Indexed {n} file(s)"
             + (f", {pdfs} PDF job(s)." if pdf_on else " (PDF rendering off)."))
+
+    @Slot(object)
+    def _on_inventory_failed(self, payload: object) -> None:
+        generation, root, msg = payload
+        if generation != self._folder_generation or root != self.folder:
+            return
+        self.inventory = None
+        self.inventory_label.setText("Indexing failed.")
+        self.start_btn.setEnabled(False)
+        self._add_issue(msg)
+        QMessageBox.critical(self, "Folder indexing failed", msg)
+
+    def _discovery_finished(self, worker: DiscoverWorker) -> None:
+        was_current = worker.generation == self._folder_generation
+        try:
+            self.discover_workers.remove(worker)
+        except ValueError:
+            pass
+        worker.deleteLater()
+        if was_current:
+            self._set_indexing(False)
+        if self._closing and not self.discover_workers and not (
+                self.scan_worker and self.scan_worker.isRunning()):
+            self.close()
+
+    def _set_indexing(self, indexing: bool) -> None:
+        if (not indexing and self.scan_worker
+                and self.scan_worker.isRunning()):
+            return
+        self.browse_btn.setEnabled(not indexing)
+        self.drop.setEnabled(not indexing)
+        self.recent_folders.setEnabled(not indexing)
+        self.clear_recents_btn.setEnabled(
+            not indexing and bool(self.settings.history.recent_scan_paths))
+        self.reset_btn.setEnabled(not indexing)
+        self.another_btn.setEnabled(not indexing)
+        self.settings_panel.setEnabled(not indexing)
 
     def _start(self) -> None:
         if not self.folder:
@@ -1120,6 +1320,11 @@ class MainWindow(QMainWindow):
         self.reset_btn.setEnabled(not running)
         self.settings_panel.setEnabled(not running)
         self.another_btn.setEnabled(not running)
+        self.browse_btn.setEnabled(not running)
+        self.drop.setEnabled(not running)
+        self.recent_folders.setEnabled(not running)
+        self.clear_recents_btn.setEnabled(
+            not running and bool(self.settings.history.recent_scan_paths))
 
     @Slot(object)
     def _on_event(self, event: RunEvent) -> None:
@@ -1191,7 +1396,7 @@ class MainWindow(QMainWindow):
         # Authoritative count at end of run — reconcile the event-driven tally.
         self._review_count = summary.pending_review
         self._set_review_badge(self._review_count)
-        if self._closing:
+        if self._closing and not self.discover_workers:
             self.close()
 
     @Slot(str)
@@ -1199,7 +1404,7 @@ class MainWindow(QMainWindow):
         self._set_running(False)
         self._add_issue(msg)
         QMessageBox.critical(self, "Error", msg)
-        if self._closing:
+        if self._closing and not self.discover_workers:
             self.close()
 
     def _add_issue(self, msg: str) -> None:
@@ -1247,6 +1452,7 @@ class MainWindow(QMainWindow):
         self._refresh_review_badge()
 
     def _scan_another(self) -> None:
+        self._folder_generation += 1  # ignore any late discovery result
         self.folder = None
         self.inventory = None
         self._refresh_review_badge()
@@ -1260,7 +1466,7 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.folder)))
 
     def _reset(self) -> None:
-        dlg = ResetDialog(self, settings=self.settings)
+        dlg = ResetDialog(self, settings=self.settings_panel.to_settings())
         if dlg.exec() == QDialog.DialogCode.Accepted:
             n, failures = dlg.perform_reset()
             msg = f"Removed {n} file(s)."
@@ -1285,6 +1491,11 @@ class MainWindow(QMainWindow):
             self._closing = True
             self._cancel()
             self._log("Finishing current request before quit…")
+            event.ignore()
+            return
+        if self.discover_workers:
+            self._closing = True
+            self._log("Finishing folder indexing before quit…")
             event.ignore()
             return
         event.accept()

@@ -13,13 +13,15 @@ import io
 import contextlib
 import shutil
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
 
 import furtag
 from furtag import (
-    FileItem, LiveDisplay, TagIntegrator, notify, set_active_observer,
+    FileItem, Ledger, LiveDisplay, TagIntegrator, WriteOutcome, notify,
+    set_active_observer,
 )
 from furtag_events import NullObserver, RunEvent, TerminalObserver
 from furtag_settings import RunOptions, Settings
@@ -370,15 +372,90 @@ class TestTransientLookupFailures(unittest.TestCase):
         events = rec.kinds("finish_file", "hash")
         self.assertTrue(events[-1].extra["retryable"])
 
-    def test_image_with_hash_failure_and_perceptual_miss_stays_retryable(self):
+    def test_image_with_hash_failure_skips_slow_perceptual_and_stays_retryable(self):
         media, ledger, rec, summary = self._run_with_hash_failure(".png")
         stat = media.stat()
         self.assertEqual(
             ledger.status_for(media.name, stat.st_size, stat.st_mtime),
             "hashed")
         self.assertEqual(summary.unmatched, 0)
-        events = rec.kinds("finish_file", "perceptual")
+        events = rec.kinds("finish_file", "hash")
         self.assertTrue(events[-1].extra["retryable"])
+        self.assertEqual(rec.kinds("start_file", "perceptual"), [])
+
+    def test_incomplete_output_is_not_checkpointed_as_matched(self):
+        root = _make_pngs(1)
+        self.addCleanup(shutil.rmtree, root, True)
+        settings = _offline_settings()
+        settings.sources.e621_enabled = True
+        ti = TagIntegrator(settings=settings)
+        ti.has_e621 = True
+        ti._hash_lookup = lambda service, md5: (
+            {"creator:exact"}, {"https://e621.net/posts/1"}, set())
+        ti.write_results_detailed = lambda *args, **kwargs: WriteOutcome(
+            None, False)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ti.run(root, options=_run_options(), observer=RecordingObserver(),
+                   use_terminal_display=False)
+
+        media = next(root.glob("*.png"))
+        st = media.stat()
+        ledger = Ledger(root)
+        ledger.load()
+        self.assertNotEqual(
+            ledger.status_for(media.name, st.st_size, st.st_mtime),
+            "matched")
+
+    def test_partial_hash_hit_waits_for_failed_additive_source(self):
+        root = Path(tempfile.mkdtemp(prefix="furtag-partial-hit-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        media = root / "media.mp4"
+        media.write_bytes(b"not-real-video")
+        settings = _offline_settings()
+        settings.sources.e621_enabled = True
+        settings.sources.danbooru_enabled = True
+        ti = TagIntegrator(settings=settings)
+        ti.has_e621 = ti.has_danbooru = True
+
+        def lookup(service, _md5):
+            if service == "e621":
+                return {"creator:exact"}, {"https://e621.net/posts/1"}, set()
+            raise OSError("temporary Danbooru failure")
+
+        ti._hash_lookup = lookup
+        ti.write_results_detailed = mock.MagicMock()
+        rec = RecordingObserver()
+        with contextlib.redirect_stdout(io.StringIO()), \
+             mock.patch("furtag.notify"):
+            summary = ti.run(
+                root, options=_run_options(), observer=rec,
+                use_terminal_display=False)
+
+        ledger = Ledger(root)
+        ledger.load()
+        st = media.stat()
+        self.assertEqual(
+            ledger.status_for(media.name, st.st_size, st.st_mtime),
+            "hashed")
+        self.assertEqual(summary.tagged, 0)
+        ti.write_results_detailed.assert_not_called()
+        event = rec.kinds("finish_file", "hash")[-1]
+        self.assertTrue(event.extra["retryable"])
+        self.assertEqual(event.extra["failed_sources"], ["danbooru"])
+
+    def test_pre_set_cancellation_is_not_cleared(self):
+        root = _make_pngs(1)
+        self.addCleanup(shutil.rmtree, root, True)
+        cancel = threading.Event()
+        cancel.set()
+        ti = TagIntegrator(settings=_offline_settings())
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = ti.run(
+                root, options=_run_options(), observer=RecordingObserver(),
+                cancel_event=cancel, use_terminal_display=False)
+        self.assertTrue(cancel.is_set())
+        self.assertTrue(summary.cancelled)
 
 
 class TestUrlEnrichmentBoundary(unittest.TestCase):
@@ -389,15 +466,15 @@ class TestUrlEnrichmentBoundary(unittest.TestCase):
         policies = []
 
         def capture(media, tags, urls, known_sha256=None, exact_match=False,
-                    url_policy=None, force_associate_urls=None):
+                    url_policy=None, force_associate_urls=None, notes=None):
             if url_policy is None:
                 url_policy = (
                     UrlWritePolicy.ENRICH_HASH_POSTS if exact_match
                     else UrlWritePolicy.ASSOCIATE_ONLY)
             policies.append(url_policy)
-            return "a" * 64
+            return WriteOutcome("a" * 64, True)
 
-        ti.write_results = capture
+        ti.write_results_detailed = capture
         return policies
 
     def test_hash_tier_write_is_marked_exact(self):

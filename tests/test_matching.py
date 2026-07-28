@@ -2,10 +2,11 @@
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from furtag import TagIntegrator, _is_pdf_page_render
+from furtag import TagIntegrator, RetryableLookupError, _is_pdf_page_render
 from furtag_review import PendingReview
 from furtag_settings import Settings
 
@@ -418,11 +419,56 @@ class TestPdfPageDetection(unittest.TestCase):
             mtime=st.st_mtime, md5="0" * 32, match_class="tossUp",
             platform="furaffinity", fluffle_tags=["creator:Someone"],
             fluffle_urls=["https://example.invalid/1"])
-        with patch.object(ti, "write_results",
-                          return_value=None) as writer:
+        from furtag import WriteOutcome
+        with patch.object(
+                ti, "write_results_detailed",
+                return_value=WriteOutcome(None, True)) as writer:
             self.assertTrue(ti.resolve_pending_review(pending, True,
                                                       root=self.root))
         return writer.call_args[0][1]
+
+
+class TestPdfRenderResume(unittest.TestCase):
+    def test_partial_png_without_completion_manifest_is_re_rendered(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pdf = root / "comic.pdf"
+            pdf.write_bytes(b"%PDF-1.4\n")
+            out_dir = root / "comic"
+            out_dir.mkdir()
+            (out_dir / "comic PAGE1.PNG").write_bytes(b"partial")
+            ti = TagIntegrator(settings=Settings())
+            with patch("furtag._import_fitz", return_value=MagicMock()):
+                _page_dirs, jobs = ti.plan_pdf_renders(root)
+            self.assertEqual(jobs, [pdf])
+
+    def test_completed_render_requires_every_manifest_page(self):
+        from furtag import PDF_COMPLETE_FILE
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pdf = root / "comic.pdf"
+            pdf.write_bytes(b"%PDF-1.4\n")
+            st = pdf.stat()
+            out_dir = root / "comic"
+            out_dir.mkdir()
+            page1 = out_dir / "comic PAGE1.PNG"
+            page2 = out_dir / "comic PAGE2.PNG"
+            page1.write_bytes(b"one")
+            page2.write_bytes(b"two")
+            (out_dir / PDF_COMPLETE_FILE).write_text(json.dumps({
+                "version": 1,
+                "source": {"size": st.st_size, "mtime_ns": st.st_mtime_ns},
+                "dpi": 300,
+                "pages": [page1.name, page2.name],
+            }), encoding="utf-8")
+            ti = TagIntegrator(settings=Settings())
+            with patch("furtag._import_fitz", return_value=MagicMock()):
+                _page_dirs, jobs = ti.plan_pdf_renders(root)
+                self.assertEqual(jobs, [])
+                page2.unlink()
+                _page_dirs, jobs = ti.plan_pdf_renders(root)
+            self.assertEqual(jobs, [pdf])
 
 
 class TestSauceNAOThresholds(unittest.TestCase):
@@ -483,16 +529,19 @@ class TestSauceNAOQuota(unittest.TestCase):
         ti.session.post = MagicMock(side_effect=[first, second])
 
         with patch("furtag.notify") as notice:
-            ti.saucenao_search(Path("first.png"))
+            with self.assertRaises(RetryableLookupError):
+                ti.saucenao_search(Path("first.png"))
             self.assertFalse(ti.saucenao_exhausted)
             ti.pace["saucenao"].backoff.assert_called_once_with(45.0)
 
-            ti.saucenao_search(Path("second.png"))
+            with self.assertRaises(RetryableLookupError):
+                ti.saucenao_search(Path("second.png"))
             self.assertTrue(ti.saucenao_exhausted)
             self.assertEqual(ti.session.post.call_count, 2)
 
             # Once disabled, later files never spend another API request.
-            ti.saucenao_search(Path("third.png"))
+            with self.assertRaises(RetryableLookupError):
+                ti.saucenao_search(Path("third.png"))
             self.assertEqual(ti.session.post.call_count, 2)
 
         messages = [call.args[0] for call in notice.call_args_list]

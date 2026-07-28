@@ -2,6 +2,19 @@
 
 All notable changes to FurTag are documented here.
 
+## Unreleased
+
+- **Direct source notes** — e621 descriptions and InkBunny titles/descriptions now go straight from their existing API responses to Hydrus `/add_notes/set_notes`; the slow URL-downloader enrichment path is now optional and off by default.
+- **Persistent recent folders** — the GUI remembers a bounded MRU list in the platform-specific user settings file, including temporarily disconnected volumes.
+- **Safer retries** — transient source failures, partial additive hash hits, exhausted SauceNAO quota, and incomplete Hydrus/sidecar writes no longer become permanent `nomatch`/`matched` ledger records; permanent credential/media failures no longer loop forever.
+- **Ledger backfill + manifests** — old resolved entries retry once for direct notes, and directory fast-skip fingerprints now cover names, nanosecond mtimes, and sidecar state.
+- **Capability-aware backfill** — sidecar/offline scans defer direct-note migration until Hydrus can actually write notes, while missing optional permissions no longer cause full-library retry loops.
+- **Duplicate completion safety** — exact copies remain pending until the canonical result and each per-copy sidecar write complete successfully.
+- **PDF resume correctness** — partial page folders no longer count as completed renders; an atomic completion manifest validates every page.
+- **Live credential safety** — reloading/removing credentials clears stale source sessions and Hydrus permissions before reconnecting.
+- **GUI lifecycle hardening** — stale discovery results cannot populate a newly selected folder, indexing workers are retained safely, and scan-folder controls lock during active work.
+- **Privacy hardening** — local settings, recent paths, Codex memory, and FurTag PDF runtime metadata are explicitly gitignored.
+
 ## [0.1.0] — 2026-07-26
 
 First public snapshot of the current `main` tree. Suitable for people who already run Hydrus and want automated booru-backed tagging.
