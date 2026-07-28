@@ -774,5 +774,138 @@ class TestNoLiveCalls(unittest.TestCase):
         self.assertFalse(ti.has_inkbunny)
 
 
+def _auth_test_settings():
+    """Offline settings with only e621 enabled as a hash source."""
+    s = Settings()
+    s.output.hydrus_enabled = False
+    s.output.sidecars_enabled = True
+    for name in ("e621", "inkbunny", "danbooru", "gelbooru",
+                 "fluffle", "saucenao"):
+        setattr(s.sources, f"{name}_enabled", False)
+    s.sources.e621_enabled = True
+    s.pdf.pdf_enabled = False
+    return s
+
+
+class TestAuthRejectionKeepsFilesUnresolved(unittest.TestCase):
+    """HTTP 401/403 must never be laundered into a clean 'not found'.
+
+    The ledger keys on (size, mtime); a file sealed as ``nomatch`` during a
+    credential outage would stay skipped forever after the key is fixed.
+    """
+
+    def _e621_integrator(self, session):
+        ti = TagIntegrator(settings=_auth_test_settings(), session=session)
+        ti.has_e621 = True
+        ti.enabled_e621 = True
+        ti.e621_username = "u"
+        ti.e621_api_key = "k"
+        ti.headers_e6 = {"User-Agent": "test"}
+        ti.pace["e621"].wait = lambda: None
+        return ti
+
+    def test_e621_auth_rejection_is_retryable_not_a_clean_miss(self):
+        session = FakeSession(routes=[
+            ("GET", "e621.net", FakeResponse(401, {"error": "denied"})),
+        ])
+        ti = self._e621_integrator(session)
+        with patch("furtag.notify"), self.assertRaises(RetryableLookupError):
+            ti.e621_lookup_by_md5("0" * 32)
+        self.assertFalse(ti.has_e621)          # source disabled for the run
+        self.assertIn("e621", ti.auth_rejected_sources)
+
+    def test_danbooru_auth_rejection_is_retryable_not_a_clean_miss(self):
+        session = FakeSession(routes=[
+            ("GET", "danbooru.donmai.us", FakeResponse(403, {})),
+        ])
+        ti = TagIntegrator(settings=Settings(), session=session)
+        ti.has_danbooru = True
+        ti.danbooru_anon = True     # already anonymous: no fallback left
+        ti.pace["danbooru"].wait = lambda: None
+        with patch("furtag.notify"), self.assertRaises(RetryableLookupError):
+            ti.danbooru_lookup_by_md5("0" * 32)
+        self.assertFalse(ti.has_danbooru)
+        self.assertIn("danbooru", ti.auth_rejected_sources)
+
+    def test_gelbooru_auth_rejection_is_retryable_not_a_clean_miss(self):
+        session = FakeSession(routes=[
+            ("GET", "gelbooru.com", FakeResponse(401, {})),
+        ])
+        ti = TagIntegrator(settings=Settings(), session=session)
+        ti.has_gelbooru = True
+        ti.gelbooru_user_id = "1"
+        ti.gelbooru_api_key = "k"
+        ti.pace["gelbooru"].wait = lambda: None
+        with patch("furtag.notify"), self.assertRaises(RetryableLookupError):
+            ti.gelbooru_lookup_by_md5("0" * 32)
+        self.assertFalse(ti.has_gelbooru)
+        self.assertIn("gelbooru", ti.auth_rejected_sources)
+
+    def test_later_files_are_not_sealed_after_the_source_is_disabled(self):
+        """The source is gone from enabled_hash_services() — still not a miss."""
+        import concurrent.futures as cf
+        from furtag import FileItem
+
+        session = FakeSession()
+        ti = self._e621_integrator(session)
+        ti.has_e621 = False                       # disabled by an earlier 401
+        ti.auth_rejected_sources = {"e621"}
+        self.assertEqual(ti.enabled_hash_services(), [])
+
+        item = FileItem(path=Path("/tmp/later.mp4"), relpath="later.mp4",
+                        size=1, mtime=0.0, kind="video", md5="0" * 32)
+        with cf.ThreadPoolExecutor(max_workers=1) as ex:
+            ti.hash_tier(item, ex)
+        self.assertEqual(item.lookup_errors, {"e621"})
+        self.assertEqual(session.calls, [])       # no hammering of a bad key
+
+    def test_run_with_rejecting_e621_leaves_no_file_resolved(self):
+        import contextlib
+        import io
+        import shutil
+        from furtag import RESOLVED_LEDGER_STATUSES
+        from furtag_events import NullObserver
+        from furtag_settings import RunOptions
+
+        root = Path(tempfile.mkdtemp(prefix="furtag-auth-401-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        names = ["a.mp4", "b.mp4", "c.mp4"]      # videos: hash tier only
+        for i, name in enumerate(names):
+            (root / name).write_bytes(b"not-real-video-%d" % i)
+
+        session = FakeSession(routes=[
+            ("GET", "e621.net", FakeResponse(401, {"error": "denied"})),
+        ])
+        ti = self._e621_integrator(session)
+        with contextlib.redirect_stdout(io.StringIO()), patch("furtag.notify"):
+            summary = ti.run(
+                root,
+                options=RunOptions(import_unmatched=False,
+                                   result_page_limit=0,
+                                   build_already_tagged_page=False,
+                                   sync_sidecars=False, pdf_dpi=None),
+                observer=NullObserver(), use_terminal_display=False)
+
+        ledger = Ledger(root)
+        ledger.load()
+        for name in names:
+            st = (root / name).stat()
+            status = ledger.status_for(name, st.st_size, st.st_mtime)
+            self.assertNotIn(
+                status, RESOLVED_LEDGER_STATUSES,
+                f"{name} was sealed as {status!r} during an auth outage")
+        self.assertEqual(summary.unmatched, 0)
+        # The rejecting API is asked exactly once, not once per file.
+        self.assertEqual(len([c for c in session.calls if "e621" in c[1]]), 1)
+
+    def test_credential_reload_clears_the_auth_rejection(self):
+        session = FakeSession()
+        ti = TagIntegrator(settings=Settings(), session=session)
+        ti.auth_rejected_sources = {"e621"}
+        with patch("furtag.notify"):
+            ti.load_credentials({})
+        self.assertEqual(ti.auth_rejected_sources, set())
+
+
 if __name__ == "__main__":
     unittest.main()

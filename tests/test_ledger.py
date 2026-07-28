@@ -5,7 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from furtag import (
     LEDGER_METADATA_VERSION, Ledger, LedgerManager, TagIntegrator,
@@ -234,6 +234,49 @@ class TestReviewQueue(unittest.TestCase):
             self.assertEqual(rq2.list_items()[0].match_class, "tossUp")
             rq2.remove(p.id)
             self.assertEqual(len(rq2), 0)
+
+
+class TestCliReviewLoopSurvivesSourceFailure(unittest.TestCase):
+    """A raising source must defer the item, not kill the CLI.
+
+    ``resolve_pending_review`` reaches e621, which raises RetryableLookupError
+    on a 401 rather than reporting a clean miss. ``_cli_review_loop`` is called
+    inside a try that only catches KeyboardInterrupt, so an escaping error would
+    end the whole CLI with a traceback and drop the rest of the queue.
+    """
+
+    def _run_loop(self, answer, resolve):
+        import furtag as ft
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            rq = ReviewQueue(root)
+            for name in ("a.jpg", "b.jpg"):
+                rq.add(PendingReview.create(
+                    path=str(root / name), relpath=name, size=1, mtime=1.0,
+                    match_class="tossUp", platform="e621",
+                    location="https://e621.net/posts/1"))
+            ti = MagicMock()
+            ti._review_queue = rq
+            ti.resolve_pending_review.side_effect = resolve
+
+            real_isatty = ft.sys.stdin.isatty
+            ft.sys.stdin.isatty = lambda: True
+            try:
+                with patch("builtins.input", lambda *_a, **_k: answer):
+                    ft._cli_review_loop(ti, root)
+            finally:
+                ft.sys.stdin.isatty = real_isatty
+            return ti.resolve_pending_review.call_count
+
+    def test_retryable_error_defers_and_keeps_going(self):
+        from furtag import RetryableLookupError
+        calls = self._run_loop(
+            "a", RetryableLookupError("e621 authentication rejected"))
+        # Both items attempted: the loop must not abort on the first failure.
+        self.assertEqual(calls, 2)
+
+    def test_normal_approval_still_resolves(self):
+        self.assertEqual(self._run_loop("a", lambda *a, **k: True), 2)
 
 
 class TestLedgerSha256(unittest.TestCase):

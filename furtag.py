@@ -65,7 +65,7 @@ import time
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import requests
 from PIL import Image, ImageFile
@@ -1158,6 +1158,11 @@ class TagIntegrator(HydrusMixin):
         self.saucenao_exhausted = False   # set True when the daily quota runs out
         self._saucenao_consecutive_429 = 0
 
+        # Hash sources switched off mid-run by an HTTP 401/403. A rejected key
+        # is recoverable across runs (the user fixes it), so every file seen
+        # while a source sits in here must stay unresolved in the ledger.
+        self.auth_rejected_sources: Set[str] = set()
+
         # Fluffle has no credentials — availability is always True when enabled
         self.has_fluffle = True
         self.enabled_fluffle = True
@@ -1323,6 +1328,7 @@ class TagIntegrator(HydrusMixin):
         self.danbooru_anon = False
         self.saucenao_exhausted = False
         self._saucenao_consecutive_429 = 0
+        self.auth_rejected_sources = set()
         self.has_hydrus = False
         self.hydrus_tag_service_key = ""
         self.hydrus_can_edit_urls = False
@@ -1441,6 +1447,29 @@ class TagIntegrator(HydrusMixin):
             self.hydrus_direct_notes_enabled
             and self.has_hydrus
             and self.hydrus_can_edit_notes)
+
+    def _reject_source_auth(self, name: str, message: str) -> "RetryableLookupError":
+        """Disable *name* for the rest of the run after an HTTP 401/403.
+
+        Two things have to happen at once. The source is switched off so the
+        run does not hammer a rejecting API once per file (``has_*`` = False,
+        the long-standing behaviour). But a rejected key is *not* a clean
+        "this post does not exist" answer — it is recoverable as soon as the
+        user fixes their credentials, and the ledger keys on (size, mtime),
+        which never change. So the source is also remembered here; `hash_tier`
+        turns that into a per-file lookup error for every remaining file, which
+        keeps them out of ``RESOLVED_LEDGER_STATUSES`` and eligible for a
+        later run.
+
+        Returns the error to raise, so callers read as ``raise self._reject…``.
+        """
+        setattr(self, f"has_{name}", False)
+        if name not in self.auth_rejected_sources:
+            self.auth_rejected_sources.add(name)
+            notify(message)
+        return RetryableLookupError(
+            f"{name} authentication rejected (HTTP 401/403); "
+            "retry once credentials are fixed")
 
     def source_available(self, name: str) -> bool:
         """Credentials present. Called per file per service — no dict building."""
@@ -1581,10 +1610,10 @@ class TagIntegrator(HydrusMixin):
                 self.pace["e621"].backoff(10)
                 raise RetryableLookupError("e621 rate limited (HTTP 429)")
             if r.status_code in (401, 403):
-                self.has_e621 = False
-                notify("‼️  e621 authentication rejected – disabled until "
-                       "credentials are reloaded.")
-                return {}
+                raise self._reject_source_auth(
+                    "e621",
+                    "‼️  e621 authentication rejected – disabled until "
+                    "credentials are reloaded.")
             if r.status_code == 404:
                 return {}
             if r.status_code != 200:
@@ -1876,10 +1905,10 @@ class TagIntegrator(HydrusMixin):
                 self.danbooru_anon = True
                 return self._danbooru_get(url, params)
             if r.status_code in (401, 403):
-                self.has_danbooru = False
-                notify("‼️  Danbooru anonymous access rejected – disabled "
-                       "until credentials are reloaded.")
-                return []
+                raise self._reject_source_auth(
+                    "danbooru",
+                    "‼️  Danbooru anonymous access rejected – disabled "
+                    "until credentials are reloaded.")
             if r.status_code == 404:
                 return {}
             if r.status_code != 200:
@@ -1946,10 +1975,10 @@ class TagIntegrator(HydrusMixin):
                 timeout=15,
             )
             if r.status_code in (401, 403):
-                self.has_gelbooru = False
-                notify("‼️  Gelbooru authentication rejected – disabled until "
-                       "credentials are reloaded.")
-                return []
+                raise self._reject_source_auth(
+                    "gelbooru",
+                    "‼️  Gelbooru authentication rejected – disabled until "
+                    "credentials are reloaded.")
             if r.status_code == 404:
                 return []
             if r.status_code != 200:
@@ -3465,6 +3494,16 @@ class TagIntegrator(HydrusMixin):
         metadata = SourceMetadata()
         hit: Set[str] = set()
         item.lookup_errors.clear()
+        if item.md5:
+            # A source disabled mid-run by a 401/403 is not a clean miss for the
+            # files that come after it — they never even ask. Without this the
+            # rest of the run would be sealed as "nomatch", and since the ledger
+            # keys on (size, mtime) those files would stay skipped forever even
+            # after the user fixes the key. Recording the error here (rather
+            # than re-querying) keeps them unresolved without hammering the API.
+            item.lookup_errors.update(
+                s for s in HASH_SOURCES
+                if s in self.auth_rejected_sources and self.source_enabled(s))
         if not item.md5 or not services:
             return HashTierResult(metadata, [])
 
@@ -4345,19 +4384,112 @@ def _looks_like_furtag_json_sidecar(path: Path) -> bool:
     return all(isinstance(v, list) for v in data.values())
 
 
+# Namespaces FurTag itself writes into a ``.txt`` tag sidecar: the booru
+# category mappings (e621 artist/copyright/character/species/lore, Danbooru and
+# Gelbooru artist/character/copyright), Fluffle's ``site:``/``creator:``, the
+# SauceNAO ``title:``/``series:`` fields, and the rendered-PDF ``comic:``/
+# ``page:`` base tags. Everything else FurTag emits is a bare general tag.
+_FURTAG_TAG_NAMESPACES = (
+    "character", "comic", "creator", "lore", "page", "series", "site",
+    "species", "title",
+)
+_NAMESPACED_TAG_RE = re.compile(
+    r"(?:%s):[^\s]" % "|".join(_FURTAG_TAG_NAMESPACES), re.I)
+_URL_LINE_RE = re.compile(r"https?://[^\s]+")
+# A real sidecar is a handful of short lines; anything past this is someone
+# else's file and must never be read whole into memory.
+_MAX_TXT_SIDECAR_BYTES = 1024 * 1024
+_MAX_TAG_LINE_CHARS = 200
+
+
+def _read_small_utf8(path: Path, max_bytes: int) -> Optional[str]:
+    """Strict-UTF-8 contents of *path*, or None if unreadable/too big/not UTF-8.
+
+    Reads at most ``max_bytes + 1`` bytes, so a huge file costs one bounded read
+    rather than its full size in memory. ``None`` always means "can't vouch for
+    this file", which callers must treat as *not* FurTag's.
+    """
+    try:
+        with path.open("rb") as fh:
+            blob = fh.read(max_bytes + 1)
+    except OSError:
+        return None
+    if len(blob) > max_bytes:
+        return None
+    try:
+        return blob.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _is_furtag_tag_line(line: str) -> bool:
+    """True for a line shaped like one tag as ``_append_lines`` would write it.
+
+    Tags reach the sidecar already stripped and single-line, never contain a URL
+    (those go to the ``.urls.txt``), and are short. Prose, indented notes, and
+    Stable Diffusion prompt blobs all fail at least one of these.
+
+    Spaces are allowed *only* inside a namespaced value, because SauceNAO writes
+    real titles (``title:Some Comic Name``). A bare tag from any booru is
+    underscore-joined and never contains a space, so a spaced un-namespaced line
+    is prose — which is what keeps a notes file that happens to open with
+    ``title:my great idea`` from being classed as ours and deleted.
+    """
+    if not (line and line == line.strip()
+            and len(line) <= _MAX_TAG_LINE_CHARS
+            and "://" not in line
+            and not any(ord(ch) < 32 for ch in line)):
+        return False
+    return " " not in line or bool(_NAMESPACED_TAG_RE.match(line))
+
+
+def _looks_like_furtag_txt_sidecar(path: Path, *, urls: bool) -> bool:
+    """True only for text of exactly FurTag's own ``.txt`` sidecar shape.
+
+    ``<media>.<ext>.txt`` is also what gallery-dl ``--write-tags``, Stable
+    Diffusion prompt dumps, and plain hand-written notes are called, and Reset
+    deletes with ``unlink()`` — no trash, no undo. So the bias is hard toward
+    keeping: unreadable, non-UTF-8, oversized, empty, and ambiguous files are
+    all reported as *not* ours. Failing to delete a real sidecar leaves clutter
+    the user can remove by hand; the other mistake is unrecoverable.
+
+    A URL sidecar must be nothing but ``http(s)`` URLs. A tag sidecar must be
+    nothing but tag-shaped lines *and* carry at least one tag in a namespace
+    FurTag actually emits (``creator:``, ``character:``, ``species:``, ...).
+    """
+    text = _read_small_utf8(path, _MAX_TXT_SIDECAR_BYTES)
+    if text is None:
+        return False
+    # split("\n") rather than splitlines(): splitlines() also breaks on \x0b,
+    # \x0c and \u2028, which would hide the control characters we screen for.
+    lines = [ln.rstrip("\r") for ln in text.split("\n")]
+    body = [ln for ln in lines if ln.strip()]
+    if not body:
+        # FurTag never writes an empty text sidecar: _write_sidecar_results
+        # returns early with no tags/urls, and _append_lines only opens the file
+        # when it has something to append.
+        return False
+    if urls:
+        return all(_URL_LINE_RE.fullmatch(ln) for ln in body)
+    if not all(_is_furtag_tag_line(ln) for ln in body):
+        return False
+    return any(_NAMESPACED_TAG_RE.match(ln) for ln in body)
+
+
 def _is_furtag_sidecar(path: Path, json_patterns: Optional[List[str]] = None
                        ) -> bool:
-    """True only for FurTag's media-extension-preserving sidecar names.
+    """True only for FurTag sidecars — by name *and* by content.
 
-    ``.txt`` / ``.urls.txt`` names are FurTag-specific enough to accept by name.
-    A ``.json`` name is accepted only when it matches a configured JSON sidecar
-    pattern *and* the contents look like FurTag's own payload.
+    Every branch verifies the body, because each of these names is also used by
+    other tools (gallery-dl metadata/tag dumps) and by users keeping notes
+    beside their media, and Reset deletes what this returns True for.
     """
     name = path.name.lower()
     media_exts = IMG_EXTS | VIDEO_EXTS
-    if any(name.endswith(ext + ".txt") or name.endswith(ext + ".urls.txt")
-           for ext in media_exts):
-        return True
+    if any(name.endswith(ext + ".urls.txt") for ext in media_exts):
+        return _looks_like_furtag_txt_sidecar(path, urls=True)
+    if any(name.endswith(ext + ".txt") for ext in media_exts):
+        return _looks_like_furtag_txt_sidecar(path, urls=False)
     if not name.endswith(".json"):
         return False
     if json_patterns is None:
@@ -4715,16 +4847,25 @@ def _cli_review_loop(ti: TagIntegrator, root: Path) -> None:
             break
         if ans in {"s", "skip", ""}:
             continue
-        if ans in {"a", "y", "yes", "approve"}:
-            if ti.resolve_pending_review(pending, approve=True, root=root):
+        if ans in {"a", "y", "yes", "approve", "r", "n", "no", "reject"}:
+            approve = ans in {"a", "y", "yes", "approve"}
+            # A source failure here (rate limit, or a 401 that disabled the
+            # source mid-run) raises rather than returning a clean miss. The
+            # GUI already treats that as "leave it queued"; do the same here
+            # instead of dying with a traceback and dropping the rest of the
+            # queue on the floor.
+            try:
+                done = ti.resolve_pending_review(pending, approve=approve,
+                                                 root=root)
+            except RetryableLookupError as e:
+                print(f"  ⚠️  Deferred, still queued – {e}")
+                continue
+            if not done:
+                print("  ⚠️  Could not resolve.")
+            elif approve:
                 print("  ✅ Approved.")
             else:
-                print("  ⚠️  Could not resolve.")
-        elif ans in {"r", "n", "no", "reject"}:
-            if ti.resolve_pending_review(pending, approve=False, root=root):
                 print("  ❌ Rejected (nomatch).")
-            else:
-                print("  ⚠️  Could not resolve.")
 
 
 def main() -> None:

@@ -307,5 +307,155 @@ class TestForeignJsonNotOurSidecar(unittest.TestCase):
             self.assertIn("p1.png.json", names)
 
 
+class TestForeignTxtNotOurSidecar(unittest.TestCase):
+    """`<media>.<ext>.txt` is also a hand-written note / gallery-dl tag dump.
+
+    Reset deletes with ``unlink()`` — no trash, no undo — so a name match alone
+    must never mark a `.txt` deletable, exactly as for the JSON branch. The bias
+    is toward keeping: a missed sidecar is clutter, a wrong delete is gone.
+    """
+
+    def _candidates(self, root: Path, settings=None):
+        _, sidecars = _nuke_candidates(root, settings or Settings())
+        return {p.name for p in sidecars}
+
+    def test_prose_opening_with_a_namespace_word_is_not_deletable(self):
+        """A notes file may legitimately start ``title:...``.
+
+        Spaces have to be allowed inside a namespaced value (SauceNAO writes
+        real titles), so the namespace check alone would claim this file. A
+        spaced *un-namespaced* line is prose and must disqualify the file.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "notes.jpg").write_bytes(b"img")
+            (root / "notes.jpg.txt").write_text(
+                "title:my great idea\n"
+                "and then some rambling prose line here\n",
+                encoding="utf-8")
+            self.assertEqual(self._candidates(root), set())
+
+    def test_namespaced_value_with_spaces_is_still_ours(self):
+        """The prose guard must not reject genuine spaced values."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "s.jpg").write_bytes(b"img")
+            (root / "s.jpg.txt").write_text(
+                "title:Some Comic Name\ncreator:alice\nfur\n", encoding="utf-8")
+            self.assertEqual(self._candidates(root), {"s.jpg.txt"})
+
+    def test_written_tag_and_url_sidecars_are_deletable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            media = root / "real.jpg"
+            media.write_bytes(b"img")
+            ti = TagIntegrator(settings=Settings())
+            ti._write_sidecar_results(
+                media, {"creator:alice", "solo", "anthro"},
+                {"https://e621.net/posts/1"})
+            self.assertEqual(self._candidates(root),
+                             {"real.jpg.txt", "real.jpg.urls.txt"})
+
+    def test_pdf_page_base_tag_sidecar_is_deletable(self):
+        # convert_pdf writes only comic:/page: (and maybe creator:) base tags.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "comic PAGE1.PNG").write_bytes(b"png")
+            (root / "comic PAGE1.PNG.txt").write_text(
+                "comic:my comic\npage:1\n", encoding="utf-8")
+            self.assertEqual(self._candidates(root), {"comic PAGE1.PNG.txt"})
+
+    def test_handwritten_note_is_not_deletable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "commission.png").write_bytes(b"img")
+            (root / "commission.png.txt").write_text(
+                "Paid $50 on the 3rd, revisions due Friday.\n"
+                "Client wants the background swapped out.\n", encoding="utf-8")
+            self.assertEqual(self._candidates(root), set())
+
+    def test_gallerydl_write_tags_output_is_not_deletable(self):
+        # gallery-dl --write-tags: one bare tag per line, no FurTag namespaces.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "post.jpg").write_bytes(b"img")
+            (root / "post.jpg.txt").write_text(
+                "fox\nsolo\nmale\ndigital_media_(artwork)\n", encoding="utf-8")
+            self.assertEqual(self._candidates(root), set())
+
+    def test_stable_diffusion_prompt_file_is_not_deletable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "render.png").write_bytes(b"img")
+            (root / "render.png.txt").write_text(
+                "masterpiece, best quality, anthro wolf, forest background\n"
+                "Negative prompt: blurry, extra limbs\n"
+                "Steps: 30, Sampler: DPM++ 2M, CFG scale: 7, Seed: 12345\n",
+                encoding="utf-8")
+            self.assertEqual(self._candidates(root), set())
+
+    def test_empty_txt_is_not_deletable(self):
+        # FurTag never writes an empty text sidecar, so an empty one isn't ours.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "e.jpg").write_bytes(b"img")
+            (root / "e.jpg.txt").write_text("", encoding="utf-8")
+            (root / "w.jpg").write_bytes(b"img")
+            (root / "w.jpg.txt").write_text("\n  \n\n", encoding="utf-8")
+            self.assertEqual(self._candidates(root), set())
+
+    def test_non_utf8_txt_is_not_deletable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "b.jpg").write_bytes(b"img")
+            (root / "b.jpg.txt").write_bytes(b"creator:\xff\xfe caf\xe9\n")
+            self.assertEqual(self._candidates(root), set())
+
+    def test_oversized_txt_is_not_deletable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "big.jpg").write_bytes(b"img")
+            (root / "big.jpg.txt").write_text(
+                "creator:alice\n" + "solo\n" * 300_000, encoding="utf-8")
+            self.assertEqual(self._candidates(root), set())
+
+    def test_urls_sidecar_with_non_url_lines_is_not_deletable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "u.jpg").write_bytes(b"img")
+            (root / "u.jpg.urls.txt").write_text(
+                "https://e621.net/posts/1\nremember to check this one\n",
+                encoding="utf-8")
+            self.assertEqual(self._candidates(root), set())
+
+    def test_urls_sidecar_of_only_urls_is_deletable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "v.jpg").write_bytes(b"img")
+            (root / "v.jpg.urls.txt").write_text(
+                "https://e621.net/posts/1\nhttp://example.com/a?b=c\n",
+                encoding="utf-8")
+            self.assertEqual(self._candidates(root), {"v.jpg.urls.txt"})
+
+    def test_perform_nuke_removes_ours_and_spares_theirs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for name in ("mine.jpg", "theirs.jpg"):
+                (root / name).write_bytes(b"img")
+            (root / "mine.jpg.txt").write_text(
+                "creator:alice\nsolo\n", encoding="utf-8")
+            (root / "theirs.jpg.txt").write_text(
+                "My own notes about this picture, kept for years.\n",
+                encoding="utf-8")
+
+            removed, failures = perform_nuke(
+                root, include_pdf_pages=False, include_ledgers_reports=False,
+                include_sidecars=True, settings=Settings())
+
+            self.assertEqual((removed, failures), (1, []))
+            self.assertFalse((root / "mine.jpg.txt").exists())
+            self.assertTrue((root / "theirs.jpg.txt").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
