@@ -52,7 +52,9 @@ class TestSecureStoreMerge(unittest.TestCase):
         cfg = self._load({})
         self.assertEqual(cfg.get("hydrus_tag_service"), "my gui tags")
         self.assertEqual(cfg.get("hydrus_import"), "true")
-        self.assertEqual(cfg.get("hydrus_results_page"), "on")
+        # Review-page preferences stay in Settings and are no longer mixed
+        # into the credential snapshot passed to Hydrus connection setup.
+        self.assertNotIn("hydrus_results_page", cfg)
 
     def test_secret_fields_are_loaded_from_secure_snapshot(self):
         cfg = self._load({

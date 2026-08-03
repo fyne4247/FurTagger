@@ -143,6 +143,50 @@ class TestSettingsStore(unittest.TestCase):
         self.assertTrue(loaded.hydrus.direct_source_notes)
         self.assertTrue(loaded.hydrus.exact_url_enrichment)
 
+    def test_v2_page_settings_migrate_to_independent_live_pages(self):
+        loaded = Settings.from_dict({
+            "version": 2,
+            "hydrus": {
+                "results_pages_enabled": True,
+                "new_imports_page_name": "Fresh",
+                "newly_tagged_page_name": "Updated",
+                "duplicate_tagged_page_name": "Duplicates",
+                "already_tagged_page_name": "History",
+                "build_already_tagged_page": True,
+                "result_page_limit": 37,
+            },
+        })
+        h = loaded.hydrus
+        self.assertEqual(h.new_imports_page_name, "Fresh")
+        self.assertEqual(h.newly_tagged_page_name, "Updated")
+        self.assertEqual(h.duplicate_tagged_page_name, "Duplicates")
+        self.assertEqual(h.already_tagged_page_name, "History")
+        self.assertTrue(h.already_tagged_page_enabled)
+        for prefix in ("new_imports", "newly_tagged", "duplicate_tagged"):
+            self.assertEqual(getattr(h, f"{prefix}_page_limit"), 37)
+            self.assertEqual(getattr(h, f"{prefix}_page_mode"), "live")
+        self.assertEqual(h.already_tagged_page_limit, 37)
+
+    def test_page_settings_normalize_invalid_values(self):
+        loaded = Settings.from_dict({
+            "version": 3,
+            "hydrus": {
+                "new_imports_page_limit": -4,
+                "new_imports_page_mode": "rolling",
+                "newly_tagged_page_limit": "bad",
+                "duplicate_tagged_page_mode": None,
+                "already_tagged_page_limit": -1,
+                "live_page_update_interval": 999,
+            },
+        })
+        h = loaded.hydrus
+        self.assertEqual(h.new_imports_page_limit, 0)
+        self.assertEqual(h.new_imports_page_mode, "live")
+        self.assertEqual(h.newly_tagged_page_limit, 0)
+        self.assertEqual(h.duplicate_tagged_page_mode, "live")
+        self.assertEqual(h.already_tagged_page_limit, 0)
+        self.assertEqual(h.live_page_update_interval, 60)
+
     def test_forward_compat_unknown_keys(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "settings.json"

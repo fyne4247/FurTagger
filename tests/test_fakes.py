@@ -3,6 +3,7 @@
 import hashlib
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1042,11 +1043,12 @@ class TestHydrusDuplicateTaggedPage(unittest.TestCase):
                                  "service_key": "svc123"}],
             })),
         ] + _deleted_dup_routes([DUP_OK]))
-        ti = TagIntegrator(settings=Settings(), session=session)
+        settings = Settings()
+        settings.hydrus.results_pages_enabled = False
+        ti = TagIntegrator(settings=settings, session=session)
         cfg = {
             "hydrus_api_url": "http://127.0.0.1:45869",
             "hydrus_access_key": "k" * 64,
-            "hydrus_results_page": "off",
         }
         ti._init_hydrus(cfg)
         self.assertTrue(ti.has_hydrus)
@@ -1057,7 +1059,7 @@ class TestHydrusDuplicateTaggedPage(unittest.TestCase):
         self._push(ti)
         self.assertEqual(ti.hydrus_result_pages["duplicates"]["hashes"], [])
 
-    def test_page_name_comes_from_credentials_key(self):
+    def test_page_name_comes_from_settings(self):
         session = FakeSession(routes=[
             ("GET", "verify_access_key", FakeResponse(200, {
                 "basic_permissions": [0, 1, 2, 3, 4, 8],
@@ -1068,11 +1070,12 @@ class TestHydrusDuplicateTaggedPage(unittest.TestCase):
                                  "service_key": "svc123"}],
             })),
         ])
-        ti = TagIntegrator(settings=Settings(), session=session)
+        settings = Settings()
+        settings.hydrus.duplicate_tagged_page_name = "Dupe Review"
+        ti = TagIntegrator(settings=settings, session=session)
         ti._init_hydrus({
             "hydrus_api_url": "http://127.0.0.1:45869",
             "hydrus_access_key": "k" * 64,
-            "hydrus_duplicate_tagged_page": "Dupe Review",
         })
         self.assertTrue(ti.hydrus_result_pages["duplicates"]["enabled"])
         self.assertEqual(ti.hydrus_result_pages["duplicates"]["name"],
@@ -1099,6 +1102,152 @@ class TestHydrusDuplicateTaggedPage(unittest.TestCase):
         ti._hydrus_flush_result_pages()
         self.assertEqual([c["page_name"] for c in created], ["Dupe Review"])
         self.assertEqual(created[0]["hashes"], [DUP_OK])
+
+
+class TestHydrusLivePagePublisher(unittest.TestCase):
+    def _integrator(self, settings, routes):
+        ti = _hydrus_ti(FakeSession(routes), settings=settings)
+        ti.hydrus_can_manage_pages = True
+        ti.apply_settings(settings)
+        return ti
+
+    def test_interval_zero_creates_then_appends_by_page_key(self):
+        created = threading.Event()
+        appended = threading.Event()
+        bodies = []
+
+        def new_page(_url, kwargs):
+            bodies.append(("new", kwargs["json"]))
+            created.set()
+            return FakeResponse(200, {"page_key": "live-key"})
+
+        def add_files(_url, kwargs):
+            bodies.append(("add", kwargs["json"]))
+            appended.set()
+            return FakeResponse(200, {})
+
+        settings = Settings()
+        settings.hydrus.live_page_update_interval = 0
+        ti = self._integrator(settings, [
+            ("POST", "manage_pages/new_page", new_page),
+            ("POST", "manage_pages/add_files", add_files),
+        ])
+        ti._hydrus_start_result_page_run()
+        try:
+            ti._hydrus_add_to_page("new", "a" * 64)
+            self.assertTrue(created.wait(1))
+            ti._hydrus_add_to_page("new", "b" * 64)
+            self.assertTrue(appended.wait(1))
+        finally:
+            ti._hydrus_finalize_result_page_run()
+        self.assertEqual(bodies[0][1]["hashes"], ["a" * 64])
+        self.assertEqual(bodies[1][1], {
+            "page_key": "live-key", "hashes": ["b" * 64]})
+
+    def test_live_limit_deduplicates_and_keeps_first_n(self):
+        created = []
+
+        def new_page(_url, kwargs):
+            created.append(kwargs["json"])
+            return FakeResponse(200, {"page_key": "limited"})
+
+        settings = Settings()
+        settings.hydrus.live_page_update_interval = 60
+        settings.hydrus.new_imports_page_limit = 2
+        ti = self._integrator(settings, [
+            ("POST", "manage_pages/new_page", new_page),
+        ])
+        ti._hydrus_start_result_page_run()
+        for value in ("a", "a", "b", "c"):
+            ti._hydrus_add_to_page("new", value * 64)
+        ti._hydrus_finalize_result_page_run()
+        self.assertEqual(created[0]["hashes"], ["a" * 64, "b" * 64])
+
+    def test_publication_batches_are_capped_at_256(self):
+        calls = []
+
+        def new_page(_url, kwargs):
+            calls.append(("new", kwargs["json"]))
+            return FakeResponse(200, {"page_key": "batched"})
+
+        def add_files(_url, kwargs):
+            calls.append(("add", kwargs["json"]))
+            return FakeResponse(200, {})
+
+        settings = Settings()
+        settings.hydrus.live_page_update_interval = 60
+        ti = self._integrator(settings, [
+            ("POST", "manage_pages/new_page", new_page),
+            ("POST", "manage_pages/add_files", add_files),
+        ])
+        ti._hydrus_start_result_page_run()
+        for number in range(600):
+            ti._hydrus_add_to_page("new", f"{number:064x}")
+        ti._hydrus_finalize_result_page_run()
+        self.assertEqual(
+            [len(body["hashes"]) for _kind, body in calls],
+            [256, 256, 88])
+
+    def test_deferred_limit_creates_newest_n_only_at_finalization(self):
+        created = []
+
+        def new_page(_url, kwargs):
+            created.append(kwargs["json"])
+            return FakeResponse(200, {"page_key": "deferred"})
+
+        settings = Settings()
+        settings.hydrus.new_imports_page_mode = "end_of_run"
+        settings.hydrus.new_imports_page_limit = 2
+        ti = self._integrator(settings, [
+            ("POST", "manage_pages/new_page", new_page),
+        ])
+        ti._hydrus_start_result_page_run()
+        for value in ("a", "b", "c"):
+            ti._hydrus_add_to_page("new", value * 64)
+        self.assertEqual(created, [])
+        ti._hydrus_finalize_result_page_run()
+        self.assertEqual(created[0]["hashes"], ["b" * 64, "c" * 64])
+
+    def test_one_page_failure_does_not_disable_another(self):
+        def new_page(_url, kwargs):
+            if kwargs["json"]["page_name"] == "Broken":
+                return FakeResponse(500, {}, text="boom")
+            return FakeResponse(200, {"page_key": "healthy"})
+
+        settings = Settings()
+        settings.hydrus.live_page_update_interval = 60
+        settings.hydrus.new_imports_page_name = "Broken"
+        settings.hydrus.newly_tagged_page_name = "Healthy"
+        ti = self._integrator(settings, [
+            ("POST", "manage_pages/new_page", new_page),
+        ])
+        ti._hydrus_start_result_page_run()
+        ti._hydrus_add_to_page("new", "a" * 64)
+        ti._hydrus_add_to_page("updated", "b" * 64)
+        with patch("furtag_hydrus._notify") as warning:
+            ti._hydrus_finalize_result_page_run()
+        self.assertTrue(ti.hydrus_result_pages["new"].failed)
+        self.assertFalse(ti.hydrus_result_pages["updated"].failed)
+        self.assertEqual(ti.hydrus_result_pages["updated"].page_key, "healthy")
+        self.assertEqual(warning.call_count, 1)
+
+    def test_consecutive_runs_clear_hashes_and_page_keys(self):
+        settings = Settings()
+        settings.hydrus.live_page_update_interval = 60
+        ti = self._integrator(settings, [
+            ("POST", "manage_pages/new_page",
+             FakeResponse(200, {"page_key": "first"})),
+        ])
+        ti._hydrus_start_result_page_run()
+        ti._hydrus_add_to_page("new", "a" * 64)
+        ti._hydrus_finalize_result_page_run()
+        self.assertEqual(ti.hydrus_result_pages["new"].page_key, "first")
+        ti._hydrus_start_result_page_run()
+        try:
+            self.assertEqual(ti.hydrus_result_pages["new"].hashes, [])
+            self.assertIsNone(ti.hydrus_result_pages["new"].page_key)
+        finally:
+            ti._hydrus_finalize_result_page_run()
 
 
 class TestNoLiveCalls(unittest.TestCase):
@@ -1260,8 +1409,6 @@ class TestAuthRejectionKeepsFilesUnresolved(unittest.TestCase):
             summary = ti.run(
                 root,
                 options=RunOptions(import_unmatched=False,
-                                   result_page_limit=0,
-                                   build_already_tagged_page=False,
                                    sync_sidecars=False, pdf_dpi=None),
                 observer=NullObserver(), use_terminal_display=False)
 

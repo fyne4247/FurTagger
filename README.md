@@ -39,7 +39,7 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
 - **Direct source notes** — e621 descriptions and InkBunny titles/descriptions are reused from source API responses FurTag already fetched, then written straight to Hydrus notes by SHA-256. This is the default and does **not** queue a downloader job per URL.
 - **Optional legacy URL enrichment** — exact post URLs can still be queued through Hydrus for parser-only metadata such as timestamps. It is off by default because it is substantially slower. Perceptual/external URLs and multi-file InkBunny submissions remain associate-only.
 - **Resumable sidecar sync** — push existing `<file>.txt` / `<file>.urls.txt` into Hydrus without re-searching; successful payloads are checkpointed in the ledger.
-- **Result pages** — optional New Imports / Newly Tagged / Duplicate Tagged / Already Tagged pages.
+- **Configurable live result pages** — New Imports, Newly Tagged, and Duplicate Tagged can update while a scan is running (10-second default cadence) or be created at the end. Each page has its own enabled state, name, and limit; Already Tagged is a separate one-shot pre-scan page.
 - **Deleted-file duplicates** — when import hits a previously deleted file, tags/URLs can be applied to current Hydrus duplicate-group members (same URL policy as a normal push). FurTag retains the original SHA and target hashes. A successful empty relationship query is terminal for that Hydrus database; missing permission or API failure remains retryable, and a policy-disabled result reopens if the option is enabled later.
 - **Database-scoped checkpoints** — Hydrus completion state is bound to a persisted, non-secret database identity plus API origin. If the database is replaced at the same address, use **Hydrus → Use a new/replaced Hydrus database…** to rotate the identity and revalidate old decisions.
 
@@ -91,6 +91,10 @@ python3 -m venv .venv
 .venv/bin/python furtag.py
 ```
 
+Hydrus review pages are configured persistently on the GUI's **Settings →
+Hydrus** tab. The CLI uses those saved settings; it no longer asks for a shared
+page limit or an Already Tagged override at launch.
+
 On first run the launcher creates `.venv`, installs dependencies, and verifies the HTTPS CA bundle (`certifi`). If you **rename or move** the project folder while a scan is running, restart FurTag so workers pick up the new path.
 
 ### Selective reset (NUKE!)
@@ -120,7 +124,24 @@ Open **Credentials** in the GUI, or set environment variables:
 
 Resolution order: **environment → OS keyring**. Missing credentials disable only that source.
 
-Non-secret options (thresholds, source toggles, page names, sidecar patterns, rate limits, direct notes, optional URL enrichment, and Hydrus database identity) live in platform-specific `settings.json` via `platformdirs`.
+Non-secret options (thresholds, source toggles, page configuration, sidecar patterns, rate limits, direct notes, optional URL enrichment, and Hydrus database identity) live in platform-specific `settings.json` via `platformdirs`.
+
+Each Hydrus review page has its own toggle, name, and limit (`0` means
+unlimited). For the three scan-result pages:
+
+- **Live** lazily creates the page when its first results arrive, then appends
+  later batches at the configured 0–60 second cadence. A finite limit keeps the
+  **first N** results.
+- **End of run** creates the page only during finalization. A finite limit keeps
+  the **newest N** results.
+
+Already Tagged is built once before matching from unchanged ledger records and
+uses only its own toggle and limit. Hydrus's Client API can append files to an
+open page but cannot remove individual files, so an exact live rolling newest-N
+page is not possible. FurTag therefore states the finite live behavior as
+first-N and does not create rollover pages or temporary database tags. The
+metadata-downloader page is owned by Hydrus's downloader and is configured
+separately from these review-page limits.
 
 The GUI also remembers up to 12 recently selected scan folders there, including temporarily disconnected volumes; the **Clear** button forgets the list. This history is local machine state: it is never written into the repository, media ledgers, or sidecars, and local settings/state filenames are gitignored.
 

@@ -35,6 +35,46 @@ HYDRUS_PAGE_BATCH = 256         # hashes per manage_pages call
 HYDRUS_RELATIONSHIP_DUPLICATES = "8"  # Hydrus duplicate-status enum; "3" = alternates
 
 
+@dataclass
+class HydrusResultPageState:
+    """Persistent page configuration plus state owned by one scan.
+
+    The small mapping compatibility shim is intentionally temporary-friendly:
+    older callers that only inspect ``page["hashes"]`` keep working, while the
+    engine itself gets typed fields and never shares keys/queues between runs.
+    """
+
+    kind: str
+    name: str = ""
+    configured_enabled: bool = True
+    enabled: bool = False
+    mode: str = "live"
+    limit: int = 0
+    hashes: List[str] = field(default_factory=list)
+    pending: List[str] = field(default_factory=list)
+    seen: Set[str] = field(default_factory=set)
+    page_key: Optional[str] = None
+    failed: bool = False
+
+    def reset(self, *, enabled: bool) -> None:
+        self.enabled = enabled
+        self.hashes.clear()
+        self.pending.clear()
+        self.seen.clear()
+        self.page_key = None
+        self.failed = False
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        setattr(self, key, value)
+
+    def update(self, values: Dict[str, Any]) -> None:
+        for key, value in values.items():
+            setattr(self, key, value)
+
+
 class HydrusImportState(str, Enum):
     """What happened to the import of this content (axis A)."""
 
@@ -187,25 +227,7 @@ class HydrusMixin:
             cfg.get("hydrus_also_sidecars", "false"), default=False)
         self.hydrus_tag_deleted_duplicates = _truthy(
             cfg.get("hydrus_tag_deleted_duplicates", "true"), default=True)
-        try:
-            self.hydrus_results_page_limit = max(
-                0, int((cfg.get("hydrus_results_page_limit") or "0").strip()))
-        except ValueError:
-            _notify("⚠️  Invalid hydrus_results_page_limit; using unlimited.")
-            self.hydrus_results_page_limit = 0
-        page_setting = cfg.get("hydrus_results_page", "on").strip()
-        page_requested = page_setting.lower() not in {"", "0", "false", "no", "off"}
-        for key, cfg_key in (("new", "hydrus_new_imports_page"),
-                             ("updated", "hydrus_newly_tagged_page"),
-                             ("duplicates", "hydrus_duplicate_tagged_page")):
-            name = cfg.get(cfg_key, "").strip()
-            if name:
-                self.hydrus_result_pages[key]["name"] = name
-        old_page_setting = cfg.get(
-            "hydrus_already_tagged_page", "Already Tagged").strip()
-        self.hydrus_already_tagged_page_name = old_page_setting or "Already Tagged"
-        old_page_requested = old_page_setting.lower() not in {
-            "", "0", "false", "no", "off"}
+        page_requested = bool(self.settings.hydrus.results_pages_enabled)
 
         try:
             r = self.session.get(
@@ -221,6 +243,7 @@ class HydrusMixin:
             permissions = access.get("basic_permissions") or []
             everything = access.get("permits_everything", False)
             can_manage_pages = everything or 4 in permissions
+            self.hydrus_can_manage_pages = can_manage_pages
             # Hydrus permission 0 = "Import and Edit URLs"; associate_url 403s
             # without it, so know up front rather than failing per file.
             self.hydrus_can_edit_urls = everything or 0 in permissions
@@ -250,10 +273,14 @@ class HydrusMixin:
                 _notify("⚠️  Deleted-file duplicate tagging disabled – access key needs "
                        "'Manage File Relationships'.")
             for page in self.hydrus_result_pages.values():
-                page["enabled"] = page_requested and can_manage_pages
+                page.enabled = (
+                    page_requested and page.configured_enabled
+                    and can_manage_pages)
             self.hydrus_already_tagged_page_enabled = (
-                old_page_requested and can_manage_pages)
-            if (page_requested or old_page_requested) and not can_manage_pages:
+                page_requested
+                and self.settings.hydrus.already_tagged_page_enabled
+                and can_manage_pages)
+            if page_requested and not can_manage_pages:
                 _notify("⚠️  Hydrus pages disabled – access key needs Manage Pages permission.")
             svc_key = self._hydrus_resolve_tag_service(self.hydrus_tag_service_name)
             if not svc_key:
@@ -860,20 +887,111 @@ class HydrusMixin:
 
 
     def _hydrus_add_to_page(self, kind: str, file_hash: str) -> None:
-        """Keep a result-page hash, retaining only the newest configured N.
-
-        Hydrus's public page API can append but cannot remove individual files,
-        so pages are created once at the end of the run from this rolling list.
-        """
+        """Accept a result hash without making page API traffic block a worker."""
         page = self.hydrus_result_pages.get(kind)
-        if not page or not page["enabled"]:
+        if not page or not page.enabled or page.failed or not file_hash:
             return
-        hashes = page["hashes"]
-        if file_hash in hashes:
-            hashes.remove(file_hash)
-        hashes.append(file_hash)
-        if self.hydrus_results_page_limit:
-            del hashes[:-self.hydrus_results_page_limit]
+        with self._hydrus_page_condition:
+            if file_hash in page.seen:
+                return
+            if page.mode == "live" and page.limit and len(page.hashes) >= page.limit:
+                return
+            page.seen.add(file_hash)
+            page.hashes.append(file_hash)
+            if page.mode == "end_of_run":
+                if page.limit and len(page.hashes) > page.limit:
+                    del page.hashes[:-page.limit]
+            else:
+                page.pending.append(file_hash)
+                if self.hydrus_live_page_update_interval == 0:
+                    self._hydrus_page_condition.notify()
+
+
+    def _hydrus_start_result_page_run(self) -> None:
+        """Reset all page runtime state and start this scan's live publisher."""
+        hy = self.settings.hydrus
+        enabled_master = bool(
+            self.has_hydrus and self.hydrus_can_manage_pages
+            and hy.results_pages_enabled)
+        with self._hydrus_page_condition:
+            self._hydrus_page_failures.clear()
+            self._hydrus_page_stop = False
+            self._hydrus_page_run_active = True
+            for page in self.hydrus_result_pages.values():
+                page.reset(enabled=enabled_master and page.configured_enabled)
+        self.hydrus_already_tagged_page_enabled = bool(
+            enabled_master and hy.already_tagged_page_enabled)
+        live_enabled = any(
+            page.enabled and page.mode == "live"
+            for page in self.hydrus_result_pages.values())
+        self._hydrus_page_publisher = None
+        if live_enabled:
+            self._hydrus_page_publisher = threading.Thread(
+                target=self._hydrus_page_publisher_loop,
+                name="hydrus-page-publisher", daemon=True)
+            self._hydrus_page_publisher.start()
+
+
+    def _hydrus_page_publisher_loop(self) -> None:
+        """Publish live page queues periodically until final synchronous drain."""
+        interval = self.hydrus_live_page_update_interval
+        while True:
+            with self._hydrus_page_condition:
+                if not self._hydrus_page_stop:
+                    if interval == 0:
+                        self._hydrus_page_condition.wait_for(
+                            lambda: self._hydrus_page_stop or any(
+                                page.pending for page in
+                                self.hydrus_result_pages.values()))
+                    else:
+                        self._hydrus_page_condition.wait(timeout=interval)
+                stopping = self._hydrus_page_stop
+                batches = []
+                for page in self.hydrus_result_pages.values():
+                    if page.mode != "live" or not page.pending:
+                        continue
+                    batch = page.pending[:]
+                    page.pending.clear()
+                    batches.append((page, batch))
+            for page, batch in batches:
+                self._hydrus_publish_live_batch(page, batch)
+            if stopping:
+                return
+
+
+    def _hydrus_publish_live_batch(
+            self, page: HydrusResultPageState, hashes: List[str]) -> None:
+        if not hashes or not page.enabled or page.failed:
+            return
+        try:
+            if page.page_key is None:
+                page.page_key = self._hydrus_create_hash_page(page.name, hashes)
+                if not page.page_key:
+                    raise RuntimeError("page creation returned no page key")
+                return
+            for start in range(0, len(hashes), HYDRUS_PAGE_BATCH):
+                with self._hydrus_page_api_lock:
+                    r = self._hydrus_post("manage_pages/add_files", {
+                        "page_key": page.page_key,
+                        "hashes": hashes[start:start + HYDRUS_PAGE_BATCH],
+                    }, 30)
+                if r.status_code != 200:
+                    raise RuntimeError(
+                        f"HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            self._hydrus_disable_result_page(page, e)
+
+
+    def _hydrus_disable_result_page(
+            self, page: HydrusResultPageState, error: Exception) -> None:
+        """Disable only one page and retain one warning for run finalization."""
+        with self._hydrus_page_condition:
+            if page.failed:
+                return
+            page.failed = True
+            page.enabled = False
+            page.pending.clear()
+            self._hydrus_page_failures[page.name] = str(error)
 
 
     def _hydrus_create_hash_page(self, name: str, hashes: List[str]) -> Optional[str]:
@@ -885,7 +1003,7 @@ class HydrusMixin:
         page exists is reported and stops the fill, keeping what landed.
         """
         first, rest = hashes[:HYDRUS_PAGE_BATCH], hashes[HYDRUS_PAGE_BATCH:]
-        with self._hydrus_lock:
+        with self._hydrus_page_api_lock:
             r = self._hydrus_post("manage_pages/new_page", {
                 "page_type": 6,
                 "page_name": name,
@@ -902,26 +1020,59 @@ class HydrusMixin:
                     "hashes": rest[start:start + HYDRUS_PAGE_BATCH],
                 }, 30)
                 if r.status_code != 200:
-                    _notify(f"⚠️  Hydrus stopped filling '{name}' page "
-                           f"(HTTP {r.status_code}).")
-                    break
+                    raise RuntimeError(
+                        f"HTTP {r.status_code}: {r.text[:200]}")
         return page_key
 
 
     def _hydrus_flush_result_pages(self) -> None:
-        """Create this run's hash-locked result pages from their rolling lists."""
+        """Compatibility helper: synchronously publish all uncreated pages."""
         if not self.has_hydrus:
             return
         for page in self.hydrus_result_pages.values():
-            if not page["enabled"] or not page["hashes"]:
+            if not page.enabled or page.failed or not page.hashes or page.page_key:
                 continue
-            name = page["name"]
             try:
-                self._hydrus_create_hash_page(name, page["hashes"])
+                page.page_key = self._hydrus_create_hash_page(
+                    page.name, list(page.hashes))
             except Exception as e:
-                page["enabled"] = False
-                _notify(f"⚠️  Hydrus '{name}' page unavailable ({e}); "
-                       "continuing without it.")
+                self._hydrus_disable_result_page(page, e)
+
+
+    def _hydrus_finalize_result_page_run(self) -> None:
+        """Drain live queues, create deferred pages, and stop the publisher."""
+        if not self._hydrus_page_run_active:
+            return
+        with self._hydrus_page_condition:
+            self._hydrus_page_stop = True
+            self._hydrus_page_condition.notify_all()
+        publisher = self._hydrus_page_publisher
+        if publisher is not None:
+            publisher.join()
+
+        # Defensive synchronous drain for a run with no publisher, and for any
+        # queue accepted immediately around shutdown.
+        for page in self.hydrus_result_pages.values():
+            if page.mode == "live":
+                with self._hydrus_page_condition:
+                    pending = page.pending[:]
+                    page.pending.clear()
+                self._hydrus_publish_live_batch(page, pending)
+            elif page.enabled and not page.failed and page.hashes:
+                try:
+                    page.page_key = self._hydrus_create_hash_page(
+                        page.name, list(page.hashes))
+                except Exception as e:
+                    self._hydrus_disable_result_page(page, e)
+
+        if self._hydrus_page_failures:
+            details = "; ".join(
+                f"{name}: {error}" for name, error in
+                self._hydrus_page_failures.items())
+            _notify("⚠️  Some Hydrus review pages were disabled for this run "
+                    f"({details}). Tagging and other pages continued.")
+        self._hydrus_page_publisher = None
+        self._hydrus_page_run_active = False
 
 
     @staticmethod
@@ -1023,7 +1174,10 @@ class HydrusMixin:
                 self.hydrus_already_tagged_page_name, hashes)
         except (requests.RequestException, ValueError, KeyError, TypeError,
                 RuntimeError) as e:
-            _notify(f"⚠️  Hydrus Already Tagged page failed: {e}")
+            with self._hydrus_page_condition:
+                self._hydrus_page_failures.setdefault(
+                    self.hydrus_already_tagged_page_name, str(e))
+            self.hydrus_already_tagged_page_enabled = False
             return 0
         return len(hashes)
 

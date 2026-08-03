@@ -90,6 +90,7 @@ from furtag_credentials import CredentialStore
 from furtag_urls import UrlWritePolicy
 from furtag_hydrus import (
     HydrusMixin,
+    HydrusResultPageState,
     HYDRUS_HASH_LOOKUP_BATCH,
     HYDRUS_PAGE_BATCH,
     HYDRUS_RELATIONSHIP_DUPLICATES,
@@ -1450,23 +1451,24 @@ class TagIntegrator(HydrusMixin):
         self.hydrus_can_manage_relationships = False
         self.hydrus_exact_url_enrichment = True
         self.hydrus_exact_url_enrichment_page_name = "FurTag Metadata"
-        # Three result pages: genuinely new imports, files already in Hydrus
-        # that merely gained tags, and current duplicate-group members tagged
-        # on behalf of a previously-deleted file. Hashes are retained as rolling
-        # newest-N lists, then each page is created once when the scan finishes.
-        # Page names come from settings via apply_settings().
-        self.hydrus_result_pages: Dict[str, Dict] = {
-            "new":        {"name": "", "enabled": False, "hashes": []},
-            "updated":    {"name": "", "enabled": False, "hashes": []},
-            "duplicates": {"name": "", "enabled": False, "hashes": []},
+        self.hydrus_result_pages: Dict[str, HydrusResultPageState] = {
+            "new": HydrusResultPageState("new"),
+            "updated": HydrusResultPageState("updated"),
+            "duplicates": HydrusResultPageState("duplicates"),
         }
         self.hydrus_already_tagged_page_name = ""
         self.hydrus_already_tagged_page_enabled = False
-        # Set once from the startup Hydrus menu. None means do not build an
-        # Already Tagged page this session; 0 means include every match.
-        self.hydrus_already_tagged_page_limit: Optional[int] = None
+        self.hydrus_already_tagged_page_limit = 0
+        self.hydrus_live_page_update_interval = 10
         self.has_hydrus = False
+        self.hydrus_can_manage_pages = False
         self._hydrus_lock = threading.Lock()  # serialise API writes (hash + perc)
+        self._hydrus_page_api_lock = threading.Lock()
+        self._hydrus_page_condition = threading.Condition()
+        self._hydrus_page_publisher: Optional[threading.Thread] = None
+        self._hydrus_page_stop = False
+        self._hydrus_page_run_active = False
+        self._hydrus_page_failures: Dict[str, str] = {}
         self.apply_settings(self.settings)
 
     def apply_settings(self, settings: Settings) -> None:
@@ -1500,11 +1502,21 @@ class TagIntegrator(HydrusMixin):
         self.hydrus_exact_url_enrichment = bool(hy.exact_url_enrichment)
         self.hydrus_exact_url_enrichment_page_name = (
             hy.exact_url_enrichment_page_name.strip() or "FurTag Metadata")
-        self.hydrus_results_page_limit = hy.result_page_limit
-        self.hydrus_result_pages["new"]["name"] = hy.new_imports_page_name
-        self.hydrus_result_pages["updated"]["name"] = hy.newly_tagged_page_name
-        self.hydrus_result_pages["duplicates"]["name"] = hy.duplicate_tagged_page_name
+        for kind, prefix in (("new", "new_imports"),
+                             ("updated", "newly_tagged"),
+                             ("duplicates", "duplicate_tagged")):
+            page = self.hydrus_result_pages[kind]
+            page.name = getattr(hy, f"{prefix}_page_name")
+            page.configured_enabled = bool(
+                getattr(hy, f"{prefix}_page_enabled"))
+            page.limit = getattr(hy, f"{prefix}_page_limit")
+            page.mode = getattr(hy, f"{prefix}_page_mode")
         self.hydrus_already_tagged_page_name = hy.already_tagged_page_name
+        self.hydrus_already_tagged_page_enabled = bool(
+            hy.results_pages_enabled and hy.already_tagged_page_enabled
+            and self.hydrus_can_manage_pages)
+        self.hydrus_already_tagged_page_limit = hy.already_tagged_page_limit
+        self.hydrus_live_page_update_interval = hy.live_page_update_interval
         self._apply_source_toggles()
 
     def _reresolve_tag_service(self) -> None:
@@ -1605,8 +1617,9 @@ class TagIntegrator(HydrusMixin):
         self.hydrus_can_edit_notes = False
         self.hydrus_can_search_files = False
         self.hydrus_can_manage_relationships = False
+        self.hydrus_can_manage_pages = False
         for page in self.hydrus_result_pages.values():
-            page["enabled"] = False
+            page.enabled = False
         self.hydrus_already_tagged_page_enabled = False
 
         # Non-secret Hydrus preferences always come from Settings.
@@ -1616,12 +1629,6 @@ class TagIntegrator(HydrusMixin):
             "hydrus_import": _bool_str(out.hydrus_import),
             "hydrus_also_sidecars": _bool_str(out.sidecars_enabled),
             "hydrus_tag_deleted_duplicates": _bool_str(out.hydrus_tag_deleted_duplicates),
-            "hydrus_results_page_limit": str(hy.result_page_limit),
-            "hydrus_new_imports_page": hy.new_imports_page_name,
-            "hydrus_newly_tagged_page": hy.newly_tagged_page_name,
-            "hydrus_duplicate_tagged_page": hy.duplicate_tagged_page_name,
-            "hydrus_already_tagged_page": hy.already_tagged_page_name,
-            "hydrus_results_page": "on" if hy.results_pages_enabled else "off",
         }
         if out.hydrus_tag_service:
             defaults["hydrus_tag_service"] = out.hydrus_tag_service
@@ -4518,10 +4525,14 @@ class TagIntegrator(HydrusMixin):
         self._display_detached = False
         if disp is not None:
             _display = disp
+        if options and options.settings_override is not None:
+            self.apply_settings(options.settings_override)
+        self._hydrus_start_result_page_run()
         try:
             return self._run_pipeline(
                 root, options, cancel_event, use_terminal_display, pdf_dpi)
         finally:
+            self._hydrus_finalize_result_page_run()
             self._detach_display()
             _display = prev_display
             set_active_observer(prev_active)
@@ -4549,8 +4560,6 @@ class TagIntegrator(HydrusMixin):
                       cancel_event: Optional[threading.Event],
                       use_terminal_display: bool,
                       pdf_dpi: Optional[int]) -> ScanSummary:
-        if options and options.settings_override is not None:
-            self.apply_settings(options.settings_override)
         if cancel_event is None:
             self.cancel_event = threading.Event()
         else:
@@ -4566,18 +4575,9 @@ class TagIntegrator(HydrusMixin):
                          ("e621", "inkbunny", "danbooru",
                           "gelbooru", "fluffle", "saucenao")})
 
-        # Per-scan result pages
-        for page in self.hydrus_result_pages.values():
-            page["hashes"].clear()
-
         # Apply run options onto instance
         if options is not None:
             self.hydrus_import_unmatched = options.import_unmatched
-            self.hydrus_results_page_limit = options.result_page_limit
-            if options.build_already_tagged_page:
-                self.hydrus_already_tagged_page_limit = options.result_page_limit
-            else:
-                self.hydrus_already_tagged_page_limit = None
             if options.sync_sidecars and self.has_hydrus:
                 self.sync_sidecars_to_hydrus(Path(root))
 
@@ -4649,12 +4649,12 @@ class TagIntegrator(HydrusMixin):
                 f"⚠️  Hydrus reconciliation remains pending for "
                 f"{prior_reconciled.failed} prior no-match file(s).")
         has_prior_matches = self._has_prior_matched_files(ledger_mgr)
-        at_limit = (self.hydrus_already_tagged_page_limit
-                    if (self.has_hydrus and self.hydrus_already_tagged_page_enabled
-                        and has_prior_matches)
-                    else None)
+        build_already = bool(
+            self.has_hydrus and self.hydrus_already_tagged_page_enabled
+            and has_prior_matches)
         already_tagged = self._hydrus_populate_already_tagged_page(
-            ledger_mgr, at_limit)
+            ledger_mgr, self.hydrus_already_tagged_page_limit
+            if build_already else None)
         if already_tagged:
             ledger_mgr.save_all()
             print(f"✅ Already Tagged page → {already_tagged} ledger-matched file(s)")
@@ -5122,7 +5122,6 @@ class TagIntegrator(HydrusMixin):
         finally:
             if pdf_executor is not None:
                 pdf_executor.shutdown(wait=True)
-            self._hydrus_flush_result_pages()
             self._flush_repeated_issues()
             # Close the panel before the closing bookkeeping below, whose
             # notify()s must print rather than redraw a torn-down panel.
@@ -5577,23 +5576,6 @@ def _prompt_for_nuke(settings: Optional[Settings] = None) -> Optional[Path]:
     return root
 
 
-def prompt_for_already_tagged(page_limit: int) -> Optional[int]:
-    """Set the session-wide Already Tagged page policy.
-
-    Uses the same per-window newest-N cap as the other Hydrus review pages, so
-    every page created before the launcher exits follows one consistent limit.
-    """
-    if not sys.stdin.isatty():
-        return page_limit
-    try:
-        ans = input(
-            "\n👀 Build an 'Already Tagged' page for ledger-skipped matches "
-            "in each scanned folder? [y/N]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return None
-    return page_limit if ans in {"y", "yes"} else None
-
-
 def prompt_for_unmatched_import() -> bool:
     """Session-wide choice to import files with no tags or source URLs."""
     if not sys.stdin.isatty():
@@ -5606,30 +5588,6 @@ def prompt_for_unmatched_import() -> bool:
     except (EOFError, KeyboardInterrupt):
         return False
     return answer in {"y", "yes"}
-
-
-def prompt_for_results_page_limit(default: int) -> int:
-    """Ask for the launcher-session newest-N cap on every review page."""
-    if not sys.stdin.isatty():
-        return default
-    while True:
-        try:
-            raw = input(
-                "\n👀 Hydrus review-page limit (kept until FurTag closes) "
-                f"[0 = unlimited, default {default}]: "
-            ).strip().replace(",", "")
-        except (EOFError, KeyboardInterrupt):
-            return default
-        if not raw:
-            return default
-        try:
-            limit = int(raw)
-        except ValueError:
-            print("   Enter 0 for unlimited, or a whole positive number.")
-            continue
-        if limit >= 0:
-            return limit
-        print("   Enter 0 for unlimited, or a whole positive number.")
 
 
 def prompt_for_sidecar_sync() -> bool:
@@ -5754,14 +5712,7 @@ def main() -> None:
         except (EOFError, KeyboardInterrupt):
             sys.exit("\n👋 Bye.")
 
-    # These Hydrus choices apply to every folder scanned before FurTag exits.
     if ti.has_hydrus:
-        if any(page["enabled"] for page in ti.hydrus_result_pages.values()):
-            ti.hydrus_results_page_limit = prompt_for_results_page_limit(
-                ti.hydrus_results_page_limit)
-        if ti.hydrus_already_tagged_page_enabled:
-            ti.hydrus_already_tagged_page_limit = prompt_for_already_tagged(
-                ti.hydrus_results_page_limit)
         ti.hydrus_import_unmatched = (
             prompt_for_unmatched_import() if ti.hydrus_import else False)
 
@@ -5769,9 +5720,6 @@ def main() -> None:
         root = prompt_for_folder(settings)
         opts = RunOptions.from_settings(ti.settings)
         opts.import_unmatched = ti.hydrus_import_unmatched
-        opts.result_page_limit = ti.hydrus_results_page_limit
-        opts.build_already_tagged_page = (
-            ti.hydrus_already_tagged_page_limit is not None)
         if ti.has_hydrus and prompt_for_sidecar_sync():
             opts.sync_sidecars = True
         try:

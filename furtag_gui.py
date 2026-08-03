@@ -610,15 +610,54 @@ class SettingsPanel(QWidget):
             "descriptions straight to Hydrus notes. Requires the Hydrus "
             "'Add Notes / Edit File Notes' permission.")
         self.exact_url_enrichment_page_name = QLineEdit()
-        self.results_pages = QCheckBox("Enable result pages")
-        self.new_imports_name = QLineEdit()
-        self.newly_tagged_name = QLineEdit()
-        self.duplicate_tagged_name = QLineEdit()
-        self.already_tagged_name = QLineEdit()
-        self.build_already = QCheckBox("Build Already Tagged page")
-        self.page_limit = QSpinBox()
-        self.page_limit.setRange(0, 1_000_000)
-        self.page_limit.setSpecialValueText("Unlimited")
+        self.results_pages = QCheckBox("Enable Hydrus review pages")
+        self.page_controls: Dict[str, Dict[str, object]] = {}
+
+        def make_page_group(
+                prefix: str, title: str, *, result_page: bool) -> QGroupBox:
+            group = QGroupBox(title)
+            form = QFormLayout(group)
+            enabled = QCheckBox("Enabled")
+            name = QLineEdit()
+            limit = QSpinBox()
+            limit.setRange(0, 1_000_000)
+            limit.setSpecialValueText("Unlimited")
+            controls: Dict[str, object] = {
+                "enabled": enabled, "name": name, "limit": limit}
+            form.addRow(enabled)
+            form.addRow("Page name", name)
+            form.addRow("Limit (0 = unlimited)", limit)
+            if result_page:
+                mode = QComboBox()
+                mode.addItem("Live — first N results", "live")
+                mode.addItem("End of run — newest N results", "end_of_run")
+                mode.setToolTip(
+                    "Live pages append during the scan and finite limits keep "
+                    "the first N. End-of-run pages are created when the scan "
+                    "finishes and finite limits keep the newest N.")
+                controls["mode"] = mode
+                form.addRow("Publication", mode)
+                mode.currentIndexChanged.connect(
+                    self._update_page_interval_visibility)
+            enabled.toggled.connect(self._update_page_interval_visibility)
+            self.page_controls[prefix] = controls
+            return group
+
+        page_groups = (
+            make_page_group("new_imports", "New Imports", result_page=True),
+            make_page_group("newly_tagged", "Newly Tagged", result_page=True),
+            make_page_group("duplicate_tagged", "Duplicate Tagged", result_page=True),
+            make_page_group("already_tagged", "Already Tagged", result_page=False),
+        )
+        self.live_page_interval = QSpinBox()
+        self.live_page_interval.setRange(0, 60)
+        self.live_page_interval.setSuffix(" seconds")
+        self.live_page_interval.setSpecialValueText("Immediately")
+        self.live_page_interval_box = QWidget()
+        live_interval_layout = QFormLayout(self.live_page_interval_box)
+        live_interval_layout.setContentsMargins(0, 0, 0, 0)
+        live_interval_layout.addRow(
+            "Live update interval", self.live_page_interval)
         self.hydrus_profile_label = QLabel()
         self.rotate_hydrus_profile = QPushButton(
             "Use a new/replaced Hydrus database…")
@@ -628,20 +667,27 @@ class SettingsPanel(QWidget):
             "existing completion checkpoints will be revalidated.")
         self.rotate_hydrus_profile.clicked.connect(
             self._rotate_hydrus_profile_uuid)
-        hf.addRow(self.direct_source_notes)
-        hf.addRow(self.exact_url_enrichment)
-        hf.addRow("Metadata downloader page",
-                  self.exact_url_enrichment_page_name)
+        metadata_group = QGroupBox("Metadata downloader (separate Hydrus-owned page)")
+        metadata_form = QFormLayout(metadata_group)
+        metadata_form.addRow(self.direct_source_notes)
+        metadata_form.addRow(self.exact_url_enrichment)
+        metadata_form.addRow("Downloader page name",
+                             self.exact_url_enrichment_page_name)
+        metadata_note = QLabel(
+            "Hydrus owns this downloader page, so review-page limits and "
+            "publication modes do not apply to it.")
+        metadata_note.setWordWrap(True)
+        metadata_form.addRow(metadata_note)
+        hf.addRow(metadata_group)
         hf.addRow(self.results_pages)
-        hf.addRow("New Imports name", self.new_imports_name)
-        hf.addRow("Newly Tagged name", self.newly_tagged_name)
-        hf.addRow("Duplicate Tagged name", self.duplicate_tagged_name)
-        hf.addRow("Already Tagged name", self.already_tagged_name)
-        hf.addRow(self.build_already)
-        hf.addRow("Page limit (0=all)", self.page_limit)
+        for group in page_groups:
+            hf.addRow(group)
+        hf.addRow(self.live_page_interval_box)
         hf.addRow("Database identity", self.hydrus_profile_label)
         hf.addRow(self.rotate_hydrus_profile)
         self._add_tab("Hydrus", hy)
+        self.results_pages.toggled.connect(
+            self._update_page_interval_visibility)
 
         # Sources
         src = QWidget()
@@ -738,6 +784,15 @@ class SettingsPanel(QWidget):
 
         self.load_from(self._initial)
 
+    def _update_page_interval_visibility(self, *_args) -> None:
+        """Only show cadence when an enabled live result page can use it."""
+        visible = self.results_pages.isChecked() and any(
+            bool(controls["enabled"].isChecked())
+            and controls["mode"].currentData() == "live"
+            for prefix, controls in self.page_controls.items()
+            if prefix != "already_tagged")
+        self.live_page_interval_box.setVisible(visible)
+
     def load_from(self, s: Settings) -> None:
         o, h, src, m, p, perf = (
             s.output, s.hydrus, s.sources, s.matching, s.pdf, s.performance)
@@ -756,12 +811,17 @@ class SettingsPanel(QWidget):
         self.exact_url_enrichment.setChecked(h.exact_url_enrichment)
         self.exact_url_enrichment_page_name.setText(
             h.exact_url_enrichment_page_name)
-        self.new_imports_name.setText(h.new_imports_page_name)
-        self.newly_tagged_name.setText(h.newly_tagged_page_name)
-        self.duplicate_tagged_name.setText(h.duplicate_tagged_page_name)
-        self.already_tagged_name.setText(h.already_tagged_page_name)
-        self.build_already.setChecked(h.build_already_tagged_page)
-        self.page_limit.setValue(h.result_page_limit)
+        for prefix, controls in self.page_controls.items():
+            controls["enabled"].setChecked(
+                getattr(h, f"{prefix}_page_enabled"))
+            controls["name"].setText(getattr(h, f"{prefix}_page_name"))
+            controls["limit"].setValue(getattr(h, f"{prefix}_page_limit"))
+            if "mode" in controls:
+                mode = getattr(h, f"{prefix}_page_mode")
+                idx = controls["mode"].findData(mode)
+                controls["mode"].setCurrentIndex(max(0, idx))
+        self.live_page_interval.setValue(h.live_page_update_interval)
+        self._update_page_interval_visibility()
         self.hydrus_profile_label.setText(
             h.hydrus_profile_uuid[:8] + "…" if h.hydrus_profile_uuid else "unset")
         for name, cb in self.src_checks.items():
@@ -803,12 +863,17 @@ class SettingsPanel(QWidget):
             self.exact_url_enrichment_page_name.text().strip()
             or "FurTag Metadata")
         s.hydrus.results_pages_enabled = self.results_pages.isChecked()
-        s.hydrus.new_imports_page_name = self.new_imports_name.text().strip()
-        s.hydrus.newly_tagged_page_name = self.newly_tagged_name.text().strip()
-        s.hydrus.duplicate_tagged_page_name = self.duplicate_tagged_name.text().strip()
-        s.hydrus.already_tagged_page_name = self.already_tagged_name.text().strip()
-        s.hydrus.build_already_tagged_page = self.build_already.isChecked()
-        s.hydrus.result_page_limit = self.page_limit.value()
+        for prefix, controls in self.page_controls.items():
+            setattr(s.hydrus, f"{prefix}_page_enabled",
+                    controls["enabled"].isChecked())
+            setattr(s.hydrus, f"{prefix}_page_name",
+                    controls["name"].text().strip())
+            setattr(s.hydrus, f"{prefix}_page_limit",
+                    controls["limit"].value())
+            if "mode" in controls:
+                setattr(s.hydrus, f"{prefix}_page_mode",
+                        controls["mode"].currentData())
+        s.hydrus.live_page_update_interval = self.live_page_interval.value()
         for name, cb in self.src_checks.items():
             setattr(s.sources, f"{name}_enabled", cb.isChecked())
         s.matching.saucenao_min_similarity = self.sn_min.value()
@@ -1006,25 +1071,14 @@ class MainWindow(QMainWindow):
         opts.addWidget(QLabel("This run:"))
         self.opt_import_unmatched = QCheckBox("Import unmatched")
         self.opt_sync_sidecars = QCheckBox("Sync sidecars first")
-        self.opt_already = QCheckBox("Already Tagged page")
-        self.opt_page_limit = QSpinBox()
-        self.opt_page_limit.setRange(0, 1_000_000)
-        self.opt_page_limit.setSpecialValueText("Unlimited")
-        self.opt_page_limit.setMaximumWidth(100)
-        self.opt_page_limit.setValue(self.settings.hydrus.result_page_limit)
         self.opt_import_unmatched.setChecked(self.settings.output.hydrus_import_unmatched)
-        self.opt_already.setChecked(self.settings.hydrus.build_already_tagged_page)
         for option in (
-                self.opt_import_unmatched, self.opt_sync_sidecars,
-                self.opt_already, self.opt_page_limit):
+                self.opt_import_unmatched, self.opt_sync_sidecars):
             option.setToolTip(
                 "Session-only override for this scan; saved defaults remain "
                 "on the Settings tab.")
         opts.addWidget(self.opt_import_unmatched)
         opts.addWidget(self.opt_sync_sidecars)
-        opts.addWidget(self.opt_already)
-        opts.addWidget(QLabel("Page limit:"))
-        opts.addWidget(self.opt_page_limit)
         opts.addStretch()
         scan_lay.addLayout(opts)
 
@@ -1346,8 +1400,6 @@ class MainWindow(QMainWindow):
         opts = RunOptions.from_settings(s)
         opts.import_unmatched = self.opt_import_unmatched.isChecked()
         opts.sync_sidecars = self.opt_sync_sidecars.isChecked()
-        opts.build_already_tagged_page = self.opt_already.isChecked()
-        opts.result_page_limit = self.opt_page_limit.value()
         # Always set, so the engine never falls through to an interactive prompt.
         # The PDF-quality dialog below may override it.
         opts.pdf_dpi = s.pdf.pdf_dpi

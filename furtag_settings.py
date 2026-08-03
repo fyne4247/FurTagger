@@ -48,7 +48,7 @@ DEFAULT_FLUFFLE_TOSSUP_E621 = True
 DEFAULT_PDF_DPI = 300
 DEFAULT_PDF_ARCHIVAL_DPI = 600
 
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
 RECENT_SCAN_PATH_LIMIT = 12
 APP_NAME = "FurTag"
 APP_AUTHOR = "FurTag"
@@ -61,6 +61,7 @@ DEFAULT_JSON_PATTERN = "{name}{ext}.json"
 
 FLUFFLE_MATCH_CLASSES = ("exact", "tossUp", "alternative", "unlikely")
 FLUFFLE_REVIEW_MODES = ("off", "tossups", "tossups_alternatives")
+HYDRUS_PAGE_MODES = ("live", "end_of_run")
 
 
 @dataclass
@@ -93,13 +94,25 @@ class HydrusSettings:
     exact_url_enrichment: bool = False
     exact_url_enrichment_page_name: str = "FurTag Metadata"
     results_pages_enabled: bool = True
+    new_imports_page_enabled: bool = True
     new_imports_page_name: str = "FurTag New Imports"
+    new_imports_page_limit: int = 0
+    new_imports_page_mode: str = "live"
+    newly_tagged_page_enabled: bool = True
     newly_tagged_page_name: str = "FurTag Newly Tagged"
+    newly_tagged_page_limit: int = 0
+    newly_tagged_page_mode: str = "live"
     # Current duplicate-group members tagged on behalf of a deleted file.
+    duplicate_tagged_page_enabled: bool = True
     duplicate_tagged_page_name: str = "FurTag Duplicate Tagged"
+    duplicate_tagged_page_limit: int = 0
+    duplicate_tagged_page_mode: str = "live"
+    already_tagged_page_enabled: bool = False
     already_tagged_page_name: str = "Already Tagged"
-    build_already_tagged_page: bool = False
-    result_page_limit: int = 0  # 0 = unlimited
+    already_tagged_page_limit: int = 0
+    # Shared cadence for live result pages. Zero wakes the publisher for every
+    # accepted result; positive values allow arrivals to coalesce into batches.
+    live_page_update_interval: int = 10
     # Non-secret identity for this Hydrus database binding. Rotate via an
     # explicit "new/replaced Hydrus database" action; never derived from the
     # access key. Combined with API origin into hydrus_scope_id().
@@ -195,6 +208,18 @@ class Settings:
                 and "direct_source_notes" not in hydrus_data):
             base.hydrus.direct_source_notes = True
             base.hydrus.exact_url_enrichment = False
+        # v2 had one limit shared by all result pages and a session-style
+        # Already Tagged switch. Distribute those values into the independent
+        # v3 page settings and restore the historical live publication mode.
+        if loaded_version < 3 and isinstance(hydrus_data, dict):
+            old_limit = hydrus_data.get("result_page_limit", 0)
+            for prefix in ("new_imports", "newly_tagged", "duplicate_tagged",
+                           "already_tagged"):
+                setattr(base.hydrus, f"{prefix}_page_limit", old_limit)
+            base.hydrus.already_tagged_page_enabled = bool(
+                hydrus_data.get("build_already_tagged_page", False))
+            for prefix in ("new_imports", "newly_tagged", "duplicate_tagged"):
+                setattr(base.hydrus, f"{prefix}_page_mode", "live")
         base.sources = _merge_dataclass(SourceSettings, data.get("sources"))
         base.matching = _merge_dataclass(MatchingSettings, data.get("matching"))
         base.pdf = _merge_dataclass(PdfSettings, data.get("pdf"))
@@ -253,10 +278,30 @@ def _normalize_settings(s: Settings) -> None:
         s.pdf.pdf_dpi = max(72, min(2400, int(s.pdf.pdf_dpi)))
     except (TypeError, ValueError):
         s.pdf.pdf_dpi = DEFAULT_PDF_DPI
+    for prefix in ("new_imports", "newly_tagged", "duplicate_tagged",
+                   "already_tagged"):
+        limit_attr = f"{prefix}_page_limit"
+        try:
+            setattr(s.hydrus, limit_attr,
+                    max(0, int(getattr(s.hydrus, limit_attr))))
+        except (TypeError, ValueError):
+            setattr(s.hydrus, limit_attr, 0)
+        name_attr = f"{prefix}_page_name"
+        default_name = getattr(HydrusSettings(), name_attr)
+        name = getattr(s.hydrus, name_attr)
+        setattr(s.hydrus, name_attr,
+                name.strip() if isinstance(name, str) and name.strip()
+                else default_name)
+    for prefix in ("new_imports", "newly_tagged", "duplicate_tagged"):
+        mode_attr = f"{prefix}_page_mode"
+        mode = getattr(s.hydrus, mode_attr)
+        if mode not in HYDRUS_PAGE_MODES:
+            setattr(s.hydrus, mode_attr, "live")
     try:
-        s.hydrus.result_page_limit = max(0, int(s.hydrus.result_page_limit))
+        s.hydrus.live_page_update_interval = max(
+            0, min(60, int(s.hydrus.live_page_update_interval)))
     except (TypeError, ValueError):
-        s.hydrus.result_page_limit = 0
+        s.hydrus.live_page_update_interval = 10
     enrichment_page = s.hydrus.exact_url_enrichment_page_name
     if not isinstance(enrichment_page, str) or not enrichment_page.strip():
         enrichment_page = "FurTag Metadata"
@@ -370,8 +415,6 @@ def remember_scan_path(
 class RunOptions:
     """Tier-3 per-run options, seeded from Settings then overridden by prompts/GUI."""
     import_unmatched: bool = False
-    result_page_limit: int = 0
-    build_already_tagged_page: bool = False
     sync_sidecars: bool = False
     pdf_dpi: Optional[int] = None  # None → use Settings.pdf.pdf_dpi
     # Resolved PDF path → {"comic": str, "creator": str?} from pre-render prompt.
@@ -384,8 +427,6 @@ class RunOptions:
     def from_settings(cls, settings: Settings) -> "RunOptions":
         return cls(
             import_unmatched=settings.output.hydrus_import_unmatched,
-            result_page_limit=settings.hydrus.result_page_limit,
-            build_already_tagged_page=settings.hydrus.build_already_tagged_page,
             sync_sidecars=False,
             # pdf_dpi / pdf_meta deliberately left None: the engine resolves them
             # (settings → interactive prompt). Pinning them here would make the

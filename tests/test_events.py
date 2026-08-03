@@ -51,9 +51,7 @@ def _offline_settings():
 
 
 def _run_options():
-    return RunOptions(import_unmatched=False, result_page_limit=0,
-                      build_already_tagged_page=False, sync_sidecars=False,
-                      pdf_dpi=None)
+    return RunOptions(import_unmatched=False, sync_sidecars=False, pdf_dpi=None)
 
 
 def _make_pngs(count):
