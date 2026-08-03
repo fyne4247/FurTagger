@@ -1018,6 +1018,23 @@ class TestHydrusDuplicateTaggedPage(unittest.TestCase):
         # Not conflated with the ordinary "newly tagged" page.
         self.assertEqual(ti.hydrus_result_pages["updated"]["hashes"], [])
         self.assertEqual(ti.hydrus_result_pages["new"]["hashes"], [])
+        repeated = ti._repeated_issues["hydrus_deleted_tagged_targets"]
+        self.assertEqual(repeated[0], 1)
+        self.assertEqual(repeated[3], "info")
+
+    def test_deleted_duplicate_successes_are_aggregated(self):
+        ti = _hydrus_ti(FakeSession(
+            _deleted_dup_routes([DUP_OK])))
+        ti.hydrus_tag_deleted_duplicates = True
+        ti.hydrus_can_manage_relationships = True
+        ti.hydrus_result_pages["duplicates"].enabled = True
+        with patch("furtag.notify_info") as info:
+            self._push(ti, "first.jpg")
+            self._push(ti, "second.jpg")
+        self.assertEqual(info.call_count, 1)
+        repeated = ti._repeated_issues["hydrus_deleted_tagged_targets"]
+        self.assertEqual(repeated[0], 2)
+        self.assertIn("second.jpg", repeated[2])
 
     def test_failed_member_is_not_added(self):
         ti = _hydrus_ti(FakeSession(

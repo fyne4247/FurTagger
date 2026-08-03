@@ -1565,9 +1565,17 @@ class HydrusMixin:
                         f"⚠️  Hydrus: failed tagging duplicate of "
                         f"{media.name}: {e}")
             if applied:
-                _notify_info(
+                message = (
                     f"✅ Hydrus: {media.name} was deleted; tagged "
                     f"{len(applied)} current duplicate-group file(s).")
+                aggregate = getattr(self, "_notify_repeated_info", None)
+                if callable(aggregate):
+                    aggregate(
+                        "hydrus_deleted_tagged_targets",
+                        "Hydrus deleted files with tagged current duplicates",
+                        message)
+                else:
+                    _notify_info(message)
             return HydrusPushResult(
                 sha256=deleted_hash,
                 import_state=HydrusImportState.PREVIOUSLY_DELETED,
