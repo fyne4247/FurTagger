@@ -4,6 +4,9 @@ All notable changes to FurTag are documented here.
 
 ## Unreleased
 
+- **No-match queue reconciliation** — prior no-match files completed by the Hydrus pre-scan pass are now removed from the already-built search queue, preventing an immediate redundant booru/perceptual rescan in the same run. The summary reports live, previously deleted, vetoed, terminal, and still-pending outcomes accurately instead of calling every result a new import.
+- **Legacy match migration** — `tools/migrate_legacy_ledgers.py` can conservatively bind unchanged legacy matches to the current search profile and Hydrus database. It defaults to dry-run, verifies each SHA-256 (or MD5-resolved SHA-256) is currently local in Hydrus, backs up every changed ledger, and leaves unverifiable rows open.
+- **Quieter cancellation/deleted-file logging** — expected lookup cancellation no longer appears as a source failure, and repeated “previously deleted; no current duplicates” notices are informational and aggregated instead of flooding the issue stream one file at a time.
 - **Typed Hydrus outcomes** — imports now preserve separate import and metadata states, including live, previously deleted, vetoed, permission-missing, policy-skipped, and retryable failures. Deleted originals retain their SHA-256 and any successfully tagged duplicate targets.
 - **Correct deleted-file completion** — only a successful empty relationship query creates a terminal no-duplicate result. Missing relationship permission and relationship/API failures remain retryable; disabling duplicate tagging is terminal only for that policy and reopens when enabled.
 - **Hydrus database scoping** — normal output, unmatched imports, sidecar sync, and directory seals are bound to a persisted non-secret Hydrus profile UUID plus normalized API origin. The GUI has an explicit action for replacing/rebuilding a Hydrus database.

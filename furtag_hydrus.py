@@ -15,7 +15,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import (
@@ -125,6 +125,22 @@ class HydrusAddFileResult:
     sha256: Optional[str]
     status: int
     note: str = ""
+
+
+@dataclass
+class PriorNomatchReconcileResult:
+    """Outcome summary for the pre-scan unmatched-import reconciliation."""
+
+    completed_paths: Set[Path] = field(default_factory=set)
+    live: int = 0
+    previously_deleted: int = 0
+    vetoed: int = 0
+    other_terminal: int = 0
+    failed: int = 0
+
+    @property
+    def completed(self) -> int:
+        return len(self.completed_paths)
 
 
 def _truthy(val: str, default: bool = False) -> bool:
@@ -1020,15 +1036,21 @@ class HydrusMixin:
             require_ledger_file=True))
 
 
-    def _hydrus_import_prior_nomatches(self, ledger_mgr: LedgerManager) -> int:
+    def _hydrus_import_prior_nomatches(
+            self, ledger_mgr: LedgerManager,
+            queued_items: Optional[List[FileItem]] = None,
+    ) -> PriorNomatchReconcileResult:
         """Import unchanged old no-match files when unmatched import is on.
 
         Picks up legacy rows without SHA and rows whose nested
-        ``unmatched_import`` checkpoint is incomplete (BF-02).
+        ``unmatched_import`` checkpoint is incomplete (BF-02). Files completed
+        here are removed from *queued_items* so a profile-invalidated nomatch
+        is not immediately searched again by the already-built scan queue.
         """
+        result = PriorNomatchReconcileResult()
         if not (self.has_hydrus and self.hydrus_import and
                 self.hydrus_import_unmatched):
-            return 0
+            return result
         current_scope = self._hydrus_scope_id()
 
         def _needs_import(rec: Dict) -> bool:
@@ -1037,17 +1059,19 @@ class HydrusMixin:
             return not self.unmatched_import_is_complete(
                 rec, required=True, scope_id=current_scope)
 
-        entries: List[Tuple[Path, Ledger, str, int, float, Optional[str]]] = []
+        entries: List[Tuple[
+            Path, Ledger, str, int, float, int, Optional[str]]] = []
         for path, ledger, name, st, rec in self._unchanged_records(
                 ledger_mgr, _needs_import, {"nomatch"}):
             entries.append((
-                path, ledger, name, st.st_size, st.st_mtime,
+                path, ledger, name, st.st_size, st.st_mtime, st.st_mtime_ns,
                 rec.get("md5") if isinstance(rec, dict) else None))
         if entries:
             print(f"📥 Importing {len(entries)} prior no-match file(s) to Hydrus…")
-        imported = 0
-        for done, (path, ledger, name, size, mtime, md5) in enumerate(
+        for done, (path, ledger, name, size, mtime, mtime_ns, md5) in enumerate(
                 entries, 1):
+            if self.cancelled():
+                break
             # A per-file Hydrus round trip — without a status event the GUI's
             # progress cards sit frozen for the whole (possibly long) import.
             self._emit("status", track="hash",
@@ -1059,13 +1083,28 @@ class HydrusMixin:
                     ledger,
                     name, size, mtime, md5, "nomatch", [],
                     sha256=outcome.sha256,
-                    unmatched_import=outcome.unmatched_import)
-                imported += 1
-            elif outcome.sha256:
-                # Retain hash for retry without claiming the sink finished.
-                ledger.cache_sha256(name, size, mtime, outcome.sha256)
-                # Still write the incomplete checkpoint so seals stay open.
-                previous = ledger._fresh_record(name, size, mtime) or {}
+                    unmatched_import=outcome.unmatched_import,
+                    mtime_ns=mtime_ns)
+                result.completed_paths.add(path.resolve())
+                checkpoint = outcome.unmatched_import or {}
+                import_state = checkpoint.get("import_state")
+                if import_state == HydrusImportState.LIVE.value:
+                    result.live += 1
+                elif import_state == HydrusImportState.PREVIOUSLY_DELETED.value:
+                    result.previously_deleted += 1
+                elif import_state == HydrusImportState.VETOED.value:
+                    result.vetoed += 1
+                else:
+                    result.other_terminal += 1
+            else:
+                # Persist the incomplete checkpoint even when no SHA was
+                # returned; otherwise the ledger loses why the sink is open.
+                if outcome.sha256:
+                    ledger.cache_sha256(
+                        name, size, mtime, outcome.sha256,
+                        mtime_ns=mtime_ns)
+                previous = ledger._fresh_record(
+                    name, size, mtime, mtime_ns=mtime_ns) or {}
                 sources = list(previous.get("sources") or [])
                 self.ledger_record(
                     ledger,
@@ -1075,8 +1114,15 @@ class HydrusMixin:
                     sha256=outcome.sha256,
                     unmatched_import=outcome.unmatched_import,
                     review=previous.get("review") if isinstance(
-                        previous.get("review"), dict) else None)
-        return imported
+                        previous.get("review"), dict) else None,
+                    mtime_ns=mtime_ns)
+                result.failed += 1
+        if queued_items is not None and result.completed_paths:
+            completed = result.completed_paths
+            queued_items[:] = [
+                item for item in queued_items
+                if item.path.resolve() not in completed]
+        return result
 
 
     @staticmethod
@@ -1318,9 +1364,17 @@ class HydrusMixin:
                 HYDRUS_RELATIONSHIP_DUPLICATES, [])
                 if isinstance(h, str) and len(h) == 64 and h != deleted_hash})
             if not targets:
-                _notify(
-                    f"⚠️  Hydrus: {media.name} was previously deleted; no "
+                message = (
+                    f"Hydrus: {media.name} was previously deleted; no "
                     "current duplicate-group members to tag.")
+                aggregate = getattr(self, "_notify_repeated_info", None)
+                if callable(aggregate):
+                    aggregate(
+                        "hydrus_deleted_no_targets",
+                        "Hydrus deleted files with no current duplicates",
+                        message)
+                else:
+                    _notify_info(message)
                 return HydrusPushResult(
                     sha256=deleted_hash,
                     import_state=HydrusImportState.PREVIOUSLY_DELETED,

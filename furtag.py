@@ -296,7 +296,10 @@ class LiveDisplay:
 
     _ABBR = {"e621": "e621", "inkbunny": "ib", "danbooru": "dan", "gelbooru": "gel"}
     # · not started yet · … querying · ✓ found · ✗ not found (clean miss) · ⚠ error/blocked
-    _SYM  = {"pending": "·", "run": "…", "hit": "✓", "miss": "✗", "err": "⚠"}
+    _SYM  = {
+        "pending": "·", "run": "…", "hit": "✓", "miss": "✗",
+        "err": "⚠", "cancel": "⏹",
+    }
     _LEGEND = ("legend:  … querying   ✓ found   ✗ not found   ⚠ error/blocked")
     _TRACK_ORDER = ("hash", "perceptual")
     _SEP = "  " + "─" * 60
@@ -1376,7 +1379,7 @@ class TagIntegrator(HydrusMixin):
         self._fatal_network_lock = threading.Lock()
         self._fatal_network_error = False
         self._repeated_issue_lock = threading.Lock()
-        self._repeated_issues: Dict[str, Tuple[int, str, str]] = {}
+        self._repeated_issues: Dict[str, Tuple[int, str, str, str]] = {}
 
         # Per-service pacers — intervals are filled in by apply_settings() below,
         # which is the single place settings → instance attrs is wired.
@@ -3968,27 +3971,39 @@ class TagIntegrator(HydrusMixin):
         each progress point is written exactly once."""
         self._observer.emit(RunEvent(kind=kind, **fields))
 
+    def _notify_repeated(
+            self, key: str, label: str, message: str,
+            severity: str) -> None:
+        """Report one repeated event, then bounded progress summaries."""
+        with self._repeated_issue_lock:
+            count, _, _, _ = self._repeated_issues.get(
+                key, (0, label, message, severity))
+            count += 1
+            self._repeated_issues[key] = (
+                count, label, message, severity)
+        emit = notify_info if severity == "info" else notify
+        if count == 1:
+            emit(message)
+        elif count % 25 == 0:
+            emit(f"{label}: {count} so far; latest: {message}")
+
     def _notify_repeated_issue(
             self, key: str, label: str, message: str) -> None:
-        """Report the first repeated failure, then bounded progress summaries."""
-        with self._repeated_issue_lock:
-            count, _, _ = self._repeated_issues.get(key, (0, label, message))
-            count += 1
-            self._repeated_issues[key] = (count, label, message)
-        if count == 1:
-            notify(message)
-        elif count % 25 == 0:
-            notify(f"⚠️  {label}: {count} failures so far; latest: {message}")
+        self._notify_repeated(key, label, message, "warning")
+
+    def _notify_repeated_info(
+            self, key: str, label: str, message: str) -> None:
+        self._notify_repeated(key, label, message, "info")
 
     def _flush_repeated_issues(self) -> None:
         with self._repeated_issue_lock:
             entries = list(self._repeated_issues.values())
             self._repeated_issues.clear()
-        for count, label, message in entries:
+        for count, label, message, severity in entries:
             if count > 1:
-                notify(
-                    f"⚠️  {label}: {count} files affected this run; "
-                    f"latest: {message}")
+                emit = notify_info if severity == "info" else notify
+                emit(
+                    f"{label}: {count} files this run; latest: {message}")
 
     # ── Parallel local hashing ───────────────────────────────────────────────
 
@@ -4199,7 +4214,11 @@ class TagIntegrator(HydrusMixin):
         services = self.enabled_hash_services()
         metadata = SourceMetadata()
         hit: Set[str] = set()
+        local_errors = {
+            error for error in item.lookup_errors
+            if error in ("local_hash", "local_media")}
         item.lookup_errors.clear()
+        item.lookup_errors.update(local_errors)
         if item.md5:
             # A source disabled mid-run by a 401/403 is not a clean miss for the
             # files that come after it — they never even ask. Without this the
@@ -4229,6 +4248,10 @@ class TagIntegrator(HydrusMixin):
             try:
                 found = self._coerce_source_metadata(fut.result())
             except Exception as e:
+                if self.cancelled() and isinstance(e, RetryableLookupError):
+                    state[s] = "cancel"
+                    _tick(state)
+                    continue
                 # Network/HTTP failure — distinct from a clean "not found" miss,
                 # so surface it as ⚠ rather than ✗ (the file may still exist there).
                 if not self._stop_for_broken_ca_bundle(e):
@@ -4602,10 +4625,29 @@ class TagIntegrator(HydrusMixin):
             # Defensive: discover should have returned [] when disabled.
             pdf_jobs = []
 
-        prior_imported = self._hydrus_import_prior_nomatches(ledger_mgr)
-        if prior_imported:
+        prior_reconciled = self._hydrus_import_prior_nomatches(
+            ledger_mgr, items)
+        if prior_reconciled.completed or prior_reconciled.failed:
             ledger_mgr.save_all()
-            print(f"✅ Hydrus imported {prior_imported} prior no-match file(s)")
+        if prior_reconciled.completed:
+            parts = []
+            if prior_reconciled.live:
+                parts.append(f"{prior_reconciled.live} live/present")
+            if prior_reconciled.previously_deleted:
+                parts.append(
+                    f"{prior_reconciled.previously_deleted} previously deleted")
+            if prior_reconciled.vetoed:
+                parts.append(f"{prior_reconciled.vetoed} vetoed")
+            if prior_reconciled.other_terminal:
+                parts.append(f"{prior_reconciled.other_terminal} other terminal")
+            print(
+                f"✅ Hydrus reconciled {prior_reconciled.completed} prior "
+                f"no-match file(s) ({', '.join(parts)}); removed them from "
+                "this run's search queue")
+        if prior_reconciled.failed:
+            notify(
+                f"⚠️  Hydrus reconciliation remains pending for "
+                f"{prior_reconciled.failed} prior no-match file(s).")
         has_prior_matches = self._has_prior_matched_files(ledger_mgr)
         at_limit = (self.hydrus_already_tagged_page_limit
                     if (self.has_hydrus and self.hydrus_already_tagged_page_enabled
@@ -4833,6 +4875,24 @@ class TagIntegrator(HydrusMixin):
                         extra={"retryable": True,
                                "failed_sources": ["local_media"]})
                     notify(f"⚠️  {e}; the file will be retried.")
+                    _maybe_save_ledgers()
+                except RetryableLookupError as e:
+                    if self.cancelled():
+                        self._emit(
+                            "finish_file", track="perceptual",
+                            result="cancelled",
+                            extra={"retryable": True, "cancelled": True})
+                    else:
+                        item.lookup_errors.add("perceptual")
+                        self._emit(
+                            "finish_file", track="perceptual",
+                            result="retry later — perceptual source error",
+                            extra={"retryable": True,
+                                   "failed_sources": ["perceptual"]})
+                        self._notify_repeated_issue(
+                            "perceptual_lookup", "Perceptual lookup failures",
+                            f"❌ perceptual lookup failed on "
+                            f"{item.path.name}: {e}")
                     _maybe_save_ledgers()
                 except UnusableMediaError as e:
                     self.ledger_record(

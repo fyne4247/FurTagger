@@ -9,7 +9,9 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
-from furtag import Ledger, RetryableLookupError, TagIntegrator
+from furtag import (
+    FileItem, Ledger, LedgerManager, RetryableLookupError, TagIntegrator,
+)
 from furtag_settings import Settings
 
 
@@ -291,6 +293,9 @@ class TestDirectSourceNotes(unittest.TestCase):
             self.assertEqual(
                 outcome.hydrus_output["metadata_state"], "no_duplicate_targets")
             self.assertEqual(outcome.hydrus_output["sha256"], DELETED_HASH)
+            repeated = ti._repeated_issues["hydrus_deleted_no_targets"]
+            self.assertEqual(repeated[0], 2)
+            self.assertEqual(repeated[3], "info")
 
     def test_deleted_tagging_disabled_is_policy_skipped_not_permanent_seal(self):
         from furtag_hydrus import HydrusMetadataState
@@ -481,6 +486,73 @@ class TestUnmatchedImportBF02(unittest.TestCase):
         self.assertEqual(push.import_state, HydrusImportState.VETOED)
         self.assertEqual(push.reason, "blocked by import policy")
         self.assertTrue(push.complete)
+
+    def test_prior_reconciliation_removes_completed_item_from_scan_queue(self):
+        file_hash = "b" * 64
+        session = FakeSession([
+            ("POST", "add_files/add_file", FakeResponse(200, {
+                "status": 2, "hash": file_hash,
+            })),
+        ])
+        ti = _hydrus_ti(session)
+        ti.hydrus_import_unmatched = True
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            media = root / "old-miss.jpg"
+            media.write_bytes(b"old miss")
+            st = media.stat()
+            manager = LedgerManager()
+            ledger = manager.get(root)
+            ti.ledger_record(
+                ledger, media.name, st.st_size, st.st_mtime,
+                "a" * 32, "nomatch", [],
+                unmatched_import={
+                    "requested": False,
+                    "complete": True,
+                    "scope_id": None,
+                })
+            queue = [FileItem(
+                media, media.name, st.st_size, st.st_mtime, "image",
+                ledger=ledger, md5="a" * 32, mtime_ns=st.st_mtime_ns)]
+
+            result = ti._hydrus_import_prior_nomatches(manager, queue)
+
+            self.assertEqual(result.completed, 1)
+            self.assertEqual(result.live, 1)
+            self.assertEqual(queue, [])
+            checkpoint = ledger.records[media.name]["unmatched_import"]
+            self.assertTrue(checkpoint["complete"])
+            self.assertEqual(checkpoint["scope_id"], ti._hydrus_scope_id())
+
+    def test_failed_prior_reconciliation_stays_queued_with_checkpoint(self):
+        session = FakeSession([
+            ("POST", "add_files/add_file", FakeResponse(
+                500, {}, text="temporary failure")),
+        ])
+        ti = _hydrus_ti(session)
+        ti.hydrus_import_unmatched = True
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            media = root / "old-miss.jpg"
+            media.write_bytes(b"old miss")
+            st = media.stat()
+            manager = LedgerManager()
+            ledger = manager.get(root)
+            ti.ledger_record(
+                ledger, media.name, st.st_size, st.st_mtime,
+                "a" * 32, "nomatch", [])
+            queue = [FileItem(
+                media, media.name, st.st_size, st.st_mtime, "image",
+                ledger=ledger, md5="a" * 32, mtime_ns=st.st_mtime_ns)]
+
+            result = ti._hydrus_import_prior_nomatches(manager, queue)
+
+            self.assertEqual(result.failed, 1)
+            self.assertEqual(len(queue), 1)
+            checkpoint = ledger.records[media.name]["unmatched_import"]
+            self.assertFalse(checkpoint["complete"])
+            self.assertEqual(
+                checkpoint["import_state"], "retryable_failure")
 
 
 class _RecordingObserver:

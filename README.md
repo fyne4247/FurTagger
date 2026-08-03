@@ -158,6 +158,15 @@ The GUI also remembers up to 12 recently selected scan folders there, including 
 
 The metadata ledger version was bumped for direct notes. Once Hydrus has note-editing permission, the next scan intentionally revisits older e621/Inkbunny matches once, reusing cached MD5s. Old rows that lack a search profile or scoped Hydrus checkpoint may also be revalidated once after this upgrade; cached MD5s avoid repeating the disk-heavy hash pass. If Hydrus is offline, notes are disabled, or the key lacks permission, note backfill is deferred without repeatedly querying sources.
 
+For a large existing library whose legacy matches were already written to the same Hydrus database, the optional migration tool avoids re-searching trustworthy historical matches. Hydrus must be running and the API key must have **Search for and Fetch Files** permission. It is read-only unless `--apply` is supplied:
+
+```bash
+.venv/bin/python tools/migrate_legacy_ledgers.py "/path/to/library"
+.venv/bin/python tools/migrate_legacy_ledgers.py "/path/to/library" --apply
+```
+
+The tool upgrades only unchanged matched rows whose hash is confirmed as a current local Hydrus file. Before applying, it copies every affected ledger into a hidden timestamped backup beneath the library root, invalidates old directory seals, and leaves missing, changed, deleted, or otherwise unverifiable rows for the normal scanner.
+
 ---
 
 ## Output (sidecars)
