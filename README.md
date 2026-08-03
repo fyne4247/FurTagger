@@ -21,8 +21,6 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
 ./FurTag.command
 ```
 
-> **Screenshots:** drop a couple under `docs/` when you have them (status bar + a finished scan is enough). Discovery cares more about a clear pitch than a marketing site.
-
 ---
 
 ## Features
@@ -42,15 +40,18 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
 - **Optional legacy URL enrichment** — exact post URLs can still be queued through Hydrus for parser-only metadata such as timestamps. It is off by default because it is substantially slower. Perceptual/external URLs and multi-file InkBunny submissions remain associate-only.
 - **Resumable sidecar sync** — push existing `<file>.txt` / `<file>.urls.txt` into Hydrus without re-searching; successful payloads are checkpointed in the ledger.
 - **Result pages** — optional New Imports / Newly Tagged / Duplicate Tagged / Already Tagged pages.
-- **Deleted-file duplicates** — when import hits a previously deleted file, tags/URLs can be applied to current Hydrus duplicate-group members (same URL policy as a normal push).
+- **Deleted-file duplicates** — when import hits a previously deleted file, tags/URLs can be applied to current Hydrus duplicate-group members (same URL policy as a normal push). FurTag retains the original SHA and target hashes. A successful empty relationship query is terminal for that Hydrus database; missing permission or API failure remains retryable, and a policy-disabled result reopens if the option is enabled later.
+- **Database-scoped checkpoints** — Hydrus completion state is bound to a persisted, non-secret database identity plus API origin. If the database is replaced at the same address, use **Hydrus → Use a new/replaced Hydrus database…** to rotate the identity and revalidate old decisions.
 
 ### Reliability
 
-- **Session ledger** — `.furtag_ledger.json` per folder, keyed by path + size + mtime; interrupted runs resume without re-querying finished files.
+- **Session ledger** — `.furtag_ledger.json` per folder, keyed by path + size + nanosecond mtime when available; interrupted runs resume without re-querying finished files.
+- **Profile-aware reuse** — matched/no-match decisions are reused only under the same effective source availability and matching settings. Enabling credentials, sources, or a different threshold reopens affected unchanged files while retaining their cached MD5.
 - **Transient network errors stay retryable** — source failures are not recorded as clean `nomatch`; partial hash hits wait for every additive source instead of permanently losing metadata.
-- **Incomplete output stays retryable** — failed Hydrus tag/URL/note writes are not recorded as completed matches.
-- **Permanent failures do not loop** — rejected source credentials disable only that source for the current credential load, unavailable optional Hydrus permissions degrade once, and unchanged unreadable media is checkpointed until its file changes.
-- **Safe directory fast-skip** — the sealed fingerprint includes filenames, nanosecond mtimes, and FurTag sidecar state rather than only file count and total bytes.
+- **Incomplete output stays retryable** — failed Hydrus tag/URL/note writes and required unmatched imports remain explicit pending checkpoints instead of being recorded as completed output.
+- **Permanent failures do not loop** — rejected source credentials disable only that source for the current credential load, deterministic unreadable media is decoder-profile scoped, and transient local I/O/hash failures remain retryable.
+- **Safe directory fast-skip** — sealed fingerprints include filenames, nanosecond mtimes, FurTag sidecar state, search profile, output policy, and Hydrus database scope rather than only file count and total bytes.
+- **Bounded diagnostics** — informational successes stay out of the issue pane and repeated source failures are summarized instead of producing one warning per file.
 - **Atomic PDF completion** — a PDF is considered rendered only when its completion manifest names every finished page; partial renders restart cleanly.
 - **Selective safe reset** — NUKE! previews generated files and lets you independently remove ledgers/reports, sidecars, or rendered PDF pages without touching source media.
 - **Per-service rate limiting** — independent pacers; SauceNAO adapts to reported quotas and backs off on repeated 429s.
@@ -63,7 +64,7 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
 - **Python 3.10+** recommended (3.9+ may work)
 - **macOS** for the double-click launchers and Finder drag-and-drop (the Python engine is otherwise cross-platform)
 - Packages from `requirements.txt` (installed automatically by the launchers):
-  - `pillow`, `requests`, `certifi`, `regex`
+  - `pillow>=9.1.0`, `requests`, `certifi`, `regex`
   - `platformdirs`, `keyring`
   - `PySide6` (GUI)
   - `PyMuPDF` (optional PDF support)
@@ -119,7 +120,7 @@ Open **Credentials** in the GUI, or set environment variables:
 
 Resolution order: **environment → OS keyring**. Missing credentials disable only that source.
 
-Non-secret options (thresholds, source toggles, page names, sidecar patterns, rate limits, direct notes, optional URL enrichment) live in platform-specific `settings.json` via `platformdirs`.
+Non-secret options (thresholds, source toggles, page names, sidecar patterns, rate limits, direct notes, optional URL enrichment, and Hydrus database identity) live in platform-specific `settings.json` via `platformdirs`.
 
 The GUI also remembers up to 12 recently selected scan folders there, including temporarily disconnected volumes; the **Clear** button forgets the list. This history is local machine state: it is never written into the repository, media ledgers, or sidecars, and local settings/state filenames are gitignored.
 
@@ -153,9 +154,9 @@ The GUI also remembers up to 12 recently selected scan folders there, including 
 | Multi-file InkBunny submission pages (`/s/{id}` with pagecount > 1) | Associated only (never queued for download) |
 | Perceptual / external / artist “source” links | Associated only |
 
-**Ledger statuses** include `matched`, `nomatch`, `duplicate`, `hashed` (retry later after network errors), plus independent `sidecar_sync` checkpoints.
+**Ledger statuses** include `matched`, `nomatch`, `duplicate`, `pending_review`, `unreadable`, and `hashed` (retry later). Hydrus import/metadata disposition, unmatched-import completion, and sidecar reconciliation are stored as independent nested checkpoints. Legacy top-level `hydrus_deleted` rows remain readable but are revalidated once if they lack the current Hydrus database scope.
 
-The metadata ledger version was bumped for direct notes. Once Hydrus has note-editing permission, the next scan intentionally revisits older e621/Inkbunny matches once, reusing cached MD5s. If Hydrus is offline, notes are disabled, or the key lacks permission, that backfill is deferred without repeatedly querying sources.
+The metadata ledger version was bumped for direct notes. Once Hydrus has note-editing permission, the next scan intentionally revisits older e621/Inkbunny matches once, reusing cached MD5s. Old rows that lack a search profile or scoped Hydrus checkpoint may also be revalidated once after this upgrade; cached MD5s avoid repeating the disk-heavy hash pass. If Hydrus is offline, notes are disabled, or the key lacks permission, note backfill is deferred without repeatedly querying sources.
 
 ---
 

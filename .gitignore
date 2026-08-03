@@ -15,6 +15,10 @@ credentials.txt
 settings.json
 recent-paths.json
 
+# Local implementation plans (not shipped user documentation)
+docs/bugfix.md
+docs/design-sqlite-content-cache.md
+
 # Signing / certificates / private keys (packaging)
 certs/*
 !certs/README.md

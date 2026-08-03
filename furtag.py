@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import requests
-from PIL import Image, ImageFile
+from PIL import Image, ImageFile, UnidentifiedImageError
 import regex  # for emoji stripping
 
 from furtag_settings import (
@@ -100,6 +100,11 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True  # don't crash on slightly-truncated file
 # ── Constants ────────────────────────────────────────────────────────────────
 
 THUMB_MAX = 256
+# Pillow must decode many formats into memory before it can resize them. Keep a
+# single pathological image from consuming hundreds of megabytes (or more) in
+# the perceptual worker. 64 MP still comfortably covers 8K images and long
+# comic pages while bounding an RGBA decode to roughly 256 MiB.
+THUMB_SOURCE_MAX_PIXELS = 64_000_000
 
 # Minimum seconds between successive requests to each service, chosen from each
 # API's documented / recommended limit. Because the four hash boorus run
@@ -126,10 +131,27 @@ PDF_EXTS   = {".pdf"}
 PDF_DPI    = DEFAULT_PDF_DPI
 PDF_ARCHIVAL_DPI = DEFAULT_PDF_ARCHIVAL_DPI
 
+
+def _prune_hidden_walk_dirs(dirs: List[str]) -> None:
+    """Keep ``os.walk`` out of dot-directories and preserve natural ordering.
+
+    Volume-root scans otherwise descend into macOS internals such as
+    ``.DocumentRevisions-V100``, ``.Spotlight-V100``, and ``.Trashes``. Some are
+    unreadable even to ordinary desktop apps; others contain metadata that is
+    not user media.
+
+    Shared by the main scanner and sidecar sync (BF-10).
+    """
+    dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+
+
 # Ledger statuses treated as "resolved" for skip / fingerprint sealing.
 # pending_review is intentionally absent — those files stay eligible.
 RESOLVED_LEDGER_STATUSES = frozenset({
     "matched", "nomatch", "duplicate", "unreadable",
+    # Legacy only: older runs wrote top-level hydrus_deleted. New code writes
+    # matched/nomatch + nested hydrus_output instead; still readable for skip.
+    "hydrus_deleted",
 })
 
 # Exact-hash (MD5) sources, then every search source. One ordered definition so
@@ -144,6 +166,10 @@ LEDGER_VERSION = 5
 # adds direct e621/Inkbunny notes, so old resolved records are retried once
 # while retaining their cached MD5.
 LEDGER_METADATA_VERSION = 2
+# Bump when the canonical search-profile digest inputs change shape.
+SEARCH_PROFILE_VERSION = 1
+# Bump when unreadable-media preparation/decoder policy changes (BF-17).
+DECODER_PROFILE_VERSION = 1
 # Written beside rendered PDF page PNGs so comic:/creator: survive later runs.
 PDF_META_FILE    = ".furtag_pdf.json"
 PDF_COMPLETE_FILE = ".furtag_pdf_complete.json"
@@ -485,14 +511,23 @@ def set_active_observer(observer: Optional[RunObserver]) -> RunObserver:
 _PERCEPTUAL_DONE = object()
 
 
-def notify(msg: str) -> None:
-    """The single chokepoint for user-facing warnings/errors.
+def notify(msg: str, *, severity: str = "warning") -> None:
+    """User-facing messages for the active observer (BF-12).
 
-    Every one becomes an `issue` event on the active observer, so the terminal
-    panel (via TerminalObserver → LiveDisplay.log) and the GUI issue pane are
-    fed from the same call sites. Never `print` from inside the processing loop
-    — that would corrupt the live panel."""
-    _active_observer.emit(RunEvent(kind="issue", message=str(msg)))
+    *severity*:
+      - ``warning`` / ``error`` → ``issue`` event (issue pane / panel log)
+      - ``info`` → ``log`` event (audit/success; not treated as a problem)
+
+    Never ``print`` from inside the processing loop — that corrupts the live
+    panel.
+    """
+    kind = "log" if severity == "info" else "issue"
+    _active_observer.emit(RunEvent(kind=kind, message=str(msg)))
+
+
+def notify_info(msg: str) -> None:
+    """Informational / success line — does not enter the issue stream."""
+    notify(msg, severity="info")
 
 
 def _natural_key(s: str) -> List:
@@ -518,6 +553,7 @@ class FileItem:
     sha256: Optional[str] = None      # current Hydrus match found this run
     perceptual_only: bool = False   # PDF-derived page: skip hash tier, go perceptual
     lookup_errors: Set[str] = field(default_factory=set)
+    mtime_ns: Optional[int] = None
     # A transient source failure is not a clean miss. Keep this file's ledger
     # at ``hashed`` so a later run retries the network work without re-hashing.
 
@@ -544,6 +580,10 @@ class SourceMetadata:
 
 class RetryableLookupError(RuntimeError):
     """A source did not produce a trustworthy hit-or-miss answer."""
+
+
+class RetryableMediaError(RetryableLookupError):
+    """Local media could not be read reliably, but may succeed next run."""
 
 
 class UnusableMediaError(RuntimeError):
@@ -583,6 +623,13 @@ class WriteOutcome:
 
     sha256: Optional[str]
     complete: bool
+    # Search/ledger status for a completed write. None → "matched".
+    # New code does not write top-level hydrus_deleted; use hydrus_output.
+    ledger_status: Optional[str] = None
+    # Nested scoped Hydrus checkpoint (import_state / metadata_state / …).
+    hydrus_output: Optional[Dict] = None
+    # Nested unmatched-import checkpoint (search may be nomatch independently).
+    unmatched_import: Optional[Dict] = None
 
 
 # ── Session ledger ───────────────────────────────────────────────────────────
@@ -612,6 +659,10 @@ class Ledger:
         self.dir_manifest: Optional[str] = None
         self.dir_metadata_version: Optional[int] = None
         self.dir_direct_notes_applied: Optional[bool] = None
+        self.dir_search_profile_hash: Optional[str] = None
+        self.dir_sidecars_required: Optional[bool] = None
+        self.dir_sidecar_format: Optional[str] = None
+        self.dir_output_policy_hash: Optional[str] = None
         self._dirty = 0
         self._lock = threading.Lock()
 
@@ -631,15 +682,35 @@ class Ledger:
                     self.dir_metadata_version = fp.get("metadata_version")
                     self.dir_direct_notes_applied = fp.get(
                         "direct_notes_applied")
+                    self.dir_search_profile_hash = fp.get(
+                        "search_profile_hash")
+                    if "sidecars_required" in fp:
+                        self.dir_sidecars_required = bool(
+                            fp.get("sidecars_required"))
+                    self.dir_sidecar_format = fp.get("sidecar_format")
+                    self.dir_output_policy_hash = fp.get("output_policy_hash")
         except Exception as e:
             notify(f"⚠️  Couldn't read ledger {self.path} ({e}); starting fresh.")
 
-    def _fresh_record(self, name: str, size: int, mtime: float) -> Optional[Dict]:
-        """The stored record for `name` iff its (size, mtime) fingerprint still
-        matches the file on disk — i.e. it describes these exact bytes."""
+    def _fresh_record(
+            self, name: str, size: int, mtime: float,
+            mtime_ns: Optional[int] = None) -> Optional[Dict]:
+        """The stored record for `name` iff its fingerprint still matches disk.
+
+        Prefers nanosecond mtime when both sides have it (BF-16); falls back to
+        float ``mtime`` with ``MTIME_EPS`` for legacy rows.
+        """
         rec = self.records.get(name)
         if not rec or rec.get("size") != size:
             return None
+        stored_ns = rec.get("mtime_ns")
+        if stored_ns is not None and mtime_ns is not None:
+            try:
+                if int(stored_ns) != int(mtime_ns):
+                    return None
+            except (TypeError, ValueError):
+                return None
+            return rec
         try:
             if abs(float(rec.get("mtime", -1)) - mtime) > self.MTIME_EPS:
                 return None
@@ -649,24 +720,46 @@ class Ledger:
 
     def status_for(
             self, name: str, size: int, mtime: float,
-            require_direct_notes: bool = True) -> Optional[str]:
-        """'matched' / 'nomatch' if this exact file was already processed, else None."""
-        rec = self._fresh_record(name, size, mtime)
+            require_direct_notes: bool = True,
+            search_profile_hash: Optional[str] = None,
+            mtime_ns: Optional[int] = None,
+            decoder_profile: Optional[str] = None) -> Optional[str]:
+        """'matched' / 'nomatch' if this exact file was already processed, else None.
+
+        When *search_profile_hash* is provided, matched/nomatch rows only reuse
+        if they were sealed under that same profile (BF-03). Rows missing a
+        profile hash are treated as stale once so they refresh once under the
+        current profile.
+
+        Metadata-version invalidation is limited to matched rows that still
+        need direct-note backfill (BF-15) — not nomatch/unreadable/duplicate.
+        """
+        rec = self._fresh_record(name, size, mtime, mtime_ns=mtime_ns)
         if not rec:
             return None
         status = rec.get("status")
-        if (status in RESOLVED_LEDGER_STATUSES
-                and require_direct_notes
-                and rec.get("metadata_version") != LEDGER_METADATA_VERSION):
-            return None
+        # BF-15: only matched+notes care about LEDGER_METADATA_VERSION.
         if (status == "matched" and require_direct_notes
-                and self.needs_direct_notes(name, size, mtime)):
+                and self.needs_direct_notes(
+                    name, size, mtime, mtime_ns=mtime_ns)):
             return None
+        if (status in ("matched", "nomatch")
+                and search_profile_hash is not None):
+            rec_profile = rec.get("search_profile_hash")
+            if not rec_profile or rec_profile != search_profile_hash:
+                return None
+        # BF-17: unreadable seals reopen when decoder/prep policy changes.
+        if status == "unreadable" and decoder_profile is not None:
+            rec_dec = rec.get("decoder_profile")
+            if not rec_dec or rec_dec != decoder_profile:
+                return None
         return status
 
-    def needs_direct_notes(self, name: str, size: int, mtime: float) -> bool:
+    def needs_direct_notes(
+            self, name: str, size: int, mtime: float,
+            mtime_ns: Optional[int] = None) -> bool:
         """Whether this exact prior match still needs source-note backfill."""
-        rec = self._fresh_record(name, size, mtime)
+        rec = self._fresh_record(name, size, mtime, mtime_ns=mtime_ns)
         return bool(
             rec
             and rec.get("status") == "matched"
@@ -674,14 +767,18 @@ class Ledger:
             and (rec.get("metadata_version") != LEDGER_METADATA_VERSION
                  or rec.get("direct_notes_applied") is not True))
 
-    def md5_for(self, name: str, size: int, mtime: float) -> Optional[str]:
+    def md5_for(
+            self, name: str, size: int, mtime: float,
+            mtime_ns: Optional[int] = None) -> Optional[str]:
         """Reuse a previously-computed MD5 for an unchanged file even if its
         status isn't matched/nomatch (e.g. a booru was briefly unreachable
         last time) — saves re-hashing on retry."""
-        rec = self._fresh_record(name, size, mtime)
+        rec = self._fresh_record(name, size, mtime, mtime_ns=mtime_ns)
         return rec.get("md5") if rec else None
 
-    def cache_md5(self, name: str, size: int, mtime: float, md5: str) -> None:
+    def cache_md5(
+            self, name: str, size: int, mtime: float, md5: str,
+            mtime_ns: Optional[int] = None) -> None:
         """Checkpoint a local MD5 before the network stages finish.
 
         ``status: hashed`` deliberately remains unresolved, so the next run
@@ -690,59 +787,101 @@ class Ledger:
         if not md5:
             return
         with self._lock:
-            rec = self._fresh_record(name, size, mtime)
+            rec = self._fresh_record(name, size, mtime, mtime_ns=mtime_ns)
             if rec is not None:
                 if rec.get("md5") != md5:
                     rec["md5"] = md5
                     self._dirty += 1
+                if mtime_ns is not None and rec.get("mtime_ns") != mtime_ns:
+                    rec["mtime_ns"] = int(mtime_ns)
+                    self._dirty += 1
                 return
-            self.records[name] = {
+            row = {
                 "size": size,
                 "mtime": mtime,
                 "md5": md5,
                 "status": "hashed",
                 "sources": [],
             }
+            if mtime_ns is not None:
+                row["mtime_ns"] = int(mtime_ns)
+            self.records[name] = row
             self._dirty += 1
 
-    def sha256_for(self, name: str, size: int, mtime: float) -> Optional[str]:
+    def sha256_for(
+            self, name: str, size: int, mtime: float,
+            mtime_ns: Optional[int] = None) -> Optional[str]:
         """Return a cached Hydrus/SHA-256 hash for this unchanged file."""
-        rec = self._fresh_record(name, size, mtime)
+        rec = self._fresh_record(name, size, mtime, mtime_ns=mtime_ns)
         return rec.get("sha256") if rec else None
 
-    def cache_sha256(self, name: str, size: int, mtime: float, sha256: str) -> None:
+    def cache_sha256(
+            self, name: str, size: int, mtime: float, sha256: str,
+            mtime_ns: Optional[int] = None) -> None:
         """Add SHA-256 to an existing unchanged record for future page loads."""
         with self._lock:
-            rec = self._fresh_record(name, size, mtime)
+            rec = self._fresh_record(name, size, mtime, mtime_ns=mtime_ns)
             if rec is not None and rec.get("sha256") != sha256:
                 rec["sha256"] = sha256
                 self._dirty += 1
 
     def sidecar_sync_matches(
             self, name: str, size: int, mtime: float,
-            signature: str) -> bool:
-        """Whether these exact media bytes and sidecar payload were synced."""
-        rec = self._fresh_record(name, size, mtime)
+            signature: str,
+            *,
+            scope_id: Optional[str] = None,
+            tag_deleted_duplicates: Optional[bool] = None,
+            mtime_ns: Optional[int] = None,
+    ) -> bool:
+        """Whether these exact media bytes and sidecar payload were synced.
+
+        Terminal deleted outcomes (no live dups, etc.) are also checkpointed
+        so they are not retried forever under the same Hydrus scope/policy
+        (BF-07). Scope or deleted-dup policy changes invalidate the checkpoint.
+        """
+        rec = self._fresh_record(name, size, mtime, mtime_ns=mtime_ns)
         sync = rec.get("sidecar_sync") if rec else None
-        return (
-            isinstance(sync, dict)
-            and bool(signature)
-            and sync.get("signature") == signature
-        )
+        if not (isinstance(sync, dict) and signature
+                and sync.get("signature") == signature):
+            return False
+        # Incomplete / pending checkpoints never count as matched.
+        if sync.get("complete") is False:
+            return False
+        # Legacy checkpoints only stored signature (+ optional sha256).
+        if "scope_id" not in sync and "disposition" not in sync:
+            return scope_id is None
+        if (scope_id is not None
+                and sync.get("scope_id") != scope_id):
+            return False
+        if (tag_deleted_duplicates is not None
+                and "tag_deleted_duplicates" in sync
+                and bool(sync.get("tag_deleted_duplicates"))
+                != bool(tag_deleted_duplicates)):
+            return False
+        return True
 
     def record_sidecar_sync(
             self, name: str, size: int, mtime: float,
-            signature: str, sha256: Optional[str] = None) -> None:
-        """Checkpoint a successful sidecar→Hydrus reconciliation.
+            signature: str, sha256: Optional[str] = None,
+            *,
+            mtime_ns: Optional[int] = None,
+            scope_id: Optional[str] = None,
+            disposition: Optional[str] = None,
+            import_state: Optional[str] = None,
+            complete: bool = True,
+            tag_deleted_duplicates: Optional[bool] = None,
+    ) -> None:
+        """Checkpoint a sidecar→Hydrus reconciliation outcome.
 
-        This metadata is independent of the normal matched/nomatch status. A
-        sidecar-only record therefore remains unresolved for online-search
-        purposes, while a pre-existing scan status remains exactly unchanged.
+        Independent of normal matched/nomatch scan status. Accepts terminal
+        deleted dispositions as complete so they are not retried under the
+        same scope/policy (BF-07).
         """
         if not signature:
             return
         with self._lock:
-            rec = self._fresh_record(name, size, mtime)
+            rec = self._fresh_record(
+                name, size, mtime, mtime_ns=mtime_ns)
             if rec is None:
                 rec = {
                     "size": size,
@@ -751,14 +890,28 @@ class Ledger:
                     "status": "sidecar_only",
                     "sources": [],
                 }
+                if mtime_ns is not None:
+                    rec["mtime_ns"] = int(mtime_ns)
                 self.records[name] = rec
-            sync = {
+            elif mtime_ns is not None and rec.get("mtime_ns") != mtime_ns:
+                rec["mtime_ns"] = int(mtime_ns)
+                self._dirty += 1
+            sync: Dict = {
                 "signature": signature,
                 "synced_at": time.time(),
+                "complete": bool(complete),
             }
             if sha256:
                 sync["sha256"] = sha256
                 rec["sha256"] = sha256
+            if scope_id is not None:
+                sync["scope_id"] = scope_id
+            if disposition:
+                sync["disposition"] = disposition
+            if import_state:
+                sync["import_state"] = import_state
+            if tag_deleted_duplicates is not None:
+                sync["tag_deleted_duplicates"] = bool(tag_deleted_duplicates)
             if rec.get("sidecar_sync") != sync:
                 rec["sidecar_sync"] = sync
                 self._dirty += 1
@@ -766,17 +919,48 @@ class Ledger:
     def record(self, name: str, size: int, mtime: float, md5: Optional[str],
                status: str, sources: List[str], duplicate_of: str = "",
                sha256: Optional[str] = None,
-               direct_notes_applied: Optional[bool] = None) -> None:
+               direct_notes_applied: Optional[bool] = None,
+               hydrus_output: Optional[Dict] = None,
+               unmatched_import: Optional[Dict] = None,
+               review: Optional[Dict] = None,
+               search_profile_hash: Optional[str] = None,
+               mtime_ns: Optional[int] = None,
+               tagged_at: Optional[float] = None,
+               stamp_tagged_at: Optional[bool] = None,
+               decoder_profile: Optional[str] = None,
+               unreadable_reason: Optional[str] = None,
+               metadata_version: Optional[int] = None) -> None:
+        # New writers must not introduce top-level hydrus_deleted; map to
+        # matched + nested checkpoint if a caller still passes the legacy name.
+        if status == "hydrus_deleted":
+            status = "matched"
+            if hydrus_output is None:
+                hydrus_output = {
+                    "import_state": "previously_deleted",
+                    "metadata_state": "no_duplicate_targets",
+                    "sha256": sha256,
+                    "target_hashes": [],
+                    "complete": True,
+                    "updated_at": time.time(),
+                    "legacy_status_rewrite": True,
+                }
         with self._lock:
-            previous = self._fresh_record(name, size, mtime) or {}
+            previous = self._fresh_record(
+                name, size, mtime, mtime_ns=mtime_ns) or {}
             record = {
                 "size": size,
                 "mtime": mtime,
                 "md5": md5,
                 "status": status,
                 "sources": sources,
-                "metadata_version": LEDGER_METADATA_VERSION,
+                "metadata_version": (
+                    LEDGER_METADATA_VERSION if metadata_version is None
+                    else int(metadata_version)),
             }
+            if mtime_ns is not None:
+                record["mtime_ns"] = int(mtime_ns)
+            elif previous.get("mtime_ns") is not None:
+                record["mtime_ns"] = previous["mtime_ns"]
             if status == "matched" and direct_notes_applied is None:
                 # Compatibility for direct Ledger callers: a newly-written
                 # current-version match historically meant all requested
@@ -791,17 +975,56 @@ class Ledger:
                 # cached for these exact bytes rather than dropping it. Guarded on
                 # the same (size, mtime) freshness `sha256_for` uses, so a changed
                 # file never inherits a hash computed from different bytes.
-                sha256 = (self._fresh_record(name, size, mtime) or {}).get("sha256")
+                sha256 = (self._fresh_record(
+                    name, size, mtime, mtime_ns=mtime_ns) or {}).get("sha256")
             if sha256:
                 # Persist the SHA-256 Hydrus already handed us on import, so the
                 # Already Tagged page never has to recompute it on a later run.
                 record["sha256"] = sha256
             if status == "matched":
-                # Wall-clock stamp so the Already Tagged page can be limited to
-                # the N most recently tagged files on a later run.
-                record["tagged_at"] = time.time()
+                # BF-11: idempotent rewrites keep the original tag time so
+                # Already Tagged is not reshuffled; first match stamps now.
+                if tagged_at is not None:
+                    record["tagged_at"] = float(tagged_at)
+                elif stamp_tagged_at is True:
+                    record["tagged_at"] = time.time()
+                elif stamp_tagged_at is False:
+                    if previous.get("tagged_at") is not None:
+                        record["tagged_at"] = previous["tagged_at"]
+                elif (previous.get("status") == "matched"
+                        and previous.get("tagged_at") is not None):
+                    record["tagged_at"] = previous["tagged_at"]
+                else:
+                    record["tagged_at"] = time.time()
+            if status == "unreadable":
+                if decoder_profile:
+                    record["decoder_profile"] = decoder_profile
+                elif previous.get("decoder_profile"):
+                    record["decoder_profile"] = previous["decoder_profile"]
+                if unreadable_reason:
+                    record["unreadable_reason"] = str(unreadable_reason)[:240]
+                elif previous.get("unreadable_reason"):
+                    record["unreadable_reason"] = previous["unreadable_reason"]
+            if status in ("matched", "nomatch"):
+                if search_profile_hash:
+                    record["search_profile_hash"] = search_profile_hash
+                elif previous.get("search_profile_hash"):
+                    record["search_profile_hash"] = previous[
+                        "search_profile_hash"]
             if duplicate_of:
                 record["duplicate_of"] = duplicate_of
+            if isinstance(hydrus_output, dict):
+                record["hydrus_output"] = hydrus_output
+            elif isinstance(previous.get("hydrus_output"), dict):
+                record["hydrus_output"] = previous["hydrus_output"]
+            if isinstance(unmatched_import, dict):
+                record["unmatched_import"] = unmatched_import
+            elif isinstance(previous.get("unmatched_import"), dict):
+                record["unmatched_import"] = previous["unmatched_import"]
+            if isinstance(review, dict):
+                record["review"] = review
+            elif isinstance(previous.get("review"), dict):
+                record["review"] = previous["review"]
             # Sidecar reconciliation is orthogonal to online scan status. Keep
             # its checkpoint when this same file later gains a matched,
             # nomatch, duplicate, or pending-review record.
@@ -813,21 +1036,52 @@ class Ledger:
     def fingerprint_matches(
             self, count: int, total_size: int,
             manifest: Optional[str] = None,
-            require_direct_notes: bool = True) -> bool:
-        return (
-            self.dir_count is not None
-            and (not require_direct_notes
-                 or self.dir_metadata_version == LEDGER_METADATA_VERSION)
-            and (not require_direct_notes
-                 or self.dir_direct_notes_applied is True)
-            and (self.dir_count, self.dir_size) == (count, total_size)
-            and (manifest is None or self.dir_manifest == manifest)
-        )
+            require_direct_notes: bool = True,
+            search_profile_hash: Optional[str] = None,
+            sidecars_required: Optional[bool] = None,
+            sidecar_format: Optional[str] = None,
+            output_policy_hash: Optional[str] = None) -> bool:
+        if self.dir_count is None:
+            return False
+        if require_direct_notes:
+            if self.dir_metadata_version != LEDGER_METADATA_VERSION:
+                return False
+            if self.dir_direct_notes_applied is not True:
+                return False
+        if (self.dir_count, self.dir_size) != (count, total_size):
+            return False
+        if manifest is not None and self.dir_manifest != manifest:
+            return False
+        # BF-03: missing stored profile forces one re-check after upgrade.
+        if search_profile_hash is not None:
+            if not self.dir_search_profile_hash:
+                return False
+            if self.dir_search_profile_hash != search_profile_hash:
+                return False
+        # BF-04: seals made without sidecars cannot authorize sidecar-required runs.
+        if sidecars_required is not None:
+            if self.dir_sidecars_required is None:
+                if sidecars_required:
+                    return False
+            elif bool(self.dir_sidecars_required) != bool(sidecars_required):
+                return False
+            if (sidecars_required and sidecar_format
+                    and self.dir_sidecar_format
+                    and self.dir_sidecar_format != sidecar_format):
+                return False
+        if (output_policy_hash is not None
+                and self.dir_output_policy_hash != output_policy_hash):
+            return False
+        return True
 
     def mark_dir_complete(
             self, count: int, total_size: int,
             manifest: Optional[str] = None,
-            direct_notes_applied: bool = True) -> None:
+            direct_notes_applied: bool = True,
+            search_profile_hash: Optional[str] = None,
+            sidecars_required: bool = False,
+            sidecar_format: Optional[str] = None,
+            output_policy_hash: Optional[str] = None) -> None:
         """Seal the directory-level fingerprint. Only call once every current
         media file in the directory has a sidecar or a matched/nomatch record —
         otherwise an interrupted run could make a future scan wrongly skip
@@ -835,14 +1089,21 @@ class Ledger:
         with self._lock:
             state = (
                 count, total_size, manifest, LEDGER_METADATA_VERSION,
-                bool(direct_notes_applied))
+                bool(direct_notes_applied), search_profile_hash,
+                bool(sidecars_required), sidecar_format, output_policy_hash)
             current = (
                 self.dir_count, self.dir_size, self.dir_manifest,
-                self.dir_metadata_version, self.dir_direct_notes_applied)
+                self.dir_metadata_version, self.dir_direct_notes_applied,
+                self.dir_search_profile_hash, self.dir_sidecars_required,
+                self.dir_sidecar_format, self.dir_output_policy_hash)
             if current != state:
                 (self.dir_count, self.dir_size, self.dir_manifest,
                  self.dir_metadata_version,
-                 self.dir_direct_notes_applied) = state
+                 self.dir_direct_notes_applied,
+                 self.dir_search_profile_hash,
+                 self.dir_sidecars_required,
+                 self.dir_sidecar_format,
+                 self.dir_output_policy_hash) = state
                 self._dirty += 1
 
     def save(self) -> None:
@@ -862,6 +1123,10 @@ class Ledger:
                         "metadata_version": self.dir_metadata_version,
                         "direct_notes_applied":
                             self.dir_direct_notes_applied,
+                        "search_profile_hash": self.dir_search_profile_hash,
+                        "sidecars_required": self.dir_sidecars_required,
+                        "sidecar_format": self.dir_sidecar_format,
+                        "output_policy_hash": self.dir_output_policy_hash,
                     }
                 atomic_write_text(
                     self.path, json.dumps(payload, ensure_ascii=False, indent=0))
@@ -1110,6 +1375,8 @@ class TagIntegrator(HydrusMixin):
         self._run_lock = threading.Lock()  # one scan at a time
         self._fatal_network_lock = threading.Lock()
         self._fatal_network_error = False
+        self._repeated_issue_lock = threading.Lock()
+        self._repeated_issues: Dict[str, Tuple[int, str, str]] = {}
 
         # Per-service pacers — intervals are filled in by apply_settings() below,
         # which is the single place settings → instance attrs is wired.
@@ -1448,6 +1715,192 @@ class TagIntegrator(HydrusMixin):
             and self.has_hydrus
             and self.hydrus_can_edit_notes)
 
+    def search_profile_hash(self) -> str:
+        """Canonical digest of effective sources + matching policy (BF-03).
+
+        Availability belongs in the profile: a clean miss made without an
+        enabled source's credentials must reopen once that source can actually
+        participate. Mid-run auth rejection is handled separately as a
+        retryable lookup failure and never writes a resolved row.
+        """
+        matching = self.settings.matching
+        payload = {
+            "v": SEARCH_PROFILE_VERSION,
+            "sources": {
+                name: {
+                    "enabled": bool(self.source_enabled(name)),
+                    "available": bool(self.source_available(name)),
+                    "mode": (
+                        "anonymous" if name == "danbooru" and self.danbooru_anon
+                        else "authenticated" if self.source_available(name)
+                        else "unavailable"),
+                }
+                for name in SEARCH_SOURCES
+            },
+            "matching": {
+                "saucenao_min_similarity": float(
+                    matching.saucenao_min_similarity),
+                "saucenao_auth_similarity": float(
+                    matching.saucenao_auth_similarity),
+                "fluffle_accepted_matches": sorted(
+                    matching.fluffle_accepted_matches or []),
+                "fluffle_tossup_e621_only": bool(
+                    matching.fluffle_tossup_e621_only),
+                "fluffle_review_mode": str(matching.fluffle_review_mode or "off"),
+            },
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:32]
+
+    @staticmethod
+    def _digest_policy(payload: Dict[str, Any]) -> str:
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:32]
+
+    def hydrus_output_policy_hash(self) -> str:
+        """Identity of policy affecting terminal Hydrus dispositions."""
+        return self._digest_policy({
+            "v": 1,
+            "tag_deleted_duplicates": bool(
+                self.hydrus_tag_deleted_duplicates),
+        })
+
+    def output_policy_hash(self) -> str:
+        """Non-secret identity of every output decision used by dir seals."""
+        scope_id = None
+        if self.has_hydrus:
+            try:
+                scope_id = self._hydrus_scope_id()
+            except Exception:
+                scope_id = None
+        return self._digest_policy({
+            "v": 1,
+            "hydrus_active": bool(self.has_hydrus),
+            "hydrus_scope_id": scope_id,
+            "hydrus_import": bool(self.hydrus_import),
+            "hydrus_import_unmatched": bool(self.hydrus_import_unmatched),
+            "hydrus_policy": self.hydrus_output_policy_hash(),
+            "sidecars_required": bool(self.write_sidecars),
+            "sidecar_format": self.sidecar_format_key(),
+            "sidecar_patterns": {
+                "tag": self.settings.output.sidecar_tag_filename,
+                "url": self.settings.output.sidecar_url_filename,
+                "json": self.settings.output.sidecar_json_filename,
+            },
+        })
+
+    def sidecar_format_key(self) -> str:
+        """Output sidecar format identity for directory seals (BF-04)."""
+        out = self.settings.output
+        return str(out.sidecar_format or "txt").lower()
+
+    def ledger_record(
+            self, ledger: "Ledger", name: str, size: int, mtime: float,
+            md5: Optional[str], status: str, sources: List[str],
+            **kwargs: Any) -> None:
+        """Ledger.record with automatic search_profile_hash for search results."""
+        if status in ("matched", "nomatch"):
+            kwargs.setdefault("search_profile_hash", self.search_profile_hash())
+        if "mtime_ns" not in kwargs:
+            try:
+                st = (ledger.dir / name).stat()
+                if (st.st_size == size
+                        and abs(st.st_mtime - mtime) <= Ledger.MTIME_EPS):
+                    kwargs["mtime_ns"] = st.st_mtime_ns
+            except OSError:
+                pass
+        ledger.record(name, size, mtime, md5, status, sources, **kwargs)
+
+    def decoder_profile(self) -> str:
+        """Behavior-relevant decoder identity for unreadable seals (BF-17)."""
+        pillow_ver = "unknown"
+        try:
+            from PIL import Image as _PilImage
+            pillow_ver = getattr(_PilImage, "__version__", None) or getattr(
+                __import__("PIL", fromlist=["__version__"]), "__version__",
+                "unknown")
+        except Exception:
+            try:
+                import PIL
+                pillow_ver = getattr(PIL, "__version__", "unknown")
+            except Exception:
+                pass
+        return f"v{DECODER_PROFILE_VERSION};pillow={pillow_ver}"
+
+    def local_path_complete(
+            self, path: Path, ledger: "Ledger", st: os.stat_result, *,
+            is_pdf_page: bool = False,
+            root: Optional[Path] = None,
+            search_profile_hash: Optional[str] = None,
+            require_output_complete: bool = True,
+    ) -> bool:
+        """Shared completeness predicate for index and finalize (BF-05).
+
+        True when this path needs no further work under the current policy.
+        Missing required sidecars, profile mismatch, pending review, incomplete
+        unmatched import (when *require_output_complete*), and broken duplicate
+        links all return False.
+
+        Index uses ``require_output_complete=False`` so a profile-compatible
+        ``nomatch`` still skips re-search while a pending unmatched Hydrus
+        import is reconciled by ``_hydrus_import_prior_nomatches``. Finalize
+        uses the default True so directories cannot seal with pending sinks.
+        """
+        if search_profile_hash is None:
+            search_profile_hash = self.search_profile_hash()
+        fn = path.name
+        mtime_ns = getattr(st, "st_mtime_ns", None)
+        note_backfill = (
+            self.direct_notes_effective()
+            and ledger.needs_direct_notes(
+                fn, st.st_size, st.st_mtime, mtime_ns=mtime_ns))
+        has_sidecar = self.has_sidecar(path)
+        rec = ledger._fresh_record(
+            fn, st.st_size, st.st_mtime, mtime_ns=mtime_ns)
+        # A pre-existing/manual sidecar with no ledger row remains a supported
+        # import boundary. Once FurTag has a row, however, the sidecar satisfies
+        # only the sidecar sink; it cannot hide a stale search profile, a
+        # pending hash/search, or an incomplete Hydrus write.
+        if (has_sidecar and not is_pdf_page and not note_backfill
+                and (rec is None or rec.get("status") == "sidecar_only")):
+            return True
+
+        status = ledger.status_for(
+            fn, st.st_size, st.st_mtime,
+            self.direct_notes_effective(),
+            search_profile_hash=search_profile_hash,
+            mtime_ns=mtime_ns,
+            decoder_profile=self.decoder_profile())
+        if status is None or status not in RESOLVED_LEDGER_STATUSES:
+            return False
+
+        # Sidecar-required reopen (index previously cleared status; finalize
+        # must agree so a cancelled recovery cannot reseal).
+        if (status in ("matched", "hydrus_deleted")
+                and self.write_sidecars
+                and not has_sidecar
+                and not is_pdf_page):
+            return False
+
+        if status == "duplicate":
+            rec = ledger.records.get(fn) or {}
+            canonical = rec.get("duplicate_of") or ""
+            if root is not None and canonical and not (root / canonical).is_file():
+                return False
+
+        # Index may defer only the optional unmatched-import sink; matched
+        # Hydrus checkpoints must be checked even during search-only reuse so
+        # a database or deleted-file policy change actually queues the file.
+        check_output = require_output_complete or (
+            self.has_hydrus and status in ("matched", "hydrus_deleted"))
+        if check_output and not self.path_is_output_complete(rec):
+            return False
+        return True
+
     def _reject_source_auth(self, name: str, message: str) -> "RetryableLookupError":
         """Disable *name* for the rest of the run after an HTTP 401/403.
 
@@ -1510,6 +1963,11 @@ class TagIntegrator(HydrusMixin):
                 out[s] = "active"
         return out
 
+    @staticmethod
+    def prune_walk_dirs(dirs: List[str]) -> None:
+        """Host hook for HydrusMixin walks — same rules as the main scanner."""
+        _prune_hidden_walk_dirs(dirs)
+
     def enabled_pipeline_description(self) -> str:
         """Human-readable pipeline containing only user-enabled sources."""
         labels = {
@@ -1537,23 +1995,54 @@ class TagIntegrator(HydrusMixin):
 
     # ── Thumbnail / MD5 helpers ──────────────────────────────────────────────
 
-    @staticmethod
-    def _thumb_size(w: int, h: int, tgt: int) -> Tuple[int, int]:
-        return (round(tgt / h * w), tgt) if w > h else (tgt, round(tgt / w * h))
-
     def _prepare_thumb(self, img: Path) -> Optional[BytesIO]:
         try:
-            im = Image.open(img)
-            if im.mode not in ("RGB", "RGBA", "L"):
-                im = im.convert("RGB")   # CMYK / P / etc. don't save cleanly to PNG
-            im.thumbnail(self._thumb_size(*im.size, THUMB_MAX))
-            buf = BytesIO()
-            im.save(buf, "PNG")
+            with Image.open(img) as im:
+                width, height = im.size
+                if width <= 0 or height <= 0:
+                    raise ValueError(f"invalid image dimensions {width}×{height}")
+                if width * height > THUMB_SOURCE_MAX_PIXELS:
+                    raise ValueError(
+                        f"image is too large to thumbnail safely "
+                        f"({width}×{height}; limit is "
+                        f"{THUMB_SOURCE_MAX_PIXELS:,} pixels)")
+
+                # JPEG can ask its decoder for a reduced-resolution source.
+                # Other formats still benefit from shrinking before a mode
+                # conversion, which avoids a second full-resolution buffer.
+                im.draft("RGB", (THUMB_MAX, THUMB_MAX))
+                # Pillow < 9.1 lacks Image.Resampling; requirements floor is
+                # 9.1+, but keep a fallback for partially upgraded envs (BF-14).
+                lanczos = getattr(
+                    getattr(Image, "Resampling", Image), "LANCZOS",
+                    getattr(Image, "LANCZOS", 1))
+                im.thumbnail(
+                    (THUMB_MAX, THUMB_MAX),
+                    resample=lanczos,
+                    reducing_gap=2.0,
+                )
+                converted = None
+                if im.mode not in ("RGB", "RGBA", "L"):
+                    converted = im.convert("RGB")
+
+                buf = BytesIO()
+                try:
+                    prepared = converted if converted is not None else im
+                    prepared.save(buf, "PNG")
+                finally:
+                    if converted is not None:
+                        converted.close()
             buf.seek(0)
             return buf
-        except Exception as e:
+        except (UnidentifiedImageError, ValueError, SyntaxError) as e:
             notify(f"❌ Pillow failed on {img.name}: {e}")
             return None
+        except OSError as e:
+            raise RetryableMediaError(
+                f"temporary image read failure for {img.name}: {e}") from e
+        except Exception as e:
+            raise RetryableMediaError(
+                f"thumbnail preparation failed for {img.name}: {e}") from e
 
     @staticmethod
     def _hash_local(fp: Path, algo: str) -> Optional[str]:
@@ -2727,15 +3216,19 @@ class TagIntegrator(HydrusMixin):
                 else UrlWritePolicy.ASSOCIATE_ONLY)
 
         if self.has_hydrus and (tags or urls or notes):
-            sha256, hydrus_complete = self._hydrus_push_detailed(
+            push = self._hydrus_push_detailed(
                 media, tags, urls, known_sha256, url_policy=url_policy,
                 force_associate_urls=force_associate, notes=notes)
             sidecar_complete = True
             if self.write_sidecars:
                 sidecar_complete = self._write_sidecar_results(
                     media, tags, urls)
+            complete = push.complete and sidecar_complete
+            # Search resolution stays "matched"; Hydrus details nest under
+            # hydrus_output (never a new top-level hydrus_deleted status).
             return WriteOutcome(
-                sha256, hydrus_complete and sidecar_complete)
+                push.sha256, complete, ledger_status="matched",
+                hydrus_output=push.to_ledger_checkpoint())
 
         if self.write_sidecars:
             return WriteOutcome(
@@ -2748,6 +3241,8 @@ class TagIntegrator(HydrusMixin):
             canonical_sha256: Optional[str],
             force_associate_urls: Optional[Set[str]] = None,
             notes: Optional[Dict[str, str]] = None,
+            ledger_status: str = "matched",
+            hydrus_output: Optional[Dict] = None,
     ) -> int:
         """Give byte-identical filesystem copies the canonical result too.
 
@@ -2765,6 +3260,24 @@ class TagIntegrator(HydrusMixin):
             canonical_rel = str(canonical.path.relative_to(root))
         except ValueError:
             canonical_rel = str(canonical.path)
+        canonical_rec = (
+            canonical.ledger._fresh_record(
+                canonical.path.name, canonical.size, canonical.mtime,
+                mtime_ns=canonical.mtime_ns)
+            if canonical.ledger is not None else None) or {}
+
+        # Previously-deleted content: copies share nested hydrus_output and
+        # must not re-trigger import + relationship lookups.
+        from furtag_hydrus import HydrusImportState, HydrusMetadataState
+        out = hydrus_output if isinstance(hydrus_output, dict) else {}
+        deleted_import = (
+            out.get("import_state") == HydrusImportState.PREVIOUSLY_DELETED.value
+            or ledger_status == "hydrus_deleted")
+        terminal_no_targets = out.get("metadata_state") in (
+            HydrusMetadataState.NO_DUPLICATE_TARGETS.value,
+            HydrusMetadataState.POLICY_SKIPPED.value,
+            HydrusMetadataState.APPLIED_DUPLICATES.value,
+        ) or ledger_status == "hydrus_deleted"
 
         completed = 0
         for duplicate in duplicates:
@@ -2780,19 +3293,31 @@ class TagIntegrator(HydrusMixin):
             # Normally this is the canonical's Hydrus SHA-256, which proves
             # the tags already belong to this same byte-identical record. If
             # its earlier push failed, let this copy have one recovery attempt.
-            sha256 = canonical_sha256
-            if self.has_hydrus and not sha256 and (copy_tags or urls or notes):
-                sha256, hydrus_complete = self._hydrus_push_detailed(
+            sha256 = canonical_sha256 if (deleted_import or canonical_sha256) else None
+            copy_hydrus = out if out else None
+            if (not terminal_no_targets and self.has_hydrus and not sha256
+                    and (copy_tags or urls or notes)):
+                push = self._hydrus_push_detailed(
                     duplicate.path, copy_tags, urls,
                     force_associate_urls=force_associate, notes=notes)
-                complete = complete and hydrus_complete
+                sha256 = push.sha256
+                complete = complete and push.complete
+                copy_hydrus = push.to_ledger_checkpoint()
             if not complete:
                 continue
-            duplicate.ledger.record(
+            # Always search status matched for successful fan-out of a hit.
+            self.ledger_record(
+                duplicate.ledger,
                 duplicate.path.name, duplicate.size, duplicate.mtime,
                 duplicate.md5, "matched", sources,
                 duplicate_of=canonical_rel, sha256=sha256,
-                direct_notes_applied=self.direct_notes_effective())
+                direct_notes_applied=canonical_rec.get(
+                    "direct_notes_applied", self.direct_notes_effective()),
+                hydrus_output=copy_hydrus,
+                tagged_at=canonical_rec.get("tagged_at"),
+                stamp_tagged_at=False,
+                metadata_version=canonical_rec.get(
+                    "metadata_version", 0))
             completed += 1
         return completed
 
@@ -2809,7 +3334,8 @@ class TagIntegrator(HydrusMixin):
             duplicate.ledger.record(
                 duplicate.path.name, duplicate.size, duplicate.mtime,
                 duplicate.md5, "duplicate", [],
-                duplicate_of=canonical_rel)
+                duplicate_of=canonical_rel,
+                mtime_ns=duplicate.mtime_ns)
 
     @staticmethod
     def _read_result_sidecar(path: Path) -> Set[str]:
@@ -2822,7 +3348,13 @@ class TagIntegrator(HydrusMixin):
     def _propagate_prior_duplicate_groups(
             self, root: Path, duplicate_groups: Dict[Path, List[FileItem]],
             ledger_mgr: LedgerManager) -> int:
-        """Resolve new copies whose canonical file was matched on an earlier run."""
+        """Resolve new copies whose canonical was resolved on an earlier run.
+
+        Includes prior ``matched`` (with nested hydrus_output when present) and
+        legacy top-level ``hydrus_deleted`` seals so byte-identical copies do
+        not re-search or re-import (BF-08).
+        """
+        profile = self.search_profile_hash()
         copied_total = 0
         for canonical_path, copies in list(duplicate_groups.items()):
             try:
@@ -2830,34 +3362,168 @@ class TagIntegrator(HydrusMixin):
             except OSError:
                 continue
             ledger = ledger_mgr.get(canonical_path.parent)
-            if ledger.status_for(
-                    canonical_path.name, st.st_size, st.st_mtime,
-                    self.direct_notes_effective()) != "matched":
-                continue
             rec = ledger.records.get(canonical_path.name) or {}
+            raw_status = rec.get("status")
+            status = ledger.status_for(
+                canonical_path.name, st.st_size, st.st_mtime,
+                self.direct_notes_effective(),
+                search_profile_hash=(
+                    None if raw_status == "hydrus_deleted" else profile),
+                mtime_ns=st.st_mtime_ns)
+            if status not in ("matched", "nomatch", "hydrus_deleted"):
+                continue
             canonical = FileItem(
                 canonical_path, str(canonical_path.relative_to(root)),
-                st.st_size, st.st_mtime, self._media_kind(canonical_path.name) or "image",
+                st.st_size, st.st_mtime,
+                self._media_kind(canonical_path.name) or "image",
                 ledger=ledger, md5=rec.get("md5"),
-                sha256=ledger.sha256_for(canonical_path.name, st.st_size, st.st_mtime))
+                sha256=ledger.sha256_for(
+                    canonical_path.name, st.st_size, st.st_mtime,
+                    mtime_ns=st.st_mtime_ns),
+                mtime_ns=st.st_mtime_ns)
+            if status == "nomatch":
+                self._resolve_duplicate_nomatches(root, canonical, copies)
+                duplicate_groups.pop(canonical_path, None)
+                continue
+            hydrus_output = rec.get("hydrus_output") if isinstance(
+                rec.get("hydrus_output"), dict) else None
+            if status == "hydrus_deleted" and not hydrus_output:
+                hydrus_output = {
+                    "import_state": "previously_deleted",
+                    "metadata_state": "no_duplicate_targets",
+                    "sha256": rec.get("sha256"),
+                    "target_hashes": [],
+                    "complete": True,
+                    "legacy_status_rewrite": True,
+                }
             c_tags, c_urls = self.read_sidecar_payload(canonical_path)
             copied_total += self._propagate_duplicate_results(
                 root, canonical, copies, c_tags, c_urls,
-                list(rec.get("sources") or []), canonical.sha256)
+                list(rec.get("sources") or []), canonical.sha256,
+                hydrus_output=hydrus_output,
+                ledger_status=(
+                    "hydrus_deleted" if status == "hydrus_deleted"
+                    else "matched"))
             duplicate_groups.pop(canonical_path, None)
         return copied_total
 
     def write_unmatched(self, media: Path,
                         known_sha256: Optional[str] = None) -> Optional[str]:
-        """Optionally import a no-match file to Hydrus without tags or URLs."""
-        if not (self.has_hydrus and self.hydrus_import and
-                self.hydrus_import_unmatched):
-            return None
-        # It is already local and has no new metadata, so there is nothing to
-        # send to Hydrus; return it solely for ledger SHA-256 caching.
+        """Optionally import a no-match file. Returns SHA-256 if known."""
+        return self.write_unmatched_detailed(media, known_sha256).sha256
+
+    def write_unmatched_detailed(
+            self, media: Path,
+            known_sha256: Optional[str] = None,
+    ) -> WriteOutcome:
+        """Import a no-match file and return a typed sink outcome (BF-02).
+
+        Search resolution stays ``nomatch``; Hydrus import completion lives in
+        the nested ``unmatched_import`` checkpoint and drives ``complete``.
+        """
+        from furtag_hydrus import HydrusImportState, HydrusMetadataState
+
+        requested = bool(
+            self.has_hydrus and self.hydrus_import
+            and self.hydrus_import_unmatched)
+        if not requested:
+            return WriteOutcome(
+                known_sha256, True, ledger_status="nomatch",
+                unmatched_import={
+                    "requested": False,
+                    "complete": True,
+                    "import_state": HydrusImportState.NOT_REQUESTED.value,
+                    "metadata_state": HydrusMetadataState.NOT_REQUESTED.value,
+                    "sha256": known_sha256,
+                    "target_hashes": [],
+                    "scope_id": None,
+                    "updated_at": time.time(),
+                })
         if known_sha256:
-            return known_sha256
-        return self._hydrus_push(media, set(), set())
+            # Already known local/current; nothing to re-import.
+            scope = None
+            if hasattr(self, "_hydrus_scope_id"):
+                try:
+                    scope = self._hydrus_scope_id()
+                except Exception:
+                    scope = None
+            return WriteOutcome(
+                known_sha256, True, ledger_status="nomatch",
+                unmatched_import={
+                    "requested": True,
+                    "complete": True,
+                    "import_state": HydrusImportState.LIVE.value,
+                    "metadata_state": HydrusMetadataState.NOT_REQUESTED.value,
+                    "sha256": known_sha256,
+                    "target_hashes": [],
+                    "scope_id": scope,
+                    "policy_hash": self.hydrus_output_policy_hash(),
+                    "updated_at": time.time(),
+                })
+        push = self._hydrus_push_detailed(media, set(), set())
+        checkpoint = push.to_ledger_checkpoint()
+        checkpoint["requested"] = True
+        return WriteOutcome(
+            push.sha256, push.complete, ledger_status="nomatch",
+            unmatched_import=checkpoint)
+
+    @staticmethod
+    def unmatched_import_is_complete(
+            rec: Optional[Dict], *, required: bool,
+            scope_id: Optional[str] = None) -> bool:
+        """Whether a nomatch row's optional Hydrus import sink is done."""
+        if not required:
+            return True
+        if not isinstance(rec, dict):
+            return False
+        ui = rec.get("unmatched_import")
+        if not isinstance(ui, dict):
+            # Legacy nomatch without a checkpoint: incomplete when import is on.
+            return False
+        if ui.get("requested") is not True:
+            return False
+        if scope_id is not None and ui.get("scope_id") != scope_id:
+            return False
+        return bool(ui.get("complete"))
+
+    def path_is_output_complete(
+            self, rec: Optional[Dict], *,
+            require_unmatched_import: Optional[bool] = None) -> bool:
+        """Path-local completeness for directory seals (not search skip)."""
+        if not isinstance(rec, dict):
+            return False
+        status = rec.get("status")
+        if status not in RESOLVED_LEDGER_STATUSES:
+            return False
+        if require_unmatched_import is None:
+            require_unmatched_import = bool(
+                self.has_hydrus and self.hydrus_import
+                and self.hydrus_import_unmatched)
+        scope_id = None
+        if self.has_hydrus:
+            try:
+                scope_id = self._hydrus_scope_id()
+            except Exception:
+                return False
+        if status == "nomatch":
+            if not self.unmatched_import_is_complete(
+                    rec, required=require_unmatched_import,
+                    scope_id=scope_id if require_unmatched_import else None):
+                return False
+            return True
+        if self.has_hydrus and status in ("matched", "hydrus_deleted"):
+            checkpoint = rec.get("hydrus_output")
+            if not isinstance(checkpoint, dict):
+                return False
+            if not checkpoint.get("complete"):
+                return False
+            if checkpoint.get("scope_id") != scope_id:
+                return False
+            if (checkpoint.get("metadata_state") == "policy_skipped"
+                    and checkpoint.get("policy_hash")
+                    != self.hydrus_output_policy_hash()):
+                return False
+        return True
 
     # ── PDF pre-pass ───────────────────────────────────────────────────────────
 
@@ -2870,7 +3536,7 @@ class TagIntegrator(HydrusMixin):
         """
         pdfs: List[Path] = []
         for dp, dirs, files in os.walk(root):
-            dirs.sort()
+            _prune_hidden_walk_dirs(dirs)
             for fn in sorted(files):
                 if fn.startswith("."):
                     continue
@@ -3119,7 +3785,7 @@ class TagIntegrator(HydrusMixin):
 
         for dp, dirs, files in os.walk(root):
             scanned_dirs += 1
-            dirs.sort()
+            _prune_hidden_walk_dirs(dirs)
             dp_path = Path(dp)
             if excluded_dirs:
                 dirs[:] = [d for d in dirs if dp_path / d not in excluded_dirs]
@@ -3148,9 +3814,16 @@ class TagIntegrator(HydrusMixin):
                 total_size += st.st_size
             count = len(stats)
             manifest = self._directory_manifest(dp_path, stats)
+            profile = self.search_profile_hash()
+            sidecars_req = bool(self.write_sidecars)
+            output_policy = self.output_policy_hash()
             if count and dir_ledger.fingerprint_matches(
                     count, total_size, manifest,
-                    self.direct_notes_effective()):
+                    self.direct_notes_effective(),
+                    search_profile_hash=profile,
+                    sidecars_required=sidecars_req,
+                    sidecar_format=self.sidecar_format_key(),
+                    output_policy_hash=output_policy):
                 media += count
                 seen += count
                 skipped_dirs += 1
@@ -3165,37 +3838,26 @@ class TagIntegrator(HydrusMixin):
                 p = dp_path / fn
                 kind = self._media_kind(fn)
                 is_pdf_page = kind == "image" and p.suffix.lower() == ".png" and p.parent in pdf_page_dirs
-                has_sidecar = self.has_sidecar(p)
-                note_backfill = (
-                    self.direct_notes_effective()
-                    and dir_ledger.needs_direct_notes(
-                        fn, st.st_size, st.st_mtime))
-                if has_sidecar and not is_pdf_page and not note_backfill:
-                    tagged += 1
-                    continue
-
-                status = dir_ledger.status_for(
-                    fn, st.st_size, st.st_mtime,
-                    self.direct_notes_effective())
-                # A successful matched record is not enough when sidecars are
-                # an active output sink and its sidecar disappeared. Retry the
-                # idempotent lookup/write so user-deleted metadata is restored.
-                if (status == "matched" and self.write_sidecars
-                        and not has_sidecar and not is_pdf_page):
-                    status = None
-                if status == "duplicate":
-                    canonical = dir_ledger.records.get(fn, {}).get("duplicate_of", "")
-                    if canonical and not (root / canonical).is_file():
-                        status = None  # chosen copy disappeared; elect/search again
-                # pending_review stays eligible (unresolved)
-                if status in RESOLVED_LEDGER_STATUSES:
-                    seen += 1
+                # Search-complete (may still have pending unmatched import —
+                # that is reconciled without re-search). Finalize seals only
+                # when output is also complete.
+                if self.local_path_complete(
+                        p, dir_ledger, st, is_pdf_page=is_pdf_page,
+                        root=root, search_profile_hash=profile,
+                        require_output_complete=False):
+                    if self.has_sidecar(p) and not is_pdf_page:
+                        tagged += 1
+                    else:
+                        seen += 1
                     continue
 
                 item = FileItem(path=p, relpath=str(p.relative_to(root)),
                                 size=st.st_size, mtime=st.st_mtime, kind=kind,
                                 ledger=dir_ledger, perceptual_only=is_pdf_page,
-                                md5=dir_ledger.md5_for(fn, st.st_size, st.st_mtime))
+                                md5=dir_ledger.md5_for(
+                                    fn, st.st_size, st.st_mtime,
+                                    mtime_ns=st.st_mtime_ns),
+                                mtime_ns=st.st_mtime_ns)
                 items.append(item)
 
         # Videos first (can't reverse-image-search; rarely hash-match), then
@@ -3223,32 +3885,42 @@ class TagIntegrator(HydrusMixin):
             except (OSError, ValueError):
                 continue
             ledger = ledger_mgr.get(path.parent)
-            status = ledger.status_for(
-                path.name, st.st_size, st.st_mtime,
-                self.direct_notes_effective())
-            if status in RESOLVED_LEDGER_STATUSES:
+            if self.local_path_complete(
+                    path, ledger, st, is_pdf_page=True,
+                    root=root):
                 continue
             items.append(FileItem(
                 path=path, relpath=relpath, size=st.st_size, mtime=st.st_mtime,
                 kind="image", ledger=ledger, perceptual_only=True,
-                md5=ledger.md5_for(path.name, st.st_size, st.st_mtime)))
+                md5=ledger.md5_for(
+                    path.name, st.st_size, st.st_mtime,
+                    mtime_ns=st.st_mtime_ns),
+                mtime_ns=st.st_mtime_ns))
         items.sort(key=lambda it: _natural_key(it.relpath))
         return items
 
-    def finalize_dir_fingerprints(self, candidate_dirs: Set[Path],
-                                   pdf_page_dirs: Set[Path],
-                                   ledger_mgr: LedgerManager) -> None:
-        """After a run, re-check each directory that wasn't wholesale-skipped:
-        if every media file currently in it now has a tag sidecar or a
-        matched/nomatch ledger record, seal that directory's fingerprint so
-        the *next* run can skip it wholesale. A directory left incomplete
-        (interrupted run, persistent no-match-pending file) simply isn't
-        sealed and gets rechecked file-by-file next time — never wrongly
-        skipped."""
+    def finalize_dir_fingerprints(
+            self, candidate_dirs: Set[Path],
+            pdf_page_dirs: Set[Path],
+            ledger_mgr: LedgerManager,
+            root: Optional[Path] = None) -> None:
+        """After a run, seal directories that are fully complete under policy.
+
+        Uses the same :meth:`local_path_complete` predicate as index (BF-05),
+        including search profile (BF-03), required sidecars (BF-04), and
+        unmatched-import completeness. Does not seal after cancellation.
+        """
+        if self.cancelled():
+            return
+        profile = self.search_profile_hash()
+        sidecars_req = bool(self.write_sidecars)
+        fmt = self.sidecar_format_key()
+        output_policy = self.output_policy_hash()
         for dp_path in candidate_dirs:
             dir_ledger = ledger_mgr.get(dp_path)
             try:
-                names = sorted(f for f in os.listdir(dp_path) if not f.startswith("."))
+                names = sorted(
+                    f for f in os.listdir(dp_path) if not f.startswith("."))
             except OSError:
                 continue
 
@@ -3269,18 +3941,12 @@ class TagIntegrator(HydrusMixin):
                 count += 1
                 total_size += st.st_size
                 stats[fn] = st
-                is_pdf_page = kind == "image" and p.suffix.lower() == ".png" and p.parent in pdf_page_dirs
-                note_backfill = (
-                    self.direct_notes_effective()
-                    and dir_ledger.needs_direct_notes(
-                        fn, st.st_size, st.st_mtime))
-                if (self.has_sidecar(p) and not is_pdf_page
-                        and not note_backfill):
-                    continue
-                if dir_ledger.status_for(
-                        fn, st.st_size, st.st_mtime,
-                        self.direct_notes_effective()) not in (
-                        RESOLVED_LEDGER_STATUSES):
+                is_pdf_page = (
+                    kind == "image" and p.suffix.lower() == ".png"
+                    and p.parent in pdf_page_dirs)
+                if not self.local_path_complete(
+                        p, dir_ledger, st, is_pdf_page=is_pdf_page,
+                        root=root, search_profile_hash=profile):
                     complete = False
                     break
 
@@ -3288,7 +3954,11 @@ class TagIntegrator(HydrusMixin):
                 dir_ledger.mark_dir_complete(
                     count, total_size,
                     self._directory_manifest(dp_path, stats),
-                    self.direct_notes_effective())
+                    self.direct_notes_effective(),
+                    search_profile_hash=profile,
+                    sidecars_required=sidecars_req,
+                    sidecar_format=fmt,
+                    output_policy_hash=output_policy)
 
     # ── Progress events ──────────────────────────────────────────────────────
 
@@ -3297,6 +3967,28 @@ class TagIntegrator(HydrusMixin):
         `TerminalObserver` renders the CLI panel, `QtObserver` feeds the GUI, so
         each progress point is written exactly once."""
         self._observer.emit(RunEvent(kind=kind, **fields))
+
+    def _notify_repeated_issue(
+            self, key: str, label: str, message: str) -> None:
+        """Report the first repeated failure, then bounded progress summaries."""
+        with self._repeated_issue_lock:
+            count, _, _ = self._repeated_issues.get(key, (0, label, message))
+            count += 1
+            self._repeated_issues[key] = (count, label, message)
+        if count == 1:
+            notify(message)
+        elif count % 25 == 0:
+            notify(f"⚠️  {label}: {count} failures so far; latest: {message}")
+
+    def _flush_repeated_issues(self) -> None:
+        with self._repeated_issue_lock:
+            entries = list(self._repeated_issues.values())
+            self._repeated_issues.clear()
+        for count, label, message in entries:
+            if count > 1:
+                notify(
+                    f"⚠️  {label}: {count} files affected this run; "
+                    f"latest: {message}")
 
     # ── Parallel local hashing ───────────────────────────────────────────────
 
@@ -3323,8 +4015,14 @@ class TagIntegrator(HydrusMixin):
                 item.md5 = fut.result()
                 if item.md5:
                     item.ledger.cache_md5(
-                        item.path.name, item.size, item.mtime, item.md5)
+                        item.path.name, item.size, item.mtime, item.md5,
+                        mtime_ns=item.mtime_ns)
                     dirty_ledgers.add(item.ledger)
+                else:
+                    # A local read/hash failure is not evidence that every
+                    # remote source missed. In particular, hash-only videos
+                    # must remain unresolved rather than becoming nomatch.
+                    item.lookup_errors.add("local_hash")
                 done += 1
                 # Persist reusable hashes during the disk pass. An interrupted
                 # run loses at most one small batch rather than the whole pass.
@@ -3347,28 +4045,35 @@ class TagIntegrator(HydrusMixin):
                     ) -> Tuple[List[FileItem], int, Dict[Path, List[FileItem]]]:
         """Remove exact-MD5 duplicates from this run before network searching.
 
-        An unchanged earlier matched/no-match ledger record wins over a new
-        candidate. Otherwise the first item in the stable videos/images +
-        natural-path order is canonical. Skipped copies remain
-        ``duplicate_pending`` until the canonical's output succeeds (or it is a
-        clean no-match), preventing failed sidecar propagation from being
-        checkpointed as complete.
+        An unchanged earlier matched / nomatch / legacy hydrus_deleted ledger
+        record wins over a new candidate (BF-08). Otherwise the first item in
+        the stable videos/images + natural-path order is canonical. Skipped
+        copies remain ``duplicate_pending`` until the canonical's output
+        succeeds (or it is a clean no-match), preventing failed sidecar
+        propagation from being checkpointed as complete.
         """
+        profile = self.search_profile_hash()
+        prior_statuses = frozenset({"matched", "nomatch", "hydrus_deleted"})
         canonical_by_md5: Dict[str, Path] = {}
         for ledger in sorted(ledger_mgr.touched(), key=lambda led: str(led.dir)):
             for name, rec in sorted(ledger.records.items()):
                 if not isinstance(rec, dict) or rec.get("status") not in (
-                        "matched", "nomatch"):
+                        prior_statuses):
                     continue
                 path = ledger.dir / name
                 try:
                     st = path.stat()
                 except OSError:
                     continue
-                if ledger.status_for(
-                        name, st.st_size, st.st_mtime,
-                        self.direct_notes_effective()) not in (
-                        "matched", "nomatch"):
+                # hydrus_deleted is legacy and not profile-gated; matched/nomatch
+                # require a compatible search profile (BF-03).
+                status = ledger.status_for(
+                    name, st.st_size, st.st_mtime,
+                    self.direct_notes_effective(),
+                    search_profile_hash=(
+                        None if rec.get("status") == "hydrus_deleted"
+                        else profile))
+                if status not in prior_statuses:
                     continue
                 md5 = rec.get("md5")
                 if md5:
@@ -3398,7 +4103,8 @@ class TagIntegrator(HydrusMixin):
                 canonical_rel = str(canonical)
             item.ledger.record(item.path.name, item.size, item.mtime, item.md5,
                                "duplicate_pending", [],
-                               duplicate_of=canonical_rel)
+                               duplicate_of=canonical_rel,
+                               mtime_ns=item.mtime_ns)
             duplicate_groups.setdefault(canonical, []).append(item)
             duplicate_count += 1
 
@@ -3526,7 +4232,9 @@ class TagIntegrator(HydrusMixin):
                 # Network/HTTP failure — distinct from a clean "not found" miss,
                 # so surface it as ⚠ rather than ✗ (the file may still exist there).
                 if not self._stop_for_broken_ca_bundle(e):
-                    notify(f"❌ {s} failed on {item.path.name}: {e}")
+                    self._notify_repeated_issue(
+                        f"hash_source:{s}", f"{s} lookup failures",
+                        f"❌ {s} failed on {item.path.name}: {e}")
                 item.lookup_errors.add(s)
                 state[s] = "err"
                 _tick(state)
@@ -3632,12 +4340,18 @@ class TagIntegrator(HydrusMixin):
         if self._review_queue is not None:
             self._review_queue.add(pending)
         item.ledger.record(item.path.name, item.size, item.mtime, item.md5,
-                           "pending_review", ["pending_review"])
+                           "pending_review", ["pending_review"],
+                           mtime_ns=item.mtime_ns)
         return pending
 
     def resolve_pending_review(self, pending: PendingReview, approve: bool,
                                root: Optional[Path] = None) -> bool:
-        """Approve (enrich + write) or reject (nomatch) a pending review item."""
+        """Approve (enrich + write) or reject (nomatch) a pending review item.
+
+        Reject persists the human decision even when a required unmatched
+        Hydrus import is incomplete, so the UI does not re-prompt. Incomplete
+        output remains on the ledger for later reconciliation.
+        """
         path = Path(pending.path)
         if not path.is_file():
             return False
@@ -3676,13 +4390,37 @@ class TagIntegrator(HydrusMixin):
                     "keeping it in the review queue for retry.")
                 return False
             sha = outcome.sha256
-            ledger.record(path.name, st.st_size, st.st_mtime, pending.md5,
-                          "matched", sources, sha256=sha,
-                          direct_notes_applied=self.direct_notes_effective())
+            status = outcome.ledger_status or "matched"
+            self.ledger_record(
+                ledger,
+                path.name, st.st_size, st.st_mtime, pending.md5,
+                status, sources, sha256=sha,
+                direct_notes_applied=self.direct_notes_effective(),
+                hydrus_output=outcome.hydrus_output,
+                review={
+                    "decision": "approved",
+                    "decided_at": time.time(),
+                    "output_complete": True,
+                })
         else:
-            sha = self.write_unmatched(path)
-            ledger.record(path.name, st.st_size, st.st_mtime, pending.md5,
-                          "nomatch", [], sha256=sha)
+            outcome = self.write_unmatched_detailed(path)
+            # Always record the reject decision. Incomplete unmatched import
+            # stays on the ledger for prior-nomatch reconciliation without
+            # re-opening the interactive review UI.
+            self.ledger_record(
+                ledger,
+                path.name, st.st_size, st.st_mtime, pending.md5,
+                "nomatch", [], sha256=outcome.sha256,
+                unmatched_import=outcome.unmatched_import,
+                review={
+                    "decision": "rejected",
+                    "decided_at": time.time(),
+                    "output_complete": bool(outcome.complete),
+                })
+            if not outcome.complete:
+                notify(
+                    f"⚠️  Rejected {path.name}; required Hydrus import is "
+                    "still pending and will retry on a later scan.")
         ledger.save()
         if self._review_queue is not None:
             self._review_queue.remove(pending.id)
@@ -3797,6 +4535,8 @@ class TagIntegrator(HydrusMixin):
             # and pipeline entry, clearing it here would lose the cancellation.
             self.cancel_event = cancel_event
         self._fatal_network_error = False
+        with self._repeated_issue_lock:
+            self._repeated_issues.clear()
         self._bind_cancel_to_pacers()
         summary = ScanSummary(
             source_hits={k: 0 for k in
@@ -3878,7 +4618,8 @@ class TagIntegrator(HydrusMixin):
             print(f"✅ Already Tagged page → {already_tagged} ledger-matched file(s)")
         if not items and pdf_future is None:
             print("✅ Nothing to do — everything is tagged or already checked.")
-            self.finalize_dir_fingerprints(candidate_dirs, pdf_page_dirs, ledger_mgr)
+            self.finalize_dir_fingerprints(
+                candidate_dirs, pdf_page_dirs, ledger_mgr, root=root)
             ledger_mgr.save_all()
             summary.pending_review = len(self._review_queue) if self._review_queue else 0
             return summary
@@ -3906,7 +4647,8 @@ class TagIntegrator(HydrusMixin):
             print(f"♊ {duplicates} exact duplicate(s) skipped — see {DUPLICATES_FILE}")
         if not items and pdf_future is None:
             print("✅ Nothing unique left to search.")
-            self.finalize_dir_fingerprints(candidate_dirs, pdf_page_dirs, ledger_mgr)
+            self.finalize_dir_fingerprints(
+                candidate_dirs, pdf_page_dirs, ledger_mgr, root=root)
             ledger_mgr.save_all()
             return summary
 
@@ -3942,13 +4684,16 @@ class TagIntegrator(HydrusMixin):
                 sources: List[str], sha256: Optional[str],
                 force_associate_urls: Optional[Set[str]] = None,
                 notes: Optional[Dict[str, str]] = None,
+                ledger_status: str = "matched",
+                hydrus_output: Optional[Dict] = None,
         ) -> None:
             nonlocal duplicates_tagged
             with duplicate_lock:
                 copies = duplicate_groups.pop(item.path, [])
             copied = self._propagate_duplicate_results(
                 root, item, copies, tags, urls, sources, sha256,
-                force_associate_urls=force_associate_urls, notes=notes)
+                force_associate_urls=force_associate_urls, notes=notes,
+                ledger_status=ledger_status, hydrus_output=hydrus_output)
             if copied:
                 with counts_lock:
                     duplicates_tagged += copied
@@ -4021,7 +4766,8 @@ class TagIntegrator(HydrusMixin):
                             if outcome.sha256:
                                 item.ledger.cache_sha256(
                                     item.path.name, item.size, item.mtime,
-                                    outcome.sha256)
+                                    outcome.sha256,
+                                    mtime_ns=item.mtime_ns)
                             self._emit(
                                 "finish_file", track="perceptual",
                                 result="retry later — output incomplete",
@@ -4030,15 +4776,22 @@ class TagIntegrator(HydrusMixin):
                             _maybe_save_ledgers()
                             continue
                         sha = outcome.sha256
-                        item.ledger.record(item.path.name, item.size, item.mtime,
-                                            item.md5, "matched", sources,
-                                            sha256=sha,
-                                            direct_notes_applied=
-                                                self.direct_notes_effective())
+                        status = outcome.ledger_status or "matched"
+                        self.ledger_record(
+                            item.ledger,
+                            item.path.name, item.size, item.mtime,
+                            item.md5, status, sources, sha256=sha,
+                            direct_notes_applied=self.direct_notes_effective(),
+                            hydrus_output=outcome.hydrus_output)
                         _propagate_duplicates(
-                            item, tags, urls, sources, sha, notes=notes)
+                            item, tags, urls, sources, sha, notes=notes,
+                            ledger_status=status,
+                            hydrus_output=outcome.hydrus_output)
                         source_totals = _bump_hit(sources)
                         result = f"{'+'.join(sources)}  ({len(tags)} tags)"
+                        ho = outcome.hydrus_output or {}
+                        if ho.get("import_state") == "previously_deleted":
+                            result += " · hydrus deleted"
                         self._emit("finish_file", track="perceptual",
                                    result=result, source_hits=source_totals)
                     else:
@@ -4051,19 +4804,43 @@ class TagIntegrator(HydrusMixin):
                                        "failed_sources":
                                            sorted(item.lookup_errors)})
                         else:
-                            sha = self.write_unmatched(item.path, item.sha256)
-                            item.ledger.record(
+                            outcome = self.write_unmatched_detailed(
+                                item.path, item.sha256)
+                            self.ledger_record(
+                                item.ledger,
                                 item.path.name, item.size, item.mtime,
-                                item.md5, "nomatch", [], sha256=sha)
-                            _resolve_duplicate_nomatches(item)
-                            _bump_miss()
-                            self._emit("finish_file", track="perceptual",
-                                       result="— no match")
+                                item.md5, "nomatch", [],
+                                sha256=outcome.sha256,
+                                unmatched_import=outcome.unmatched_import)
+                            if outcome.complete:
+                                _resolve_duplicate_nomatches(item)
+                                _bump_miss()
+                                self._emit(
+                                    "finish_file", track="perceptual",
+                                    result="— no match")
+                            else:
+                                self._emit(
+                                    "finish_file", track="perceptual",
+                                    result="no match — hydrus import pending",
+                                    extra={"retryable": True,
+                                           "failed_sources": ["output"]})
+                    _maybe_save_ledgers()
+                except RetryableMediaError as e:
+                    item.lookup_errors.add("local_media")
+                    self._emit(
+                        "finish_file", track="perceptual",
+                        result="retry later — local media error",
+                        extra={"retryable": True,
+                               "failed_sources": ["local_media"]})
+                    notify(f"⚠️  {e}; the file will be retried.")
                     _maybe_save_ledgers()
                 except UnusableMediaError as e:
-                    item.ledger.record(
+                    self.ledger_record(
+                        item.ledger,
                         item.path.name, item.size, item.mtime,
-                        item.md5, "unreadable", [])
+                        item.md5, "unreadable", [],
+                        decoder_profile=self.decoder_profile(),
+                        unreadable_reason=str(e))
                     _resolve_duplicate_nomatches(item)
                     self._emit(
                         "finish_file", track="perceptual",
@@ -4148,7 +4925,8 @@ class TagIntegrator(HydrusMixin):
                             if outcome.sha256:
                                 item.ledger.cache_sha256(
                                     item.path.name, item.size, item.mtime,
-                                    outcome.sha256)
+                                    outcome.sha256,
+                                    mtime_ns=item.mtime_ns)
                             self._emit(
                                 "finish_file", track="hash",
                                 result="retry later — output incomplete",
@@ -4157,16 +4935,23 @@ class TagIntegrator(HydrusMixin):
                             _maybe_save_ledgers()
                             continue
                         sha = outcome.sha256
-                        item.ledger.record(item.path.name, item.size, item.mtime,
-                                            item.md5, "matched", sources,
-                                            sha256=sha,
-                                            direct_notes_applied=
-                                                self.direct_notes_effective())
+                        status = outcome.ledger_status or "matched"
+                        self.ledger_record(
+                            item.ledger,
+                            item.path.name, item.size, item.mtime,
+                            item.md5, status, sources, sha256=sha,
+                            direct_notes_applied=self.direct_notes_effective(),
+                            hydrus_output=outcome.hydrus_output)
                         _propagate_duplicates(
                             item, tags, urls, sources, sha,
-                            force_associate_urls=force_assoc, notes=notes)
+                            force_associate_urls=force_assoc, notes=notes,
+                            ledger_status=status,
+                            hydrus_output=outcome.hydrus_output)
                         source_totals = _bump_hit(sources)
                         result = f"{'+'.join(sources)}  ({len(tags)} tags)"
+                        ho = outcome.hydrus_output or {}
+                        if ho.get("import_state") == "previously_deleted":
+                            result += " · hydrus deleted"
                         self._emit(
                             "finish_file", track="hash", result=result,
                             source_hits=source_totals)
@@ -4199,14 +4984,26 @@ class TagIntegrator(HydrusMixin):
                                        "failed_sources":
                                            sorted(item.lookup_errors)})
                         else:
-                            sha = self.write_unmatched(item.path, item.sha256)
-                            item.ledger.record(
+                            outcome = self.write_unmatched_detailed(
+                                item.path, item.sha256)
+                            self.ledger_record(
+                                item.ledger,
                                 item.path.name, item.size, item.mtime,
-                                item.md5, "nomatch", [], sha256=sha)
-                            _resolve_duplicate_nomatches(item)
-                            _bump_miss()
-                            self._emit("finish_file", track="hash",
-                                       result="— no match")
+                                item.md5, "nomatch", [],
+                                sha256=outcome.sha256,
+                                unmatched_import=outcome.unmatched_import)
+                            if outcome.complete:
+                                _resolve_duplicate_nomatches(item)
+                                _bump_miss()
+                                self._emit(
+                                    "finish_file", track="hash",
+                                    result="— no match")
+                            else:
+                                self._emit(
+                                    "finish_file", track="hash",
+                                    result="no match — hydrus import pending",
+                                    extra={"retryable": True,
+                                           "failed_sources": ["output"]})
                     _maybe_save_ledgers()
 
             perceptual_q.join()
@@ -4241,8 +5038,9 @@ class TagIntegrator(HydrusMixin):
                     if pdf_duplicates:
                         duplicates += pdf_duplicates
                         summary.duplicates = duplicates
-                        notify(f"♊ {pdf_duplicates} duplicate PDF page(s) skipped; "
-                               f"see {DUPLICATES_FILE}.")
+                        notify_info(
+                            f"♊ {pdf_duplicates} duplicate PDF page(s) skipped; "
+                            f"see {DUPLICATES_FILE}.")
                     for item in pdf_items:
                         candidate_dirs.add(item.path.parent)
                         perceptual_q.put(item)
@@ -4265,10 +5063,12 @@ class TagIntegrator(HydrusMixin):
             if pdf_executor is not None:
                 pdf_executor.shutdown(wait=True)
             self._hydrus_flush_result_pages()
+            self._flush_repeated_issues()
             # Close the panel before the closing bookkeeping below, whose
             # notify()s must print rather than redraw a torn-down panel.
             self._detach_display()
-            self.finalize_dir_fingerprints(candidate_dirs, pdf_page_dirs, ledger_mgr)
+            self.finalize_dir_fingerprints(
+                candidate_dirs, pdf_page_dirs, ledger_mgr, root=root)
             self._write_duplicates_log(root, ledger_mgr)
             ledger_mgr.save_all()
             if self._review_queue is not None:
@@ -4515,7 +5315,7 @@ def _nuke_candidates(root: Path, settings: Optional[Settings] = None
     ledger_names = {LEDGER_FILE, LEDGER_FILE + ".tmp", DUPLICATES_FILE,
                     DUPLICATES_FILE + ".tmp"}
     for dp, dirs, files in os.walk(root, followlinks=False):
-        dirs.sort()
+        _prune_hidden_walk_dirs(dirs)
         for fn in sorted(files):
             path = Path(dp) / fn
             if fn in ledger_names:
@@ -4571,7 +5371,7 @@ def _pdf_render_candidates(root: Path) -> Tuple[List[Path], Set[Path]]:
     page_dirs: Set[Path] = set()
     pdfs: List[Path] = []
     for dp, dirs, files in os.walk(root, followlinks=False):
-        dirs.sort()
+        _prune_hidden_walk_dirs(dirs)
         for fn in sorted(files):
             if not fn.startswith(".") and Path(fn).suffix.lower() in PDF_EXTS:
                 pdfs.append(Path(dp) / fn)

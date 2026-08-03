@@ -4,6 +4,16 @@ All notable changes to FurTag are documented here.
 
 ## Unreleased
 
+- **Typed Hydrus outcomes** — imports now preserve separate import and metadata states, including live, previously deleted, vetoed, permission-missing, policy-skipped, and retryable failures. Deleted originals retain their SHA-256 and any successfully tagged duplicate targets.
+- **Correct deleted-file completion** — only a successful empty relationship query creates a terminal no-duplicate result. Missing relationship permission and relationship/API failures remain retryable; disabling duplicate tagging is terminal only for that policy and reopens when enabled.
+- **Hydrus database scoping** — normal output, unmatched imports, sidecar sync, and directory seals are bound to a persisted non-secret Hydrus profile UUID plus normalized API origin. The GUI has an explicit action for replacing/rebuilding a Hydrus database.
+- **Search-profile invalidation** — source toggles, credential availability/auth mode, perceptual thresholds, and matching policy now participate in ledger and directory reuse decisions. Newly available sources reopen old matches/no-matches without discarding reusable MD5s.
+- **Output-completeness fixes** — a sidecar can satisfy its own sink but no longer hides stale search state, unresolved hashes, failed Hydrus writes, or a newly required unmatched import. Directory seals include current sidecar/output policy and cannot reseal cancelled or incomplete recovery work.
+- **Resumable unmatched imports** — no-match search truth and Hydrus import completion are independent checkpoints. Status-3 and veto outcomes retain their SHA/reason, while failed required imports remain queued for reconciliation.
+- **Duplicate correctness** — prior clean no-match and scoped deleted outcomes resolve new exact copies without redundant searches/imports. Mirrored historical matches preserve known tag time and metadata version instead of inventing current freshness.
+- **Sidecar-sync hardening** — candidates stream in bounded batches, hidden directories follow main-scan traversal rules, terminal deleted outcomes are checkpointed separately from failures, and legacy unscoped checkpoints cannot cross Hydrus databases.
+- **Fingerprint and decoder hardening** — nanosecond mtimes now flow through normal scans, duplicate/review rows, and sidecar sync; decoder-profile changes reopen deterministic unreadable rows, while transient image and local-hash I/O failures remain retryable. Pillow is explicitly constrained to `>=9.1.0` with a compatibility fallback.
+- **Cleaner diagnostics** — success messages no longer pollute the issue pane, relationship-permission warnings are session-bounded, and repeated per-source failures are aggregated with a final count.
 - **Direct source notes** — e621 descriptions and InkBunny titles/descriptions now go straight from their existing API responses to Hydrus `/add_notes/set_notes`; the slow URL-downloader enrichment path is now optional and off by default.
 - **Persistent recent folders** — the GUI remembers a bounded MRU list in the platform-specific user settings file, including temporarily disconnected volumes.
 - **Safer retries** — transient source failures, partial additive hash hits, exhausted SauceNAO quota, and incomplete Hydrus/sidecar writes no longer become permanent `nomatch`/`matched` ledger records; permanent credential/media failures no longer loop forever.
@@ -14,6 +24,10 @@ All notable changes to FurTag are documented here.
 - **Live credential safety** — reloading/removing credentials clears stale source sessions and Hydrus permissions before reconnecting.
 - **GUI lifecycle hardening** — stale discovery results cannot populate a newly selected folder, indexing workers are retained safely, and scan-folder controls lock during active work.
 - **Privacy hardening** — local settings, recent paths, Codex memory, and FurTag PDF runtime metadata are explicitly gitignored.
+
+### Upgrade note
+
+The first scan after this upgrade may revalidate legacy rows and directory seals that lack a current search profile, output policy, or Hydrus database scope. Existing MD5 checkpoints are retained, so this should avoid repeating the disk-heavy hash pass even when network/output reconciliation is required.
 
 ## [0.1.0] — 2026-07-26
 

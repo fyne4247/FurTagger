@@ -14,6 +14,8 @@ from furtag_settings import (
     render_sidecar_name,
     normalize_recent_scan_paths,
     remember_scan_path,
+    hydrus_scope_id,
+    normalize_hydrus_api_origin,
     DEFAULT_SAUCENAO_MIN_SIMILARITY,
     DEFAULT_SAUCENAO_AUTH_SIMILARITY,
 )
@@ -178,6 +180,50 @@ class TestSettingsStore(unittest.TestCase):
         first, second = str(base / "first"), str(base / "second")
         remembered = remember_scan_path([first, second], second)
         self.assertEqual(remembered, [second, first])
+
+    def test_hydrus_profile_uuid_generated_on_load(self):
+        s = Settings.from_dict({})
+        self.assertTrue(s.hydrus.hydrus_profile_uuid)
+        again = Settings.from_dict({
+            "hydrus": {"hydrus_profile_uuid": s.hydrus.hydrus_profile_uuid},
+        })
+        self.assertEqual(
+            again.hydrus.hydrus_profile_uuid, s.hydrus.hydrus_profile_uuid)
+
+    def test_store_persists_generated_hydrus_profile_uuid(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "settings.json"
+            path.write_text('{"version": 2}\n', encoding="utf-8")
+            store = SettingsStore(path)
+            first = store.load().hydrus.hydrus_profile_uuid
+            second = store.load().hydrus.hydrus_profile_uuid
+            self.assertTrue(first)
+            self.assertEqual(second, first)
+            persisted = json.loads(path.read_text("utf-8"))
+            self.assertEqual(
+                persisted["hydrus"]["hydrus_profile_uuid"], first)
+
+    def test_new_store_persists_nonblank_hydrus_profile_uuid(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "settings.json"
+            store = SettingsStore(path)
+            first = store.load().hydrus.hydrus_profile_uuid
+            self.assertTrue(first)
+            self.assertTrue(path.exists())
+            self.assertEqual(
+                store.load().hydrus.hydrus_profile_uuid, first)
+
+    def test_hydrus_scope_id_ignores_path_and_key(self):
+        uid = "11111111-1111-1111-1111-111111111111"
+        a = hydrus_scope_id(uid, "http://127.0.0.1:45869/")
+        b = hydrus_scope_id(uid, "http://127.0.0.1:45869")
+        self.assertEqual(a, b)
+        self.assertEqual(
+            normalize_hydrus_api_origin("https://Host.Example:1234/foo"),
+            "https://host.example:1234")
+        self.assertNotEqual(
+            hydrus_scope_id(uid, "http://127.0.0.1:45869"),
+            hydrus_scope_id(uid, "http://127.0.0.1:45870"))
 
 
 class TestPreflight(unittest.TestCase):

@@ -251,14 +251,236 @@ class TestDirectSourceNotes(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             media = Path(td) / "deleted.jpg"
             media.write_bytes(b"deleted")
-            self.assertIsNone(ti._hydrus_push(
+            # Status-3 original SHA is retained (BF-06); notes go to the live dup.
+            self.assertEqual(ti._hydrus_push(
                 media, set(), set(),
-                notes={"e621 description — post 1": "survives"}))
+                notes={"e621 description — post 1": "survives"}),
+                DELETED_HASH)
 
         calls = [call for call in session.calls
                  if "add_notes/set_notes" in call[1]]
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][2]["json"]["hash"], DUP_OK)
+
+    def test_deleted_with_no_duplicate_members_is_permanent(self):
+        """Successful empty relationship query → no_duplicate_targets + SHA."""
+        from furtag_hydrus import HydrusImportState, HydrusMetadataState
+        session = FakeSession(_deleted_dup_routes([]))
+        ti = _hydrus_ti(session)
+        ti.hydrus_tag_deleted_duplicates = True
+        ti.hydrus_can_manage_relationships = True
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "gone.jpg"
+            media.write_bytes(b"gone")
+            push = ti._hydrus_push_detailed(
+                media, {"creator:test"}, set())
+            self.assertTrue(push.complete)
+            self.assertTrue(push.hydrus_deleted)
+            self.assertEqual(push.sha256, DELETED_HASH)
+            self.assertEqual(
+                push.import_state, HydrusImportState.PREVIOUSLY_DELETED)
+            self.assertEqual(
+                push.metadata_state, HydrusMetadataState.NO_DUPLICATE_TARGETS)
+
+            outcome = ti.write_results_detailed(
+                media, {"creator:test"}, set())
+            self.assertTrue(outcome.complete)
+            # Search status stays matched; Hydrus details are nested.
+            self.assertEqual(outcome.ledger_status, "matched")
+            self.assertEqual(outcome.sha256, DELETED_HASH)
+            self.assertEqual(
+                outcome.hydrus_output["metadata_state"], "no_duplicate_targets")
+            self.assertEqual(outcome.hydrus_output["sha256"], DELETED_HASH)
+
+    def test_deleted_tagging_disabled_is_policy_skipped_not_permanent_seal(self):
+        from furtag_hydrus import HydrusMetadataState
+        session = FakeSession(_deleted_dup_routes([DUP_OK]))
+        ti = _hydrus_ti(session)
+        ti.hydrus_tag_deleted_duplicates = False
+        ti.hydrus_can_manage_relationships = True
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "gone.jpg"
+            media.write_bytes(b"gone")
+            push = ti._hydrus_push_detailed(
+                media, {"creator:test"}, set())
+        self.assertTrue(push.complete)
+        self.assertFalse(push.hydrus_deleted)  # not no_duplicate_targets
+        self.assertEqual(
+            push.metadata_state, HydrusMetadataState.POLICY_SKIPPED)
+        self.assertEqual(push.sha256, DELETED_HASH)
+        # Relationship lookup should not run when tagging is off.
+        self.assertFalse(any(
+            "get_file_relationships" in url for _, url, _ in session.calls))
+
+    def test_deleted_missing_relationship_permission_is_not_sealed(self):
+        """BF-01: missing permission must not write a permanent deletion seal."""
+        from furtag_hydrus import HydrusMetadataState
+        session = FakeSession(_deleted_dup_routes([DUP_OK]))
+        ti = _hydrus_ti(session)
+        ti.hydrus_tag_deleted_duplicates = True
+        ti.hydrus_can_manage_relationships = False
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "gone.jpg"
+            media.write_bytes(b"gone")
+            push = ti._hydrus_push_detailed(
+                media, {"creator:test"}, set())
+        self.assertFalse(push.complete)
+        self.assertFalse(push.hydrus_deleted)
+        self.assertEqual(
+            push.metadata_state, HydrusMetadataState.PERMISSION_MISSING)
+        self.assertEqual(push.sha256, DELETED_HASH)
+        self.assertFalse(any(
+            "get_file_relationships" in url for _, url, _ in session.calls))
+
+    def test_deleted_with_targets_retains_original_and_target_hashes(self):
+        """BF-06: successful dup tagging keeps deleted original SHA + targets."""
+        from furtag_hydrus import HydrusImportState, HydrusMetadataState
+        session = FakeSession(_deleted_dup_routes([DUP_OK, DUP_FAIL]))
+        ti = _hydrus_ti(session)
+        ti.hydrus_tag_deleted_duplicates = True
+        ti.hydrus_can_manage_relationships = True
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "gone.jpg"
+            media.write_bytes(b"gone")
+            push = ti._hydrus_push_detailed(
+                media, {"creator:test"}, set())
+        self.assertTrue(push.complete)
+        self.assertEqual(push.sha256, DELETED_HASH)
+        self.assertEqual(
+            push.import_state, HydrusImportState.PREVIOUSLY_DELETED)
+        self.assertEqual(
+            push.metadata_state, HydrusMetadataState.APPLIED_DUPLICATES)
+        self.assertEqual(set(push.target_hashes), {DUP_OK, DUP_FAIL})
+        self.assertFalse(push.hydrus_deleted)
+
+    def test_deleted_empty_metadata_skips_relationship_lookup(self):
+        """Unmatched / no tags: previously_deleted + not_requested."""
+        from furtag_hydrus import HydrusImportState, HydrusMetadataState
+        session = FakeSession(_deleted_dup_routes([DUP_OK]))
+        ti = _hydrus_ti(session)
+        ti.hydrus_tag_deleted_duplicates = True
+        ti.hydrus_can_manage_relationships = True
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "gone.jpg"
+            media.write_bytes(b"gone")
+            push = ti._hydrus_push_detailed(media, set(), set())
+        self.assertTrue(push.complete)
+        self.assertEqual(push.sha256, DELETED_HASH)
+        self.assertEqual(
+            push.import_state, HydrusImportState.PREVIOUSLY_DELETED)
+        self.assertEqual(
+            push.metadata_state, HydrusMetadataState.NOT_REQUESTED)
+        self.assertFalse(any(
+            "get_file_relationships" in url for _, url, _ in session.calls))
+
+    def test_deleted_relationship_api_failure_stays_retryable(self):
+        from furtag_hydrus import HydrusMetadataState
+        session = FakeSession([
+            ("POST", "add_files/add_file", FakeResponse(200, {
+                "status": 3, "hash": DELETED_HASH,
+            })),
+            ("GET", "get_file_relationships", FakeResponse(
+                500, {}, text="boom")),
+        ])
+        ti = _hydrus_ti(session)
+        ti.hydrus_tag_deleted_duplicates = True
+        ti.hydrus_can_manage_relationships = True
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "gone.jpg"
+            media.write_bytes(b"gone")
+            push = ti._hydrus_push_detailed(
+                media, {"creator:test"}, set())
+        self.assertFalse(push.complete)
+        self.assertFalse(push.hydrus_deleted)
+        self.assertEqual(
+            push.metadata_state, HydrusMetadataState.RETRYABLE_FAILURE)
+        self.assertEqual(push.sha256, DELETED_HASH)
+
+
+class TestUnmatchedImportBF02(unittest.TestCase):
+    """BF-02: typed unmatched import separate from search nomatch."""
+
+    def test_import_off_records_not_requested_complete(self):
+        ti = _hydrus_ti(FakeSession())
+        ti.hydrus_import_unmatched = False
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "miss.jpg"
+            media.write_bytes(b"x")
+            out = ti.write_unmatched_detailed(media)
+        self.assertTrue(out.complete)
+        self.assertEqual(out.ledger_status, "nomatch")
+        self.assertFalse(out.unmatched_import["requested"])
+        self.assertTrue(out.unmatched_import["complete"])
+
+    def test_import_success_checkpoints_complete(self):
+        file_hash = "a" * 64
+        session = FakeSession([
+            ("POST", "add_files/add_file", FakeResponse(200, {
+                "status": 1, "hash": file_hash,
+            })),
+        ])
+        ti = _hydrus_ti(session)
+        ti.hydrus_import_unmatched = True
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "miss.jpg"
+            media.write_bytes(b"x")
+            out = ti.write_unmatched_detailed(media)
+        self.assertTrue(out.complete)
+        self.assertEqual(out.sha256, file_hash)
+        self.assertTrue(out.unmatched_import["requested"])
+        self.assertEqual(out.unmatched_import["import_state"], "live")
+
+    def test_import_status3_empty_metadata_is_complete_with_sha(self):
+        session = FakeSession(_deleted_dup_routes([DUP_OK]))
+        ti = _hydrus_ti(session)
+        ti.hydrus_import_unmatched = True
+        ti.hydrus_tag_deleted_duplicates = True
+        ti.hydrus_can_manage_relationships = True
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "miss.jpg"
+            media.write_bytes(b"x")
+            out = ti.write_unmatched_detailed(media)
+        self.assertTrue(out.complete)
+        self.assertEqual(out.sha256, DELETED_HASH)
+        self.assertEqual(
+            out.unmatched_import["import_state"], "previously_deleted")
+        self.assertEqual(
+            out.unmatched_import["metadata_state"], "not_requested")
+        self.assertFalse(any(
+            "get_file_relationships" in url for _, url, _ in session.calls))
+
+    def test_import_http_failure_is_incomplete(self):
+        session = FakeSession([
+            ("POST", "add_files/add_file", FakeResponse(500, {}, text="boom")),
+        ])
+        ti = _hydrus_ti(session)
+        ti.hydrus_import_unmatched = True
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "miss.jpg"
+            media.write_bytes(b"x")
+            out = ti.write_unmatched_detailed(media)
+        self.assertFalse(out.complete)
+        self.assertTrue(out.unmatched_import["requested"])
+        self.assertFalse(out.unmatched_import["complete"])
+
+    def test_import_veto_preserves_typed_state_and_reason(self):
+        from furtag_hydrus import HydrusImportState
+
+        session = FakeSession([
+            ("POST", "add_files/add_file", FakeResponse(200, {
+                "status": 7,
+                "hash": "f" * 64,
+                "note": "blocked by import policy",
+            })),
+        ])
+        ti = _hydrus_ti(session)
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "veto.jpg"
+            media.write_bytes(b"veto")
+            push = ti._hydrus_push_detailed(media, set(), set())
+        self.assertEqual(push.import_state, HydrusImportState.VETOED)
+        self.assertEqual(push.reason, "blocked by import policy")
+        self.assertTrue(push.complete)
 
 
 class _RecordingObserver:
@@ -398,6 +620,89 @@ class TestHydrusSidecarSync(unittest.TestCase):
         self.assertFalse(ledger.sidecar_sync_matches(
             media.name, st.st_size, st.st_mtime,
             ti._sidecar_sync_signature(tags, urls)))
+
+    def test_deleted_no_duplicates_is_terminal_not_retried(self):
+        """BF-07: status-3 + empty dups checkpoints and skips on re-sync."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            media = self._media_with_sidecar(root, data=b"deleted-bytes")
+            session = FakeSession(_deleted_dup_routes([]))
+            ti = _hydrus_ti(session)
+            ti.hydrus_tag_deleted_duplicates = True
+            ti.hydrus_can_manage_relationships = True
+
+            attempted, failed = ti.sync_sidecars_to_hydrus(root)
+            self.assertEqual(attempted, 1)
+            self.assertEqual(failed, 0)
+
+            ledger = Ledger(root)
+            ledger.load()
+            st = media.stat()
+            tags, urls = ti.read_sidecar_payload(media)
+            signature = ti._sidecar_sync_signature(tags, urls)
+            rec = ledger.records[media.name]["sidecar_sync"]
+            self.assertEqual(rec["disposition"], "deleted_no_duplicates")
+            self.assertTrue(rec["complete"])
+            self.assertEqual(rec["sha256"], DELETED_HASH)
+            self.assertTrue(ledger.sidecar_sync_matches(
+                media.name, st.st_size, st.st_mtime, signature,
+                scope_id=ti._hydrus_scope_id(),
+                tag_deleted_duplicates=True))
+
+            # Second run: no new Hydrus calls.
+            session.calls.clear()
+            attempted2, failed2 = ti.sync_sidecars_to_hydrus(root)
+            self.assertEqual((attempted2, failed2), (0, 0))
+            self.assertEqual(session.calls, [])
+
+    def test_deleted_policy_change_reopens_terminal_checkpoint(self):
+        """Enabling deleted-dup tagging after a policy-skipped seal reopens."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            media = self._media_with_sidecar(root, data=b"deleted-bytes")
+            session = FakeSession(_deleted_dup_routes([DUP_OK]))
+            ti = _hydrus_ti(session)
+            ti.hydrus_tag_deleted_duplicates = False
+            ti.hydrus_can_manage_relationships = True
+
+            attempted, failed = ti.sync_sidecars_to_hydrus(root)
+            self.assertEqual((attempted, failed), (1, 0))
+            ledger = Ledger(root)
+            ledger.load()
+            self.assertEqual(
+                ledger.records[media.name]["sidecar_sync"]["disposition"],
+                "deleted_policy_skipped")
+
+            # Policy on → checkpoint no longer matches → re-attempt tags dups.
+            ti.hydrus_tag_deleted_duplicates = True
+            session.calls.clear()
+            attempted2, failed2 = ti.sync_sidecars_to_hydrus(root)
+            self.assertEqual((attempted2, failed2), (1, 0))
+            self.assertTrue(any(
+                "add_tags/add_tags" in url for _, url, _ in session.calls))
+            ledger.load()
+            self.assertEqual(
+                ledger.records[media.name]["sidecar_sync"]["disposition"],
+                "deleted_tagged_duplicates")
+
+    def test_permission_missing_is_not_terminal_checkpoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            media = self._media_with_sidecar(root, data=b"deleted-bytes")
+            session = FakeSession(_deleted_dup_routes([DUP_OK]))
+            ti = _hydrus_ti(session)
+            ti.hydrus_tag_deleted_duplicates = True
+            ti.hydrus_can_manage_relationships = False
+
+            attempted, failed = ti.sync_sidecars_to_hydrus(root)
+            self.assertEqual((attempted, failed), (1, 1))
+            ledger = Ledger(root)
+            ledger.load()
+            st = media.stat()
+            tags, urls = ti.read_sidecar_payload(media)
+            self.assertFalse(ledger.sidecar_sync_matches(
+                media.name, st.st_size, st.st_mtime,
+                ti._sidecar_sync_signature(tags, urls)))
 
 
 DELETED_HASH = "d" * 64
@@ -632,7 +937,9 @@ class TestHydrusDuplicateTaggedPage(unittest.TestCase):
         for page in ti.hydrus_result_pages.values():
             page["enabled"] = True
 
-        self.assertIsNone(self._push(ti))  # deleted hash is never returned
+        # Original deleted SHA is retained for diagnostics; only live dups
+        # land on the duplicates results page (not the deleted original).
+        self.assertEqual(self._push(ti), DELETED_HASH)
         self.assertEqual(sorted(ti.hydrus_result_pages["duplicates"]["hashes"]),
                          sorted([DUP_OK, DUP_FAIL]))
         # Not conflated with the ordinary "newly tagged" page.

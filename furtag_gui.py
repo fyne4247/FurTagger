@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -618,6 +619,15 @@ class SettingsPanel(QWidget):
         self.page_limit = QSpinBox()
         self.page_limit.setRange(0, 1_000_000)
         self.page_limit.setSpecialValueText("Unlimited")
+        self.hydrus_profile_label = QLabel()
+        self.rotate_hydrus_profile = QPushButton(
+            "Use a new/replaced Hydrus database…")
+        self.rotate_hydrus_profile.setToolTip(
+            "Rotate FurTag's non-secret Hydrus database identity. Use this "
+            "only after replacing the Hydrus database at this API address; "
+            "existing completion checkpoints will be revalidated.")
+        self.rotate_hydrus_profile.clicked.connect(
+            self._rotate_hydrus_profile_uuid)
         hf.addRow(self.direct_source_notes)
         hf.addRow(self.exact_url_enrichment)
         hf.addRow("Metadata downloader page",
@@ -629,6 +639,8 @@ class SettingsPanel(QWidget):
         hf.addRow("Already Tagged name", self.already_tagged_name)
         hf.addRow(self.build_already)
         hf.addRow("Page limit (0=all)", self.page_limit)
+        hf.addRow("Database identity", self.hydrus_profile_label)
+        hf.addRow(self.rotate_hydrus_profile)
         self._add_tab("Hydrus", hy)
 
         # Sources
@@ -750,6 +762,8 @@ class SettingsPanel(QWidget):
         self.already_tagged_name.setText(h.already_tagged_page_name)
         self.build_already.setChecked(h.build_already_tagged_page)
         self.page_limit.setValue(h.result_page_limit)
+        self.hydrus_profile_label.setText(
+            h.hydrus_profile_uuid[:8] + "…" if h.hydrus_profile_uuid else "unset")
         for name, cb in self.src_checks.items():
             cb.setChecked(getattr(src, f"{name}_enabled", True))
         self.sn_min.setValue(m.saucenao_min_similarity)
@@ -814,6 +828,24 @@ class SettingsPanel(QWidget):
     def set_recent_scan_paths(self, paths: List[str]) -> None:
         """Keep hidden persistent history in sync with the main window."""
         self._initial.history.recent_scan_paths = list(paths)
+
+    def _rotate_hydrus_profile_uuid(self) -> None:
+        answer = QMessageBox.question(
+            self, "New Hydrus database?",
+            "Only do this if the Hydrus database was replaced or rebuilt. "
+            "FurTag will distrust old Hydrus completion checkpoints and "
+            "revalidate files on later scans. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._initial.hydrus.hydrus_profile_uuid = str(uuid.uuid4())
+        self.hydrus_profile_label.setText(
+            self._initial.hydrus.hydrus_profile_uuid[:8] + "…")
+        QMessageBox.information(
+            self, "Hydrus identity rotated",
+            "The new identity is active for this session. Choose "
+            "'Save as default' to keep it for future launches.")
 
     def _save_defaults(self) -> None:
         try:
@@ -1369,8 +1401,13 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_event(self, event: RunEvent) -> None:
-        if event.kind == "log" or event.kind == "issue":
+        if event.kind == "issue":
             self._add_issue(event.message)
+            return
+        if event.kind == "log":
+            # Informational/success (BF-12) — run log only, not the issue pane.
+            if event.message:
+                self._log(event.message)
             return
         if event.kind == "print" and event.message:
             self._log(event.message)

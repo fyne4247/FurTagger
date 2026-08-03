@@ -9,14 +9,17 @@ Three tiers (resolution order: RunOptions override → Settings → shipped defa
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sys
+import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 # Shipped defaults used by both frontends.
 # Keep these identical to furtag.py module constants so an untouched install
@@ -97,6 +100,11 @@ class HydrusSettings:
     already_tagged_page_name: str = "Already Tagged"
     build_already_tagged_page: bool = False
     result_page_limit: int = 0  # 0 = unlimited
+    # Non-secret identity for this Hydrus database binding. Rotate via an
+    # explicit "new/replaced Hydrus database" action; never derived from the
+    # access key. Combined with API origin into hydrus_scope_id().
+    hydrus_profile_uuid: str = field(
+        default_factory=lambda: str(uuid.uuid4()))
 
 
 @dataclass
@@ -268,6 +276,43 @@ def _normalize_settings(s: Settings) -> None:
         s.performance.hash_worker_count = 0
     s.history.recent_scan_paths = normalize_recent_scan_paths(
         s.history.recent_scan_paths)
+    # Stable non-secret Hydrus DB binding; generate once if missing.
+    profile = s.hydrus.hydrus_profile_uuid
+    if not isinstance(profile, str) or not profile.strip():
+        s.hydrus.hydrus_profile_uuid = str(uuid.uuid4())
+    else:
+        s.hydrus.hydrus_profile_uuid = profile.strip()
+
+
+def normalize_hydrus_api_origin(api_url: str) -> str:
+    """Canonical origin for scope IDs (scheme + host[:port], no path/key)."""
+    raw = (api_url or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return raw.rstrip("/").lower()
+    scheme = (parsed.scheme or "http").lower()
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return raw.rstrip("/").lower()
+    port = parsed.port
+    if port is None:
+        return f"{scheme}://{host}"
+    return f"{scheme}://{host}:{port}"
+
+
+def hydrus_scope_id(profile_uuid: str, api_url: str) -> str:
+    """Non-secret scope id for Hydrus deletion/sync checkpoints.
+
+    Rotating profile_uuid (explicit “new Hydrus database”) or changing API
+    origin invalidates scoped seals. Access keys never enter the digest.
+    """
+    material = f"{(profile_uuid or '').strip()}|{normalize_hydrus_api_origin(api_url)}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
 def normalize_recent_scan_paths(
@@ -472,12 +517,37 @@ class SettingsStore:
 
     def load(self) -> Settings:
         if not self.path.exists():
-            return Settings()
+            settings = Settings()
+            # The Hydrus profile UUID is a durable database identity, not a
+            # per-process nonce. Persist the defaults immediately so two runs
+            # before the user opens Preferences cannot mint different scopes.
+            try:
+                self.save(settings)
+            except OSError as e:
+                print(
+                    f"⚠️  Couldn't persist default settings {self.path} ({e}).",
+                    file=sys.stderr)
+            return settings
         try:
             data = json.loads(self.path.read_text("utf-8"))
         except (OSError, ValueError, TypeError):
             return Settings()
-        return Settings.from_dict(data if isinstance(data, dict) else {})
+        raw = data if isinstance(data, dict) else {}
+        hydrus_data = raw.get("hydrus")
+        missing_profile = not (
+            isinstance(hydrus_data, dict)
+            and isinstance(hydrus_data.get("hydrus_profile_uuid"), str)
+            and hydrus_data["hydrus_profile_uuid"].strip())
+        settings = Settings.from_dict(raw)
+        if missing_profile:
+            try:
+                self.save(settings)
+            except OSError as e:
+                print(
+                    f"⚠️  Couldn't persist Hydrus database identity "
+                    f"to {self.path} ({e}).",
+                    file=sys.stderr)
+        return settings
 
     def save(self, settings: Settings) -> None:
         payload = settings.to_dict()

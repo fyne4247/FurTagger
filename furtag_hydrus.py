@@ -14,9 +14,12 @@ import json
 import os
 import re
 import threading
+import time
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import (
-    Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING,
+    Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING,
 )
 
 import requests
@@ -32,16 +35,113 @@ HYDRUS_PAGE_BATCH = 256         # hashes per manage_pages call
 HYDRUS_RELATIONSHIP_DUPLICATES = "8"  # Hydrus duplicate-status enum; "3" = alternates
 
 
+class HydrusImportState(str, Enum):
+    """What happened to the import of this content (axis A)."""
+
+    LIVE = "live"
+    PREVIOUSLY_DELETED = "previously_deleted"
+    VETOED = "vetoed"
+    RETRYABLE_FAILURE = "retryable_failure"
+    NOT_REQUESTED = "not_requested"
+
+
+class HydrusMetadataState(str, Enum):
+    """What happened to tags/URLs/notes (axis B). Independent of import."""
+
+    APPLIED_ORIGINAL = "applied_original"
+    APPLIED_DUPLICATES = "applied_duplicates"
+    NO_DUPLICATE_TARGETS = "no_duplicate_targets"
+    POLICY_SKIPPED = "policy_skipped"
+    PERMISSION_MISSING = "permission_missing"
+    NOT_REQUESTED = "not_requested"
+    RETRYABLE_FAILURE = "retryable_failure"
+
+
+@dataclass(frozen=True)
+class HydrusPushResult:
+    """Two-axis outcome of one Hydrus import + metadata push attempt.
+
+    Import and metadata states are independent so a previously-deleted
+    unmatched file (no tags) can finish without a relationship lookup, while
+    a match with missing relationship permission stays incomplete without a
+    false permanent seal.
+    """
+
+    sha256: Optional[str] = None
+    import_state: HydrusImportState = HydrusImportState.RETRYABLE_FAILURE
+    metadata_state: HydrusMetadataState = HydrusMetadataState.RETRYABLE_FAILURE
+    target_hashes: Tuple[str, ...] = ()
+    scope_id: Optional[str] = None
+    policy_hash: Optional[str] = None
+    reason: Optional[str] = None
+
+    @property
+    def complete(self) -> bool:
+        """Whether every *requested* import/metadata axis finished terminally."""
+        if self.import_state == HydrusImportState.RETRYABLE_FAILURE:
+            return False
+        if self.metadata_state in (
+                HydrusMetadataState.PERMISSION_MISSING,
+                HydrusMetadataState.RETRYABLE_FAILURE):
+            return False
+        return True
+
+    @property
+    def hydrus_deleted(self) -> bool:
+        """Compat: durable no-target deleted outcome only (not permission/policy).
+
+        New call sites should switch on ``import_state`` / ``metadata_state``.
+        """
+        return (
+            self.import_state == HydrusImportState.PREVIOUSLY_DELETED
+            and self.metadata_state == HydrusMetadataState.NO_DUPLICATE_TARGETS
+            and self.complete
+        )
+
+    def to_ledger_checkpoint(self) -> Dict[str, Any]:
+        """Nested hydrus_output / unmatched_import checkpoint (no secrets)."""
+        return {
+            "scope_id": self.scope_id,
+            "import_state": self.import_state.value,
+            "metadata_state": self.metadata_state.value,
+            "sha256": self.sha256,
+            "target_hashes": list(self.target_hashes),
+            "policy_hash": self.policy_hash,
+            "reason": self.reason,
+            "complete": self.complete,
+            "updated_at": time.time(),
+        }
+
+    def __iter__(self):
+        """Two-value unpacking: ``sha256, complete = result``."""
+        yield self.sha256
+        yield self.complete
+
+
+@dataclass(frozen=True)
+class HydrusAddFileResult:
+    """Raw add_file outcome retained until it is mapped to typed state."""
+
+    sha256: Optional[str]
+    status: int
+    note: str = ""
+
+
 def _truthy(val: str, default: bool = False) -> bool:
     if val is None or str(val).strip() == "":
         return default
     return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def _notify(message: str) -> None:
+def _notify(message: str, *, severity: str = "warning") -> None:
     """Forward to furtag.notify without importing it at module load time."""
     from furtag import notify
-    notify(message)
+    notify(message, severity=severity)
+
+
+def _notify_info(message: str) -> None:
+    """Success/audit lines — do not pollute the issue stream (BF-12)."""
+    _notify(message, severity="info")
 
 
 class HydrusMixin:
@@ -338,14 +438,38 @@ class HydrusMixin:
         return hashlib.sha256(encoded).hexdigest()
 
 
+    @staticmethod
+    def _sidecar_sync_disposition(push: HydrusPushResult) -> Optional[str]:
+        """Map two-axis push outcome to a durable sidecar-sync disposition."""
+        if not push.complete:
+            return None
+        meta = push.metadata_state
+        if meta == HydrusMetadataState.APPLIED_ORIGINAL:
+            return "live"
+        if meta == HydrusMetadataState.APPLIED_DUPLICATES:
+            return "deleted_tagged_duplicates"
+        if meta == HydrusMetadataState.NO_DUPLICATE_TARGETS:
+            return "deleted_no_duplicates"
+        if meta == HydrusMetadataState.POLICY_SKIPPED:
+            return "deleted_policy_skipped"
+        if meta == HydrusMetadataState.NOT_REQUESTED:
+            # Empty metadata or import-only path.
+            if push.import_state == HydrusImportState.PREVIOUSLY_DELETED:
+                return "deleted_no_duplicates"
+            if push.import_state == HydrusImportState.LIVE:
+                return "live"
+            if push.import_state == HydrusImportState.NOT_REQUESTED:
+                return "live"
+        return None
+
     def sync_sidecars_to_hydrus(self, root: Path) -> Tuple[int, int]:
         """Push existing FurTag sidecars to Hydrus with resumable checkpoints.
 
         This is a migration/reconciliation pass: tag sidecars (txt or JSON)
         supply tags and URL sidecars supply source URLs. It deliberately does
-        no booru lookup. Successful syncs are recorded as independent
-        ``sidecar_sync`` metadata in each directory ledger; normal scan status
-        (matched/nomatch/etc.) is preserved and unaffected.
+        no booru lookup. Successful *and* terminal deleted outcomes are
+        recorded as independent ``sidecar_sync`` metadata (BF-07) so the same
+        dead content is not re-imported forever under the same Hydrus scope.
 
         Candidates are prepared in small batches. When the access key can
         search files, their local SHA-256s are checked against Hydrus first so
@@ -354,27 +478,40 @@ class HydrusMixin:
         """
         if not self.has_hydrus:
             return 0, 0
-        candidates: List[Path] = []
-        for dp, dirs, files in os.walk(root):
-            dirs.sort()
-            if self.cancelled():
-                break
-            for name in sorted(files):
-                if name.startswith(".") or not self._media_kind(name):
-                    continue
-                media = Path(dp) / name
-                if self.has_sidecar(media):
-                    candidates.append(media)
-        if not candidates:
-            print("📤 No FurTag sidecars found to sync to Hydrus.")
-            return 0, 0
-
-        print(f"📤 Syncing sidecars to Hydrus for {len(candidates)} file(s)…")
-        total = len(candidates)
-        attempted = successful = skipped = failed = 0
+        # BF-13: stream candidates in Hydrus-sized batches instead of retaining
+        # every path for a huge library. Total is unknown until the walk ends.
+        attempted = successful = skipped = terminal_skipped = failed = 0
+        discovered = 0
+        scope_id = self._hydrus_scope_id()
+        tag_deleted = bool(getattr(self, "hydrus_tag_deleted_duplicates", True))
         # Late import: furtag loads this mixin at import time.
         from furtag import LedgerManager, _is_junk_tag
         ledger_mgr = LedgerManager()
+        prune = getattr(self, "prune_walk_dirs", None)
+
+        def iter_batches() -> Iterable[List[Path]]:
+            nonlocal discovered
+            batch: List[Path] = []
+            for dp, dirs, files in os.walk(root):
+                if callable(prune):
+                    prune(dirs)
+                else:
+                    dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+                if self.cancelled():
+                    break
+                for name in sorted(files):
+                    if name.startswith(".") or not self._media_kind(name):
+                        continue
+                    media = Path(dp) / name
+                    if not self.has_sidecar(media):
+                        continue
+                    discovered += 1
+                    batch.append(media)
+                    if len(batch) >= HYDRUS_HASH_LOOKUP_BATCH:
+                        yield batch
+                        batch = []
+            if batch:
+                yield batch
 
         def prepare(media: Path) -> Tuple[
                 Optional[os.stat_result], Set[str], Set[str], str,
@@ -389,7 +526,10 @@ class HydrusMixin:
             signature = self._sidecar_sync_signature(tags, urls)
             ledger = ledger_mgr.get(media.parent)
             if ledger.sidecar_sync_matches(
-                    media.name, st.st_size, st.st_mtime, signature):
+                    media.name, st.st_size, st.st_mtime, signature,
+                    scope_id=scope_id,
+                    tag_deleted_duplicates=tag_deleted,
+                    mtime_ns=st.st_mtime_ns):
                 return st, tags, urls, signature, None, ledger, True
             # Empty sidecars are a completed no-op. Do not read the entire media
             # file merely to checkpoint that they contain no metadata.
@@ -398,38 +538,57 @@ class HydrusMixin:
 
         def emit_progress(
                 index: int, media: Path, state: str,
-                *, final: bool = False) -> None:
+                *, final: bool = False, total: int = 0) -> None:
             self._emit(
                 "sidecar_sync",
-                message=f"{state} {index}/{total} · {media.name}",
+                message=(
+                    f"{state} {index}"
+                    + (f"/{total}" if total else f" · found {discovered}")
+                    + f" · {media.name}"),
                 index=index,
-                total=total,
+                total=total or discovered,
                 current=str(media.relative_to(root)),
                 sub=state,
                 extra={
                     "checkpoint":
-                        index == 1 or index % 25 == 0 or index == total,
+                        index == 1 or index % 25 == 0 or final,
                     "final": final,
                     "attempted": attempted,
                     "successful": successful,
                     "skipped": skipped,
+                    "terminal_skipped": terminal_skipped,
                     "failed": failed,
+                    "discovered": discovered,
                 },
             )
 
-        # Sidecar reads and local hashes are disk-bound and independent. Work
-        # one Hydrus-sized batch ahead rather than retaining every payload/hash
-        # for a potentially huge library.
+        def checkpoint(
+                ledger, media: Path, st: os.stat_result, signature: str,
+                *, sha256: Optional[str] = None,
+                disposition: str = "live",
+                import_state: Optional[str] = None,
+                complete: bool = True) -> None:
+            ledger.record_sidecar_sync(
+                media.name, st.st_size, st.st_mtime, signature,
+                sha256=sha256,
+                mtime_ns=st.st_mtime_ns,
+                scope_id=scope_id,
+                disposition=disposition,
+                import_state=import_state,
+                complete=complete,
+                tag_deleted_duplicates=tag_deleted,
+            )
+
+        print("📤 Syncing sidecars to Hydrus…")
         workers = min(8, max(1, os.cpu_count() or 1))
+        index = 0
         try:
             with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-                for offset in range(0, total, HYDRUS_HASH_LOOKUP_BATCH):
+                for batch in iter_batches():
                     if self.cancelled():
                         break
-                    batch = candidates[
-                        offset:offset + HYDRUS_HASH_LOOKUP_BATCH]
                     emit_progress(
-                        offset + 1, batch[0], "checking sidecars")
+                        max(1, index + 1), batch[0], "checking sidecars")
                     prepared = list(ex.map(prepare, batch))
                     local_hashes = {
                         sha256 for _st, _tags, _urls, _signature, sha256,
@@ -439,9 +598,8 @@ class HydrusMixin:
                     current_hashes = self._hydrus_current_sha256s(
                         local_hashes)
 
-                    for batch_index, (media, item) in enumerate(
-                            zip(batch, prepared), start=1):
-                        index = offset + batch_index
+                    for media, item in zip(batch, prepared):
+                        index += 1
                         if self.cancelled():
                             break
                         (st, tags, urls, signature, sha256,
@@ -455,9 +613,9 @@ class HydrusMixin:
                             emit_progress(index, media, "already synced")
                             continue
                         if not tags and not urls:
-                            ledger.record_sidecar_sync(
-                                media.name, st.st_size, st.st_mtime,
-                                signature)
+                            checkpoint(
+                                ledger, media, st, signature,
+                                disposition="live")
                             successful += 1
                             emit_progress(index, media, "no metadata")
                             if successful % 25 == 0:
@@ -473,16 +631,35 @@ class HydrusMixin:
 
                         emit_progress(index, media, "syncing")
                         attempted += 1
-                        file_hash, complete = self._hydrus_push_detailed(
+                        push = self._hydrus_push_detailed(
                             media, tags, urls,
                             known_sha256=known_sha256)
-                        if complete:
-                            ledger.record_sidecar_sync(
-                                media.name, st.st_size, st.st_mtime,
-                                signature, sha256=file_hash or sha256)
+                        disposition = self._sidecar_sync_disposition(push)
+                        if disposition in (
+                                "live", "deleted_tagged_duplicates"):
+                            checkpoint(
+                                ledger, media, st, signature,
+                                sha256=push.sha256 or sha256,
+                                disposition=disposition,
+                                import_state=push.import_state.value)
                             successful += 1
                             emit_progress(index, media, "synced")
                             if successful % 25 == 0:
+                                ledger_mgr.save_all()
+                        elif disposition in (
+                                "deleted_no_duplicates",
+                                "deleted_policy_skipped"):
+                            # Terminal under this scope/policy — not a failure.
+                            checkpoint(
+                                ledger, media, st, signature,
+                                sha256=push.sha256 or sha256,
+                                disposition=disposition,
+                                import_state=push.import_state.value)
+                            terminal_skipped += 1
+                            emit_progress(
+                                index, media,
+                                "deleted in Hydrus (terminal)")
+                            if (successful + terminal_skipped) % 25 == 0:
                                 ledger_mgr.save_all()
                         else:
                             failed += 1
@@ -500,12 +677,18 @@ class HydrusMixin:
             print("⏹️  Sidecar sync cancelled.")
         else:
             final_state = "complete"
+        handled = successful + skipped + terminal_skipped + failed
+        total = discovered or handled
+        if discovered == 0 and not self.cancelled():
+            print("📤 No FurTag sidecars found to sync to Hydrus.")
+            return 0, 0
         self._emit(
             "sidecar_sync",
             message=(
                 f"sidecar sync {final_state} · {successful} new · "
-                f"{skipped} already synced · {failed} failed"),
-            index=min(total, successful + skipped + failed),
+                f"{skipped} already synced · "
+                f"{terminal_skipped} terminal deleted · {failed} failed"),
+            index=handled,
             total=total,
             extra={
                 "final": True,
@@ -513,12 +696,16 @@ class HydrusMixin:
                 "attempted": attempted,
                 "successful": successful,
                 "skipped": skipped,
+                "terminal_skipped": terminal_skipped,
                 "failed": failed,
+                "discovered": discovered,
             },
         )
         print(
             f"✅ Sidecar sync: {successful} newly completed, "
-            f"{skipped} already synced, {failed} failed; "
+            f"{skipped} already synced, "
+            f"{terminal_skipped} terminal deleted, {failed} failed"
+            f" ({discovered} candidate(s)); "
             "ledger checkpoints saved.")
         return attempted, failed
 
@@ -533,7 +720,7 @@ class HydrusMixin:
         )
 
 
-    def _hydrus_add_file(self, media: Path) -> Optional[Tuple[str, int]]:
+    def _hydrus_add_file(self, media: Path) -> Optional[HydrusAddFileResult]:
         """POST /add_files/add_file by path. Returns (SHA-256 hex, import status)
         on success — status 1 = newly imported, 2 = already in the db."""
         try:
@@ -560,9 +747,9 @@ class HydrusMixin:
         # 3 is known-deleted. Keep its hash long enough to look up current
         # duplicate-group members, but never tag or cache this deleted record.
         if status in (1, 2) and h:
-            return h, status
+            return HydrusAddFileResult(h, status, note)
         if status == 3 and h:
-            return h, status
+            return HydrusAddFileResult(h, status, note)
         if status == 3:
             _notify(f"⚠️  Hydrus: {media.name} previously deleted"
                    + (f" ({note})" if note else "") + " — not tagging.")
@@ -570,7 +757,7 @@ class HydrusMixin:
         if status == 7:
             _notify(f"⚠️  Hydrus vetoed {media.name}"
                    + (f": {note}" if note else ""))
-            return None
+            return HydrusAddFileResult(h or None, status, note)
         _notify(f"⚠️  Hydrus import failed for {media.name} (status={status})"
                + (f": {note}" if note else ""))
         return None
@@ -834,29 +1021,61 @@ class HydrusMixin:
 
 
     def _hydrus_import_prior_nomatches(self, ledger_mgr: LedgerManager) -> int:
-        """Import unchanged old no-match files once when the run toggle is on."""
+        """Import unchanged old no-match files when unmatched import is on.
+
+        Picks up legacy rows without SHA and rows whose nested
+        ``unmatched_import`` checkpoint is incomplete (BF-02).
+        """
         if not (self.has_hydrus and self.hydrus_import and
                 self.hydrus_import_unmatched):
             return 0
-        entries: List[Tuple[Path, Ledger, str, int, float]] = []
-        for path, ledger, name, st, _rec in self._unchanged_records(
-                ledger_mgr,
-                lambda r: r.get("status") == "nomatch" and not r.get("sha256"),
-                {"nomatch"}):
-            entries.append((path, ledger, name, st.st_size, st.st_mtime))
+        current_scope = self._hydrus_scope_id()
+
+        def _needs_import(rec: Dict) -> bool:
+            if rec.get("status") != "nomatch":
+                return False
+            return not self.unmatched_import_is_complete(
+                rec, required=True, scope_id=current_scope)
+
+        entries: List[Tuple[Path, Ledger, str, int, float, Optional[str]]] = []
+        for path, ledger, name, st, rec in self._unchanged_records(
+                ledger_mgr, _needs_import, {"nomatch"}):
+            entries.append((
+                path, ledger, name, st.st_size, st.st_mtime,
+                rec.get("md5") if isinstance(rec, dict) else None))
         if entries:
             print(f"📥 Importing {len(entries)} prior no-match file(s) to Hydrus…")
         imported = 0
-        for done, (path, ledger, name, size, mtime) in enumerate(entries, 1):
+        for done, (path, ledger, name, size, mtime, md5) in enumerate(
+                entries, 1):
             # A per-file Hydrus round trip — without a status event the GUI's
             # progress cards sit frozen for the whole (possibly long) import.
             self._emit("status", track="hash",
                        sub=f"Hydrus import (prior no-match) "
                            f"{done}/{len(entries)} · {path.name}")
-            sha = self.write_unmatched(path)
-            if sha:
-                ledger.cache_sha256(name, size, mtime, sha)
+            outcome = self.write_unmatched_detailed(path)
+            if outcome.complete:
+                self.ledger_record(
+                    ledger,
+                    name, size, mtime, md5, "nomatch", [],
+                    sha256=outcome.sha256,
+                    unmatched_import=outcome.unmatched_import)
                 imported += 1
+            elif outcome.sha256:
+                # Retain hash for retry without claiming the sink finished.
+                ledger.cache_sha256(name, size, mtime, outcome.sha256)
+                # Still write the incomplete checkpoint so seals stay open.
+                previous = ledger._fresh_record(name, size, mtime) or {}
+                sources = list(previous.get("sources") or [])
+                self.ledger_record(
+                    ledger,
+                    name, size, mtime,
+                    md5 or previous.get("md5"),
+                    "nomatch", sources,
+                    sha256=outcome.sha256,
+                    unmatched_import=outcome.unmatched_import,
+                    review=previous.get("review") if isinstance(
+                        previous.get("review"), dict) else None)
         return imported
 
 
@@ -888,11 +1107,25 @@ class HydrusMixin:
         Thin wrapper over :meth:`_hydrus_push_detailed` for callers that only
         need the hash (scan pipeline, tests).
         """
-        file_hash, _complete = self._hydrus_push_detailed(
+        return self._hydrus_push_detailed(
             media, tags, urls, known_sha256=known_sha256,
             exact_match=exact_match, url_policy=url_policy,
-            force_associate_urls=force_associate_urls, notes=notes)
-        return file_hash
+            force_associate_urls=force_associate_urls, notes=notes).sha256
+
+    def _hydrus_scope_id(self) -> Optional[str]:
+        """Current non-secret Hydrus scope, or None if Hydrus is unbound."""
+        from furtag_settings import hydrus_scope_id
+        url = getattr(self, "hydrus_api_url", "") or ""
+        if not url:
+            return None
+        settings = getattr(self, "settings", None)
+        profile = ""
+        if settings is not None:
+            profile = getattr(
+                getattr(settings, "hydrus", None), "hydrus_profile_uuid", "") or ""
+        if not profile:
+            profile = getattr(self, "hydrus_profile_uuid", "") or ""
+        return hydrus_scope_id(profile, url)
 
     def _hydrus_push_detailed(
             self, media: Path, tags: Set[str], urls: Set[str],
@@ -901,12 +1134,13 @@ class HydrusMixin:
             url_policy: Optional[UrlWritePolicy] = None,
             force_associate_urls: Optional[Set[str]] = None,
             notes: Optional[Dict[str, str]] = None,
-    ) -> Tuple[Optional[str], bool]:
-        """Hydrus push plus whether every requested metadata write completed.
+    ) -> HydrusPushResult:
+        """Hydrus push with two-axis import/metadata outcomes.
 
         Safety: only *adds* content (never deletes files/tags/URLs). If import
         is on and the import is refused (previously deleted, vetoed, error),
-        we abort the whole push — we do NOT fall through to bare-hash tagging.
+        we abort bare-hash tagging of the deleted original — status 3 goes
+        through the deleted-duplicate path when metadata was requested.
 
         For :attr:`UrlWritePolicy.ENRICH_HASH_POSTS`, parseable Post URLs are
         queued through Hydrus's URL downloader so installed parsers can add
@@ -915,28 +1149,51 @@ class HydrusMixin:
         """
         policy = self._resolve_url_policy(url_policy, exact_match)
         force_associate = {u for u in (force_associate_urls or set()) if u}
+        scope = self._hydrus_scope_id()
+        policy_hash = self.hydrus_output_policy_hash()
         with self._hydrus_lock:
             file_hash: Optional[str] = None
             import_status: Optional[int] = None
             try:
                 if known_sha256:
                     file_hash, import_status = known_sha256, 2
+                    import_state = HydrusImportState.LIVE
                 elif self.hydrus_import:
                     added = self._hydrus_add_file(media)
                     if not added:
-                        return None, False
-                    file_hash, import_status = added
+                        return HydrusPushResult(
+                            scope_id=scope, policy_hash=policy_hash)
+                    file_hash, import_status = added.sha256, added.status
+                    if import_status == 7:
+                        return HydrusPushResult(
+                            sha256=file_hash,
+                            import_state=HydrusImportState.VETOED,
+                            metadata_state=HydrusMetadataState.NOT_REQUESTED,
+                            scope_id=scope,
+                            policy_hash=policy_hash,
+                            reason=added.note or None)
                     if import_status == 3:
-                        complete = self._hydrus_push_to_deleted_duplicates(
+                        return self._hydrus_push_to_deleted_duplicates(
                             media, file_hash, tags, urls, url_policy=policy,
                             force_associate_urls=force_associate, notes=notes)
-                        return None, complete
+                    import_state = HydrusImportState.LIVE
                 else:
                     file_hash = self._sha256_local(media)
                     if not file_hash:
                         _notify(f"❌ Hydrus: no hash for {media.name}; skipped push.")
-                        return None, False
+                        return HydrusPushResult(
+                            scope_id=scope, policy_hash=policy_hash)
                     import_status = 2
+                    import_state = HydrusImportState.NOT_REQUESTED
+
+                metadata_requested = bool(tags or urls or notes)
+                if not metadata_requested:
+                    return HydrusPushResult(
+                        sha256=file_hash,
+                        import_state=import_state,
+                        metadata_state=HydrusMetadataState.NOT_REQUESTED,
+                        scope_id=scope,
+                        policy_hash=policy_hash)
 
                 if tags:
                     self._hydrus_add_tags(file_hash, tags)
@@ -954,6 +1211,7 @@ class HydrusMixin:
                         self._hydrus_set_notes(file_hash, notes)
                         notes_complete = True
                     except Exception as e:
+                        notes_complete = False
                         _notify(f"⚠️  Hydrus direct-note write failed for "
                                f"{media.name}; other metadata was kept ({e})")
                 urls_complete = not urls or not self.hydrus_can_edit_urls
@@ -965,12 +1223,28 @@ class HydrusMixin:
                     self._hydrus_add_to_page("new", file_hash)
                 elif tags or urls or notes:
                     self._hydrus_add_to_page("updated", file_hash)
-                return file_hash, urls_complete and notes_complete
+                meta_ok = urls_complete and notes_complete
+                return HydrusPushResult(
+                    sha256=file_hash,
+                    import_state=import_state,
+                    metadata_state=(
+                        HydrusMetadataState.APPLIED_ORIGINAL if meta_ok
+                        else HydrusMetadataState.RETRYABLE_FAILURE),
+                    scope_id=scope,
+                    policy_hash=policy_hash)
             except Exception as e:
                 _notify(f"❌ Hydrus push failed for {media.name}: {e}")
                 # If import/hash resolution already succeeded, retain the hash
                 # so an idempotent metadata retry can skip add_file next run.
-                return file_hash, False
+                return HydrusPushResult(
+                    sha256=file_hash,
+                    import_state=(
+                        HydrusImportState.LIVE if file_hash
+                        else HydrusImportState.RETRYABLE_FAILURE),
+                    metadata_state=HydrusMetadataState.RETRYABLE_FAILURE,
+                    scope_id=scope,
+                    policy_hash=policy_hash,
+                    reason=str(e)[:240])
 
     def _hydrus_push_to_deleted_duplicates(
             self, media: Path, deleted_hash: str, tags: Set[str],
@@ -978,18 +1252,57 @@ class HydrusMixin:
             url_policy: UrlWritePolicy = UrlWritePolicy.ASSOCIATE_ONLY,
             force_associate_urls: Optional[Set[str]] = None,
             notes: Optional[Dict[str, str]] = None,
-    ) -> bool:
-        """Tag only current members of a deleted file's Hydrus duplicate group.
+    ) -> HydrusPushResult:
+        """Handle import status 3 with two-axis outcomes.
 
-        Uses the same URL routing policy as a normal push so exact hash-tier
-        post URLs can still enrich notes/descriptions on surviving members.
+        Always retains *deleted_hash*. Relationship lookup runs only when
+        metadata was requested and deleted-dup tagging is enabled with
+        permission. Missing permission is incomplete (not a permanent seal).
+        Policy-disabled tagging is ``policy_skipped`` (not unscoped permanent).
+        Only a successful empty relationship query yields
+        ``no_duplicate_targets``.
         """
-        if not tags and not urls and not notes:
-            return False
-        if not (self.hydrus_tag_deleted_duplicates and
-                self.hydrus_can_manage_relationships):
-            _notify(f"⚠️  Hydrus: {media.name} was previously deleted — not tagging.")
-            return False
+        scope = self._hydrus_scope_id()
+        policy_hash = self.hydrus_output_policy_hash()
+        base_deleted = HydrusPushResult(
+            sha256=deleted_hash,
+            import_state=HydrusImportState.PREVIOUSLY_DELETED,
+            metadata_state=HydrusMetadataState.NOT_REQUESTED,
+            scope_id=scope,
+            policy_hash=policy_hash,
+        )
+        metadata_requested = bool(tags or urls or notes)
+        if not metadata_requested:
+            # Unmatched / empty push: import terminal, no relationship work.
+            return base_deleted
+
+        if not self.hydrus_tag_deleted_duplicates:
+            # Until policy fingerprints exist, do not invent an unscoped
+            # permanent seal — search may still record matched with this
+            # checkpoint; enabling tagging later needs BF-03 to reopen.
+            return HydrusPushResult(
+                sha256=deleted_hash,
+                import_state=HydrusImportState.PREVIOUSLY_DELETED,
+                metadata_state=HydrusMetadataState.POLICY_SKIPPED,
+                scope_id=scope,
+                policy_hash=policy_hash,
+            )
+
+        if not self.hydrus_can_manage_relationships:
+            if not getattr(self, "_warned_relationship_permission", False):
+                self._warned_relationship_permission = True
+                _notify(
+                    "⚠️  Hydrus: deleted-file duplicate tagging needs the "
+                    "'Manage File Relationships' permission — files stay "
+                    "retryable until the key can query relationships.")
+            return HydrusPushResult(
+                sha256=deleted_hash,
+                import_state=HydrusImportState.PREVIOUSLY_DELETED,
+                metadata_state=HydrusMetadataState.PERMISSION_MISSING,
+                scope_id=scope,
+                policy_hash=policy_hash,
+            )
+
         try:
             r = self.session.get(
                 f"{self.hydrus_api_url}/manage_file_relationships/"
@@ -1005,35 +1318,69 @@ class HydrusMixin:
                 HYDRUS_RELATIONSHIP_DUPLICATES, [])
                 if isinstance(h, str) and len(h) == 64 and h != deleted_hash})
             if not targets:
-                _notify(f"⚠️  Hydrus: {media.name} was previously deleted; no "
-                       "current duplicate-group members to tag.")
-                return False
+                _notify(
+                    f"⚠️  Hydrus: {media.name} was previously deleted; no "
+                    "current duplicate-group members to tag.")
+                return HydrusPushResult(
+                    sha256=deleted_hash,
+                    import_state=HydrusImportState.PREVIOUSLY_DELETED,
+                    metadata_state=HydrusMetadataState.NO_DUPLICATE_TARGETS,
+                    scope_id=scope,
+                    policy_hash=policy_hash,
+                )
             metadata_complete = True
+            applied: List[str] = []
             for target_hash in targets:
-                if tags:
-                    self._hydrus_add_tags(target_hash, tags)
-                if (notes and getattr(self, "hydrus_direct_notes_enabled", True)
-                        and self.hydrus_can_edit_notes):
-                    try:
-                        self._hydrus_set_notes(target_hash, notes)
-                    except Exception as e:
-                        metadata_complete = False
-                        _notify(f"⚠️  Hydrus direct-note write failed for a "
-                               f"duplicate of {media.name}; other metadata was "
-                               f"kept ({e})")
-                if urls and self.hydrus_can_edit_urls:
-                    if not self._hydrus_route_urls(
-                            media, target_hash, urls, url_policy=url_policy,
-                            force_associate_urls=force_associate_urls):
-                        metadata_complete = False
-                self._hydrus_add_to_page("duplicates", target_hash)
-            _notify(f"✅ Hydrus: {media.name} was deleted; tagged {len(targets)} "
-                   "current duplicate-group file(s).")
-            return metadata_complete
+                try:
+                    if tags:
+                        self._hydrus_add_tags(target_hash, tags)
+                    if (notes and getattr(self, "hydrus_direct_notes_enabled", True)
+                            and self.hydrus_can_edit_notes):
+                        try:
+                            self._hydrus_set_notes(target_hash, notes)
+                        except Exception as e:
+                            metadata_complete = False
+                            _notify(
+                                f"⚠️  Hydrus direct-note write failed for a "
+                                f"duplicate of {media.name}; other metadata was "
+                                f"kept ({e})")
+                    if urls and self.hydrus_can_edit_urls:
+                        if not self._hydrus_route_urls(
+                                media, target_hash, urls, url_policy=url_policy,
+                                force_associate_urls=force_associate_urls):
+                            metadata_complete = False
+                    self._hydrus_add_to_page("duplicates", target_hash)
+                    applied.append(target_hash)
+                except Exception as e:
+                    metadata_complete = False
+                    _notify(
+                        f"⚠️  Hydrus: failed tagging duplicate of "
+                        f"{media.name}: {e}")
+            if applied:
+                _notify_info(
+                    f"✅ Hydrus: {media.name} was deleted; tagged "
+                    f"{len(applied)} current duplicate-group file(s).")
+            return HydrusPushResult(
+                sha256=deleted_hash,
+                import_state=HydrusImportState.PREVIOUSLY_DELETED,
+                metadata_state=(
+                    HydrusMetadataState.APPLIED_DUPLICATES if metadata_complete
+                    else HydrusMetadataState.RETRYABLE_FAILURE),
+                target_hashes=tuple(applied),
+                scope_id=scope,
+                policy_hash=policy_hash,
+            )
         except (requests.RequestException, ValueError, RuntimeError, TypeError) as e:
             _notify(f"⚠️  Hydrus: couldn't tag duplicate-group members for "
                    f"deleted {media.name}: {e}")
-            return False
+            return HydrusPushResult(
+                sha256=deleted_hash,
+                import_state=HydrusImportState.PREVIOUSLY_DELETED,
+                metadata_state=HydrusMetadataState.RETRYABLE_FAILURE,
+                scope_id=scope,
+                policy_hash=policy_hash,
+                reason=str(e)[:240],
+            )
 
     def _hydrus_route_urls(
             self, media: Path, file_hash: str, urls: Set[str],

@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from PIL import Image
+
 from furtag import TagIntegrator, RetryableLookupError, _is_pdf_page_render
 from furtag_review import PendingReview
 from furtag_settings import Settings
@@ -63,6 +65,64 @@ class TestSourceToggles(unittest.TestCase):
         ti.saucenao_search.assert_not_called()
         self.assertEqual(result.sources, [])
         self.assertNotIn("SauceNAO", ti.enabled_pipeline_description())
+
+    def test_search_profile_changes_when_credentials_become_available(self):
+        settings = Settings()
+        before = TagIntegrator(settings=settings)
+        after = TagIntegrator(settings=settings)
+        before.has_e621 = False
+        after.has_e621 = True
+        self.assertNotEqual(
+            before.search_profile_hash(), after.search_profile_hash())
+
+
+class TestThumbnailPreparation(unittest.TestCase):
+    def test_oversized_source_is_rejected_before_decode(self):
+        fake = MagicMock()
+        fake.size = (8001, 8000)
+        fake.__enter__.return_value = fake
+
+        with patch("furtag.Image.open", return_value=fake), \
+                patch("furtag.notify") as notice:
+            thumb = TagIntegrator(settings=Settings())._prepare_thumb(
+                Path("oversized.png"))
+
+        self.assertIsNone(thumb)
+        fake.draft.assert_not_called()
+        fake.thumbnail.assert_not_called()
+        self.assertIn("too large", notice.call_args.args[0])
+
+    def test_panorama_is_bounded_by_longest_side(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "panorama.png"
+            Image.new("RGB", (4096, 64), "purple").save(source)
+
+            thumb = TagIntegrator(settings=Settings())._prepare_thumb(source)
+
+            self.assertIsNotNone(thumb)
+            with thumb, Image.open(thumb) as prepared:
+                self.assertEqual(prepared.size, (256, 4))
+                self.assertLessEqual(max(prepared.size), 256)
+
+    def test_palette_image_is_shrunk_and_converted_for_png_upload(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "palette.png"
+            Image.new("P", (1024, 256), 7).save(source)
+
+            thumb = TagIntegrator(settings=Settings())._prepare_thumb(source)
+
+            self.assertIsNotNone(thumb)
+            with thumb, Image.open(thumb) as prepared:
+                self.assertEqual(prepared.size, (256, 64))
+                self.assertEqual(prepared.mode, "RGB")
+
+    def test_transient_open_error_is_retryable_not_unreadable(self):
+        from furtag import RetryableLookupError
+
+        with patch("furtag.Image.open", side_effect=OSError("volume busy")):
+            with self.assertRaises(RetryableLookupError):
+                TagIntegrator(settings=Settings())._prepare_thumb(
+                    Path("temporarily-unavailable.png"))
 
 
 class TestFluffleMatching(unittest.TestCase):
