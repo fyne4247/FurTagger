@@ -24,6 +24,9 @@ from furtag import (
     set_active_observer,
 )
 from furtag_events import NullObserver, RunEvent, TerminalObserver
+from furtag_hydrus import (
+    HydrusImportState, HydrusMetadataState, HydrusPushResult,
+)
 from furtag_settings import RunOptions, Settings
 
 
@@ -406,6 +409,173 @@ class TestTransientLookupFailures(unittest.TestCase):
         self.assertNotEqual(
             ledger.status_for(media.name, st.st_size, st.st_mtime),
             "matched")
+
+    def test_sidecar_backed_hydrus_failure_resumes_without_lookup(self):
+        root = _make_pngs(1)
+        self.addCleanup(shutil.rmtree, root, True)
+        settings = _offline_settings()
+        settings.sources.e621_enabled = True
+
+        first = TagIntegrator(settings=settings)
+        first.has_hydrus = True
+        first.hydrus_import = True
+        first.hydrus_also_sidecars = True
+        first.hydrus_can_search_files = False
+        first.hydrus_already_tagged_page_enabled = False
+        first.has_e621 = True
+        first._hash_lookup = lambda service, md5: (
+            {"creator:exact"}, {"https://e621.net/posts/1"}, set())
+
+        def fail_during_cancel(*args, **kwargs):
+            first.request_cancel()
+            return HydrusPushResult()
+
+        first._hydrus_push_detailed = mock.MagicMock(
+            side_effect=fail_during_cancel)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = first.run(
+                root, options=_run_options(), observer=RecordingObserver(),
+                use_terminal_display=False)
+
+        media = next(root.glob("*.png"))
+        ledger = Ledger(root)
+        ledger.load()
+        pending = ledger.records[media.name]
+        self.assertEqual(pending["status"], "matched")
+        self.assertFalse(pending["hydrus_output"]["complete"])
+        self.assertIn(
+            "resume_from_sidecars", pending["hydrus_output"])
+        self.assertTrue(first.has_sidecar(media))
+        self.assertEqual(summary.tagged, 1)
+        self.assertTrue(summary.cancelled)
+
+        second = TagIntegrator(settings=settings)
+        second.has_hydrus = True
+        second.hydrus_import = True
+        second.hydrus_also_sidecars = True
+        second.hydrus_can_search_files = False
+        second.hydrus_already_tagged_page_enabled = False
+        second.has_e621 = True
+        second.hash_tier = mock.MagicMock(
+            side_effect=AssertionError("source lookup must not run"))
+        second._hydrus_push_detailed = mock.MagicMock(
+            return_value=HydrusPushResult(
+                sha256="a" * 64,
+                import_state=HydrusImportState.LIVE,
+                metadata_state=HydrusMetadataState.APPLIED_ORIGINAL,
+                scope_id=second._hydrus_scope_id(),
+                policy_hash=second.hydrus_output_policy_hash()))
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            second.run(
+                root, options=_run_options(), observer=RecordingObserver(),
+                use_terminal_display=False)
+
+        second.hash_tier.assert_not_called()
+        second._hydrus_push_detailed.assert_called_once()
+        ledger = Ledger(root)
+        ledger.load()
+        recovered = ledger.records[media.name]
+        self.assertTrue(recovered["hydrus_output"]["complete"])
+        self.assertNotIn(
+            "resume_from_sidecars", recovered["hydrus_output"])
+        self.assertEqual(recovered["sha256"], "a" * 64)
+
+    def test_failed_selective_resume_waits_for_next_launch_without_lookup(self):
+        root = _make_pngs(1)
+        self.addCleanup(shutil.rmtree, root, True)
+        media = next(root.glob("*.png"))
+        st = media.stat()
+        settings = _offline_settings()
+        settings.sources.e621_enabled = True
+        ti = TagIntegrator(settings=settings)
+        ti.has_hydrus = True
+        ti.hydrus_import = True
+        ti.hydrus_also_sidecars = True
+        ti.hydrus_can_search_files = False
+        ti.hydrus_already_tagged_page_enabled = False
+        ti.has_e621 = True
+        ti._write_sidecar_results(
+            media, {"creator:exact"}, {"https://e621.net/posts/1"})
+        ledger = Ledger(root)
+        ti.ledger_record(
+            ledger, media.name, st.st_size, st.st_mtime,
+            "b" * 32, "matched", ["e621"],
+            direct_notes_applied=False,
+            hydrus_output={
+                "scope_id": ti._hydrus_scope_id(),
+                "policy_hash": ti.hydrus_output_policy_hash(),
+                "import_state": "retryable_failure",
+                "metadata_state": "retryable_failure",
+                "complete": False,
+                "resume_from_sidecars": {
+                    "requires_sidecar": True,
+                    "url_policy": "enrich_hash_posts",
+                    "force_associate_urls": [],
+                    "notes": {},
+                },
+            })
+        ledger.save()
+        ti.hash_tier = mock.MagicMock(
+            side_effect=AssertionError("source lookup must not run"))
+        ti._hydrus_push_detailed = mock.MagicMock(
+            return_value=HydrusPushResult())
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ti.run(
+                root, options=_run_options(), observer=RecordingObserver(),
+                use_terminal_display=False)
+
+        ti.hash_tier.assert_not_called()
+        ti._hydrus_push_detailed.assert_called_once()
+        ledger = Ledger(root)
+        ledger.load()
+        self.assertEqual(ledger.records[media.name]["status"], "matched")
+        self.assertFalse(
+            ledger.records[media.name]["hydrus_output"]["complete"])
+
+    def test_legacy_hashed_sidecar_is_adopted_without_lookup(self):
+        root = _make_pngs(1)
+        self.addCleanup(shutil.rmtree, root, True)
+        media = next(root.glob("*.png"))
+        st = media.stat()
+        settings = _offline_settings()
+        ti = TagIntegrator(settings=settings)
+        ti.has_hydrus = True
+        ti.hydrus_import = True
+        ti.hydrus_also_sidecars = True
+        ti.hydrus_can_search_files = False
+        ti.hydrus_already_tagged_page_enabled = False
+        ti._write_sidecar_results(
+            media, {"creator:legacy"}, {"https://example.test/post/1"})
+        ledger = Ledger(root)
+        ledger.cache_md5(
+            media.name, st.st_size, st.st_mtime, "c" * 32,
+            mtime_ns=st.st_mtime_ns)
+        ledger.save()
+        ti.hash_tier = mock.MagicMock(
+            side_effect=AssertionError("source lookup must not run"))
+        ti._hydrus_push_detailed = mock.MagicMock(
+            return_value=HydrusPushResult(
+                sha256="d" * 64,
+                import_state=HydrusImportState.LIVE,
+                metadata_state=HydrusMetadataState.APPLIED_ORIGINAL,
+                scope_id=ti._hydrus_scope_id(),
+                policy_hash=ti.hydrus_output_policy_hash()))
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ti.run(
+                root, options=_run_options(), observer=RecordingObserver(),
+                use_terminal_display=False)
+
+        ti.hash_tier.assert_not_called()
+        ti._hydrus_push_detailed.assert_called_once()
+        ledger = Ledger(root)
+        ledger.load()
+        self.assertEqual(ledger.records[media.name]["status"], "matched")
+        self.assertTrue(
+            ledger.records[media.name]["hydrus_output"]["complete"])
 
     def test_partial_hash_hit_waits_for_failed_additive_source(self):
         root = Path(tempfile.mkdtemp(prefix="furtag-partial-hit-"))

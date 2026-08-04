@@ -634,6 +634,12 @@ class WriteOutcome:
     hydrus_output: Optional[Dict] = None
     # Nested unmatched-import checkpoint (search may be nomatch independently).
     unmatched_import: Optional[Dict] = None
+    # Per-sink detail lets the pipeline distinguish "Hydrus failed after the
+    # sidecar was safely written" from a sidecar failure that still requires a
+    # fresh lookup. ``None`` preserves the conservative behavior of legacy
+    # callers and test doubles.
+    hydrus_complete: Optional[bool] = None
+    sidecar_complete: Optional[bool] = None
 
 
 # ── Session ledger ───────────────────────────────────────────────────────────
@@ -3234,16 +3240,35 @@ class TagIntegrator(HydrusMixin):
                 sidecar_complete = self._write_sidecar_results(
                     media, tags, urls)
             complete = push.complete and sidecar_complete
+            checkpoint = push.to_ledger_checkpoint()
+            if not push.complete and sidecar_complete:
+                # Tags/URLs already have a durable copy in the sidecars. Keep
+                # only the small pieces sidecars cannot express so the next
+                # launch can retry this one Hydrus sink without querying the
+                # source sites again. A successful retry replaces this whole
+                # checkpoint, automatically dropping the transient context.
+                checkpoint["resume_from_sidecars"] = {
+                    "requires_sidecar": bool(tags or urls),
+                    "url_policy": url_policy.value,
+                    "force_associate_urls": sorted(force_associate),
+                    "notes": notes,
+                }
             # Search resolution stays "matched"; Hydrus details nest under
             # hydrus_output (never a new top-level hydrus_deleted status).
             return WriteOutcome(
                 push.sha256, complete, ledger_status="matched",
-                hydrus_output=push.to_ledger_checkpoint())
+                hydrus_output=checkpoint,
+                hydrus_complete=push.complete,
+                sidecar_complete=sidecar_complete)
 
         if self.write_sidecars:
+            sidecar_complete = self._write_sidecar_results(media, tags, urls)
             return WriteOutcome(
-                None, self._write_sidecar_results(media, tags, urls))
-        return WriteOutcome(None, not (tags or urls))
+                None, sidecar_complete,
+                hydrus_complete=True, sidecar_complete=sidecar_complete)
+        return WriteOutcome(
+            None, not (tags or urls),
+            hydrus_complete=True, sidecar_complete=True)
 
     def _propagate_duplicate_results(
             self, root: Path, canonical: FileItem, duplicates: List[FileItem],
@@ -3397,6 +3422,13 @@ class TagIntegrator(HydrusMixin):
                 continue
             hydrus_output = rec.get("hydrus_output") if isinstance(
                 rec.get("hydrus_output"), dict) else None
+            # A canonical whose Hydrus sink is still pending must be recovered
+            # first. Trying each byte-identical copy as an import fallback would
+            # turn one outage into repeated 120-second requests and defeat the
+            # selective sidecar resume path.
+            if (status == "matched" and hydrus_output is not None
+                    and not hydrus_output.get("complete")):
+                continue
             if status == "hydrus_deleted" and not hydrus_output:
                 hydrus_output = {
                     "import_state": "previously_deleted",
@@ -4414,7 +4446,13 @@ class TagIntegrator(HydrusMixin):
                 tags |= self._pdf_page_base_tags(path)
             outcome = self.write_results_detailed(
                 path, tags, urls, notes=notes)
-            if not outcome.complete:
+            resumable_hydrus = (
+                outcome.hydrus_complete is False
+                and outcome.sidecar_complete is True
+                and isinstance(outcome.hydrus_output, dict)
+                and isinstance(
+                    outcome.hydrus_output.get("resume_from_sidecars"), dict))
+            if not outcome.complete and not resumable_hydrus:
                 notify(
                     f"⚠️  Metadata output incomplete for {path.name}; "
                     "keeping it in the review queue for retry.")
@@ -4425,13 +4463,19 @@ class TagIntegrator(HydrusMixin):
                 ledger,
                 path.name, st.st_size, st.st_mtime, pending.md5,
                 status, sources, sha256=sha,
-                direct_notes_applied=self.direct_notes_effective(),
+                direct_notes_applied=(
+                    self.direct_notes_effective()
+                    if outcome.complete else False),
                 hydrus_output=outcome.hydrus_output,
                 review={
                     "decision": "approved",
                     "decided_at": time.time(),
-                    "output_complete": True,
+                    "output_complete": bool(outcome.complete),
                 })
+            if resumable_hydrus:
+                notify(
+                    f"⚠️  Approved {path.name}; tags were saved to sidecars "
+                    "and Hydrus output will retry on the next launch.")
         else:
             outcome = self.write_unmatched_detailed(path)
             # Always record the reject decision. Incomplete unmatched import
@@ -4625,6 +4669,26 @@ class TagIntegrator(HydrusMixin):
             # Defensive: discover should have returned [] when disabled.
             pdf_jobs = []
 
+        prior_matches = self._hydrus_reconcile_prior_matches(
+            ledger_mgr, items)
+        if (prior_matches.attempted or prior_matches.missing_payload):
+            ledger_mgr.save_all()
+        if prior_matches.completed:
+            print(
+                f"✅ Hydrus recovered {prior_matches.completed} previously "
+                "tagged file(s) directly from their sidecars; no source "
+                "lookups needed.")
+        if prior_matches.failed:
+            notify(
+                f"⚠️  Hydrus output remains pending for "
+                f"{prior_matches.failed} previously tagged file(s); they will "
+                "retry on the next launch without source lookups.")
+        if prior_matches.missing_payload:
+            notify(
+                f"⚠️  {prior_matches.missing_payload} pending Hydrus file(s) "
+                "lost their required sidecar payload and will use the normal "
+                "lookup pipeline instead.")
+
         prior_reconciled = self._hydrus_import_prior_nomatches(
             ledger_mgr, items)
         if prior_reconciled.completed or prior_reconciled.failed:
@@ -4759,6 +4823,37 @@ class TagIntegrator(HydrusMixin):
             if self._review_queue is not None:
                 self._review_queue.save()
 
+        def _checkpoint_pending_hydrus_match(
+                item: FileItem, outcome: WriteOutcome,
+                sources: List[str], track: str) -> bool:
+            """Seal the lookup when sidecars can resume only the failed sink."""
+            checkpoint = outcome.hydrus_output
+            resumable = (
+                outcome.hydrus_complete is False
+                and outcome.sidecar_complete is True
+                and isinstance(checkpoint, dict)
+                and isinstance(
+                    checkpoint.get("resume_from_sidecars"), dict))
+            if not resumable:
+                return False
+            self.ledger_record(
+                item.ledger,
+                item.path.name, item.size, item.mtime,
+                item.md5, "matched", sources,
+                sha256=outcome.sha256,
+                direct_notes_applied=False,
+                hydrus_output=checkpoint)
+            source_totals = _bump_hit(sources)
+            self._emit(
+                "finish_file", track=track,
+                result="tagged in sidecar — Hydrus import pending",
+                source_hits=source_totals,
+                extra={"retryable": True,
+                       "failed_sources": ["hydrus_output"],
+                       "hydrus_pending": True})
+            _maybe_save_ledgers()
+            return True
+
         hash_items = [it for it in items if not it.perceptual_only]
         perceptual_q: "queue.Queue" = queue.Queue()
         seed_count = 0
@@ -4804,6 +4899,9 @@ class TagIntegrator(HydrusMixin):
                             item.path, tags, urls, item.sha256,
                             **({"notes": notes} if notes else {}))
                         if not outcome.complete:
+                            if _checkpoint_pending_hydrus_match(
+                                    item, outcome, sources, "perceptual"):
+                                continue
                             item.lookup_errors.add("output")
                             if outcome.sha256:
                                 item.ledger.cache_sha256(
@@ -4981,6 +5079,9 @@ class TagIntegrator(HydrusMixin):
                             force_associate_urls=force_assoc,
                             **({"notes": notes} if notes else {}))
                         if not outcome.complete:
+                            if _checkpoint_pending_hydrus_match(
+                                    item, outcome, sources, "hash"):
+                                continue
                             item.lookup_errors.add("output")
                             if outcome.sha256:
                                 item.ledger.cache_sha256(

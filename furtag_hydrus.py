@@ -183,6 +183,24 @@ class PriorNomatchReconcileResult:
         return len(self.completed_paths)
 
 
+@dataclass
+class PriorMatchReconcileResult:
+    """Selective retry summary for matched rows with pending Hydrus output."""
+
+    attempted_paths: Set[Path] = field(default_factory=set)
+    completed_paths: Set[Path] = field(default_factory=set)
+    failed: int = 0
+    missing_payload: int = 0
+
+    @property
+    def attempted(self) -> int:
+        return len(self.attempted_paths)
+
+    @property
+    def completed(self) -> int:
+        return len(self.completed_paths)
+
+
 def _truthy(val: str, default: bool = False) -> bool:
     if val is None or str(val).strip() == "":
         return default
@@ -1124,7 +1142,13 @@ class HydrusMixin:
 
         entries: List[Tuple[Path, Ledger, str, int, float, Optional[str], float]] = []
         for path, ledger, name, st, rec in self._unchanged_records(
-                ledger_mgr, lambda r: r.get("status") == "matched", {"matched"}):
+                ledger_mgr,
+                lambda r: (
+                    r.get("status") == "matched"
+                    and not (
+                        isinstance(r.get("hydrus_output"), dict)
+                        and not r["hydrus_output"].get("complete"))),
+                {"matched"}):
             # Records predating tagged_at sort oldest (fall to the tail).
             entries.append((path, ledger, name, st.st_size, st.st_mtime,
                             ledger.sha256_for(name, st.st_size, st.st_mtime),
@@ -1186,8 +1210,159 @@ class HydrusMixin:
     def _has_prior_matched_files(cls, ledger_mgr: LedgerManager) -> bool:
         """True only when an unchanged, valid matched ledger record exists."""
         return any(cls._unchanged_records(
-            ledger_mgr, lambda r: r.get("status") == "matched", {"matched"},
+            ledger_mgr,
+            lambda r: (
+                r.get("status") == "matched"
+                and not (
+                    isinstance(r.get("hydrus_output"), dict)
+                    and not r["hydrus_output"].get("complete"))),
+            {"matched"},
             require_ledger_file=True))
+
+
+    def _hydrus_reconcile_prior_matches(
+            self, ledger_mgr: LedgerManager,
+            queued_items: Optional[List[FileItem]] = None,
+    ) -> PriorMatchReconcileResult:
+        """Retry only incomplete Hydrus match sinks from durable sidecars.
+
+        A normal match writes tags/URLs to sidecars after its Hydrus attempt.
+        When that attempt fails, ``write_results_detailed`` stores a compact
+        resume context beside the incomplete ``hydrus_output`` checkpoint.
+        This pre-pass selects only those ledger rows; unlike the broad manual
+        sidecar-sync operation, it neither walks unrelated sidecars nor calls
+        any source lookup service.
+
+        Attempted paths are removed from the already-built search queue even
+        when Hydrus is still down. That prevents a failed recovery attempt from
+        immediately falling through to an unnecessary booru re-query in the
+        same launch. Missing/deleted sidecars remain queued so a normal lookup
+        can reconstruct their payload.
+        """
+        result = PriorMatchReconcileResult()
+        if not self.has_hydrus:
+            return result
+        profile = self.search_profile_hash()
+
+        def _needs_resume(rec: Dict) -> bool:
+            checkpoint = rec.get("hydrus_output")
+            if rec.get("status") == "hashed":
+                # Compatibility for interrupted runs made before selective
+                # checkpoints existed. The path-level sidecar check below
+                # keeps ordinary unresolved hashes in the lookup pipeline.
+                return True
+            return bool(
+                rec.get("status") == "matched"
+                and rec.get("search_profile_hash") == profile
+                and isinstance(checkpoint, dict)
+                and not checkpoint.get("complete")
+                and isinstance(
+                    checkpoint.get("resume_from_sidecars"), dict))
+
+        entries: List[Tuple[Path, Ledger, str, os.stat_result, Dict]] = []
+        for ledger in ledger_mgr.touched():
+            for name, rec in ledger.records.items():
+                if not isinstance(rec, dict) or not _needs_resume(rec):
+                    continue
+                path = ledger.dir / name
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                # Verify bytes/path freshness directly. The shared resolved-row
+                # iterator also applies direct-note backfill invalidation, but
+                # pending Hydrus output must be resumed before that decision.
+                if ledger._fresh_record(
+                        name, st.st_size, st.st_mtime,
+                        mtime_ns=st.st_mtime_ns) is None:
+                    continue
+                if rec.get("status") == "hashed" and not self.has_sidecar(path):
+                    continue
+                entries.append((path, ledger, name, st, rec))
+        if entries:
+            print(
+                f"📥 Retrying Hydrus output for {len(entries)} previously "
+                "tagged file(s)…")
+
+        for done, (path, ledger, name, st, rec) in enumerate(entries, 1):
+            if self.cancelled():
+                break
+            checkpoint = rec.get("hydrus_output") or {}
+            resume = checkpoint.get("resume_from_sidecars") or {
+                # Legacy hashed+sidecar recovery cannot reconstruct direct
+                # notes or the original exact-URL enrichment decision, but it
+                # can safely import and apply the durable tags/URLs without a
+                # source lookup. Future failures persist the exact context.
+                "requires_sidecar": True,
+                "url_policy": UrlWritePolicy.ASSOCIATE_ONLY.value,
+                "force_associate_urls": [],
+                "notes": {},
+            }
+            requires_sidecar = bool(resume.get("requires_sidecar", True))
+            if requires_sidecar and not self.has_sidecar(path):
+                result.missing_payload += 1
+                continue
+            tags, urls = self.read_sidecar_payload(path)
+            notes = {
+                str(key): str(value)
+                for key, value in (resume.get("notes") or {}).items()
+                if str(key).strip() and str(value).strip()
+            }
+            if requires_sidecar and not (tags or urls):
+                result.missing_payload += 1
+                continue
+            try:
+                url_policy = UrlWritePolicy(
+                    resume.get("url_policy")
+                    or UrlWritePolicy.ASSOCIATE_ONLY.value)
+            except (TypeError, ValueError):
+                url_policy = UrlWritePolicy.ASSOCIATE_ONLY
+            force_associate = {
+                str(url) for url in
+                (resume.get("force_associate_urls") or []) if url
+            }
+            self._emit(
+                "status", track="hash",
+                sub=f"Hydrus retry (tagged sidecar) "
+                    f"{done}/{len(entries)} · {path.name}")
+            result.attempted_paths.add(path.resolve())
+            push = self._hydrus_push_detailed(
+                path, tags, urls,
+                known_sha256=(
+                    checkpoint.get("sha256") or rec.get("sha256")),
+                url_policy=url_policy,
+                force_associate_urls=force_associate,
+                notes=notes)
+            new_checkpoint = push.to_ledger_checkpoint()
+            if not push.complete:
+                new_checkpoint["resume_from_sidecars"] = resume
+            self.ledger_record(
+                ledger,
+                name, st.st_size, st.st_mtime, rec.get("md5"),
+                "matched", list(rec.get("sources") or []),
+                duplicate_of=str(rec.get("duplicate_of") or ""),
+                sha256=push.sha256 or rec.get("sha256"),
+                direct_notes_applied=(
+                    self.direct_notes_effective() if push.complete else False),
+                hydrus_output=new_checkpoint,
+                review=(
+                    rec.get("review")
+                    if isinstance(rec.get("review"), dict) else None),
+                mtime_ns=st.st_mtime_ns,
+                tagged_at=rec.get("tagged_at"),
+                stamp_tagged_at=False,
+                metadata_version=rec.get("metadata_version", 0))
+            if push.complete:
+                result.completed_paths.add(path.resolve())
+            else:
+                result.failed += 1
+
+        if queued_items is not None and result.attempted_paths:
+            attempted = result.attempted_paths
+            queued_items[:] = [
+                item for item in queued_items
+                if item.path.resolve() not in attempted]
+        return result
 
 
     def _hydrus_import_prior_nomatches(
