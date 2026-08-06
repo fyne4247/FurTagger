@@ -993,6 +993,7 @@ class MainWindow(QMainWindow):
         # synchronously when emitted from the GUI thread.
         set_active_observer(QtObserver(self.bridge))
         self.integrator.load_credentials_from_store(self.cred_store)
+        self._load_last_used_folder()
         self._refresh_source_status()
 
     def _build_ui(self) -> None:
@@ -1004,17 +1005,30 @@ class MainWindow(QMainWindow):
 
         # Menu
         file_menu = self.menuBar().addMenu("&File")
-        act_creds = QAction("Credentials…", self)
-        act_creds.triggered.connect(self._edit_credentials)
         act_settings = QAction("Settings…", self)
+        act_settings.setToolTip("Open the Settings tab (scan defaults, sources, Hydrus options).")
         act_settings.triggered.connect(lambda: self.main_tabs.setCurrentIndex(1))
         act_quit = QAction("Quit", self)
         act_quit.setShortcut(QKeySequence.StandardKey.Quit)
         act_quit.triggered.connect(self.close)
-        file_menu.addAction(act_creds)
         file_menu.addAction(act_settings)
         file_menu.addSeparator()
         file_menu.addAction(act_quit)
+
+        # Hydrus menu — credentials + a manual reconnect that re-checks the
+        # API without restarting the app (the connection is otherwise only
+        # re-verified automatically before a scan or after editing credentials).
+        hydrus_menu = self.menuBar().addMenu("&Hydrus")
+        act_creds = QAction("Credentials…", self)
+        act_creds.setToolTip("Set the Hydrus Client API address and access key.")
+        act_creds.triggered.connect(self._edit_credentials)
+        act_reconnect = QAction("Reconnect / Rescan Sources", self)
+        act_reconnect.setToolTip(
+            "Re-check Hydrus and other configured sources right now, without "
+            "restarting FurTag.")
+        act_reconnect.triggered.connect(self._reconnect_sources)
+        hydrus_menu.addAction(act_creds)
+        hydrus_menu.addAction(act_reconnect)
 
         # Source status (always visible) — colored dots so they read as
         # indicators, not clickable buttons.
@@ -1144,6 +1158,14 @@ class MainWindow(QMainWindow):
         self.another_btn = QPushButton("Scan Another Folder")
         self.reveal_btn = QPushButton("Reveal Results")
         self.reset_btn = QPushButton("Reset…")
+        self.another_btn.setToolTip(
+            "Keep current settings and pick a different folder to scan.")
+        self.reveal_btn.setToolTip(
+            "Open the scanned folder in your file manager.")
+        self.reset_btn.setToolTip(
+            "Remove generated sidecar/tag files for this folder so it can be "
+            "rescanned from a clean slate. Choose which files in the dialog "
+            "that follows.")
         self.cancel_btn.setEnabled(False)
         self.start_btn.clicked.connect(self._start)
         self.cancel_btn.clicked.connect(self._cancel)
@@ -1223,6 +1245,16 @@ class MainWindow(QMainWindow):
         self.clear_recents_btn.setEnabled(
             bool(self.settings.history.recent_scan_paths))
         self.recent_folders.blockSignals(False)
+
+    def _load_last_used_folder(self) -> None:
+        """Pre-select the most recently scanned folder on launch, if it's
+        still available, so the user doesn't have to re-browse or re-pick
+        it from the Recent dropdown every session."""
+        for raw in self.settings.history.recent_scan_paths:
+            path = Path(raw)
+            if path.is_dir():
+                self._set_folder(str(path))
+                return
 
     def _remember_folder(self, folder: Path) -> None:
         """Persist MRU history without saving unsaved Settings-tab edits."""
@@ -1615,6 +1647,12 @@ class MainWindow(QMainWindow):
                 settings=self.settings_panel.to_settings())
             self.integrator.load_credentials_from_store(self.cred_store)
             self._refresh_source_status()
+
+    def _reconnect_sources(self) -> None:
+        """Manually re-check Hydrus/source availability without restarting."""
+        self.integrator.load_credentials_from_store(self.cred_store)
+        self._refresh_source_status()
+        self._log("Rechecked Hydrus and source connections.")
 
     def closeEvent(self, event) -> None:
         if self.scan_worker and self.scan_worker.isRunning():
