@@ -59,6 +59,8 @@ import os
 import queue
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -97,6 +99,12 @@ from furtag_hydrus import (
 )
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # don't crash on slightly-truncated files
+# Pillow's own decompression-bomb guard fires inside Image.open() on a pixel
+# count we have not vetted yet, which turned huge-but-legitimate comic scans
+# into an endless retry loop. We enforce our own THUMB_SOURCE_MAX_PIXELS ceiling
+# immediately after open() (which is lazy and decodes nothing), and hand
+# anything above it to ImageMagick, so Pillow's heuristic only gets in the way.
+Image.MAX_IMAGE_PIXELS = None
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -106,6 +114,10 @@ THUMB_MAX = 256
 # the perceptual worker. 64 MP still comfortably covers 8K images and long
 # comic pages while bounding an RGBA decode to roughly 256 MiB.
 THUMB_SOURCE_MAX_PIXELS = 64_000_000
+
+# Seconds to pause the Fluffle lane after a 5xx, so a transient backend outage
+# doesn't chew through the remaining queue at full rate.
+FLUFFLE_SERVER_ERROR_BACKOFF = 15.0
 
 # Minimum seconds between successive requests to each service, chosen from each
 # API's documented / recommended limit. Because the four hash boorus run
@@ -170,7 +182,11 @@ LEDGER_METADATA_VERSION = 2
 # Bump when the canonical search-profile digest inputs change shape.
 SEARCH_PROFILE_VERSION = 1
 # Bump when unreadable-media preparation/decoder policy changes (BF-17).
-DECODER_PROFILE_VERSION = 1
+DECODER_PROFILE_VERSION = 2  # v2: ImageMagick downscale for oversized sources
+
+#: Resolved lazily by ``_magick_binary()``; "unset" means "not looked up yet",
+#: None means "looked up, not installed".
+_MAGICK_CMD: Any = "unset"
 # Written beside rendered PDF page PNGs so comic:/creator: survive later runs.
 PDF_META_FILE    = ".furtag_pdf.json"
 PDF_COMPLETE_FILE = ".furtag_pdf_complete.json"
@@ -1845,7 +1861,8 @@ class TagIntegrator(HydrusMixin):
                 pillow_ver = getattr(PIL, "__version__", "unknown")
             except Exception:
                 pass
-        return f"v{DECODER_PROFILE_VERSION};pillow={pillow_ver}"
+        magick = "yes" if self._magick_binary() else "no"
+        return f"v{DECODER_PROFILE_VERSION};pillow={pillow_ver};magick={magick}"
 
     def local_path_complete(
             self, path: Path, ledger: "Ledger", st: os.stat_result, *,
@@ -2011,6 +2028,68 @@ class TagIntegrator(HydrusMixin):
 
     # ── Thumbnail / MD5 helpers ──────────────────────────────────────────────
 
+    @staticmethod
+    def _magick_binary() -> Optional[List[str]]:
+        """Resolve an ImageMagick invocation once per process (None if absent)."""
+        global _MAGICK_CMD
+        if _MAGICK_CMD != "unset":
+            return _MAGICK_CMD
+        cmd: Optional[List[str]] = None
+        magick = shutil.which("magick")
+        if magick:
+            cmd = [magick]
+        else:
+            convert = shutil.which("convert")
+            if convert:
+                cmd = [convert]
+        _MAGICK_CMD = cmd
+        if cmd is None:
+            notify("⚠️  ImageMagick not found; very large images cannot be "
+                   "thumbnailed for perceptual search. Install it with "
+                   "`brew install imagemagick`.")
+        return cmd
+
+    def _prepare_thumb_external(self, img: Path) -> Optional[BytesIO]:
+        """Downscale an oversized source with ImageMagick, out of process.
+
+        Returns a PNG buffer, or None when ImageMagick is unavailable or fails.
+        Memory limits keep the child from trading a Pillow blow-up for its own;
+        past them ImageMagick pages through its on-disk pixel cache instead.
+        """
+        binary = self._magick_binary()
+        if not binary:
+            return None
+        cmd = binary + [
+            "-limit", "memory", "512MiB",
+            "-limit", "map", "2GiB",
+            "-limit", "thread", "2",
+            # [0] takes the first frame/page so animations and multi-page
+            # sources produce a single thumbnail.
+            f"{img}[0]",
+            "-strip",
+            # -thumbnail samples down before the final resize. On a 360 MP page
+            # that measured ~19s against ~140s for a plain -resize, at a
+            # quality difference invisible in a 256 px perceptual thumbnail.
+            "-thumbnail", f"{THUMB_MAX}x{THUMB_MAX}>",
+            "PNG:-",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, timeout=180, check=False)
+        except subprocess.TimeoutExpired:
+            notify(f"⚠️  ImageMagick timed out downscaling {img.name}.")
+            return None
+        except OSError as e:
+            notify(f"⚠️  ImageMagick could not run for {img.name}: {e}")
+            return None
+        if proc.returncode != 0 or not proc.stdout:
+            detail = (proc.stderr or b"").decode(
+                "utf-8", "replace").strip().splitlines()
+            notify(f"⚠️  ImageMagick failed on {img.name}"
+                   + (f": {detail[-1][:200]}" if detail else ""))
+            return None
+        return BytesIO(proc.stdout)
+
     def _prepare_thumb(self, img: Path) -> Optional[BytesIO]:
         try:
             with Image.open(img) as im:
@@ -2018,10 +2097,18 @@ class TagIntegrator(HydrusMixin):
                 if width <= 0 or height <= 0:
                     raise ValueError(f"invalid image dimensions {width}×{height}")
                 if width * height > THUMB_SOURCE_MAX_PIXELS:
+                    # Too big for an in-process decode. ImageMagick streams the
+                    # source and spills to its disk cache, so it can shrink a
+                    # 350 MP page without a multi-gigabyte RGBA buffer.
+                    oversized = (
+                        f"{width}×{height} exceeds the "
+                        f"{THUMB_SOURCE_MAX_PIXELS:,}-pixel in-process limit")
+                    external = self._prepare_thumb_external(img)
+                    if external is not None:
+                        return external
                     raise ValueError(
-                        f"image is too large to thumbnail safely "
-                        f"({width}×{height}; limit is "
-                        f"{THUMB_SOURCE_MAX_PIXELS:,} pixels)")
+                        f"image is too large to thumbnail safely ({oversized}) "
+                        f"and ImageMagick could not downscale it")
 
                 # JPEG can ask its decoder for a reduced-resolution source.
                 # Other formats still benefit from shrinking before a mode
@@ -2050,7 +2137,8 @@ class TagIntegrator(HydrusMixin):
                         converted.close()
             buf.seek(0)
             return buf
-        except (UnidentifiedImageError, ValueError, SyntaxError) as e:
+        except (UnidentifiedImageError, ValueError, SyntaxError,
+                Image.DecompressionBombError) as e:
             notify(f"❌ Pillow failed on {img.name}: {e}")
             return None
         except OSError as e:
@@ -2587,6 +2675,14 @@ class TagIntegrator(HydrusMixin):
                 notify("⚠️  Fluffle rate limit (429) – backing off 30s")
                 self.pace["fluffle"].backoff(30)
                 raise RetryableLookupError("Fluffle rate limited (HTTP 429)")
+            if r.status_code >= 500:
+                # Fluffle's backend is briefly unwell (or choked on this
+                # thumbnail). Ease off so a wobble doesn't burn through the
+                # rest of the queue at full rate; the file retries next run.
+                self.pace["fluffle"].backoff(FLUFFLE_SERVER_ERROR_BACKOFF)
+                raise RetryableLookupError(
+                    f"Fluffle server error (HTTP {r.status_code}); "
+                    f"backing off {FLUFFLE_SERVER_ERROR_BACKOFF:g}s")
             if r.status_code != 200:
                 raise RetryableLookupError(
                     f"Fluffle returned HTTP {r.status_code}")
