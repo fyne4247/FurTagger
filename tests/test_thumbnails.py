@@ -10,7 +10,7 @@ from unittest.mock import patch
 from PIL import Image
 
 import furtag
-from furtag import TagIntegrator, THUMB_SOURCE_MAX_PIXELS
+from furtag import RetryableMediaError, TagIntegrator, THUMB_SOURCE_MAX_PIXELS
 from furtag_settings import Settings
 
 
@@ -63,9 +63,11 @@ class TestPrepareThumbExternal(unittest.TestCase):
         self.ti = TagIntegrator(settings=Settings())
         self.img = Path("/nonexistent/huge.png")
         furtag._MAGICK_CMD = ["magick"]
+        furtag._MAGICK_MISSING_NOTIFIED = False
 
     def tearDown(self):
         furtag._MAGICK_CMD = "unset"
+        furtag._MAGICK_MISSING_NOTIFIED = False
 
     def test_returns_buffer_on_success(self):
         done = subprocess.CompletedProcess([], 0, _png_bytes(), b"")
@@ -74,19 +76,40 @@ class TestPrepareThumbExternal(unittest.TestCase):
         self.assertEqual(Image.open(buf).size, (64, 48))
         self.assertIn("-thumbnail", run.call_args[0][0])
 
-    def test_nonzero_exit_returns_none(self):
+    def test_nonzero_exit_is_retryable(self):
         done = subprocess.CompletedProcess([], 1, b"", b"magick: no decode")
         with patch("subprocess.run", return_value=done):
-            self.assertIsNone(self.ti._prepare_thumb_external(self.img))
+            with self.assertRaises(RetryableMediaError):
+                self.ti._prepare_thumb_external(self.img)
 
-    def test_timeout_returns_none(self):
+    def test_timeout_is_retryable(self):
         with patch("subprocess.run",
                    side_effect=subprocess.TimeoutExpired("magick", 180)):
-            self.assertIsNone(self.ti._prepare_thumb_external(self.img))
+            with self.assertRaises(RetryableMediaError):
+                self.ti._prepare_thumb_external(self.img)
 
-    def test_missing_binary_returns_none(self):
+    def test_launch_error_is_retryable(self):
+        with patch("subprocess.run", side_effect=OSError("process unavailable")):
+            with self.assertRaises(RetryableMediaError):
+                self.ti._prepare_thumb_external(self.img)
+
+    def test_missing_binary_returns_none_and_warns_once(self):
         furtag._MAGICK_CMD = None
-        self.assertIsNone(self.ti._prepare_thumb_external(self.img))
+        with patch("furtag.notify") as notice:
+            self.assertIsNone(self.ti._prepare_thumb_external(self.img))
+            self.assertIsNone(self.ti._prepare_thumb_external(self.img))
+        notice.assert_called_once()
+
+    def test_decoder_profile_silently_probes_missing_binary(self):
+        furtag._MAGICK_CMD = "unset"
+        with patch("furtag.shutil.which", return_value=None), \
+                patch("furtag.notify") as notice:
+            profile = self.ti.decoder_profile()
+            self.assertIn("magick=no", profile)
+            notice.assert_not_called()
+            self.assertIsNone(self.ti._prepare_thumb_external(self.img))
+            self.assertIsNone(self.ti._prepare_thumb_external(self.img))
+        notice.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -55,6 +55,21 @@ class FakeSession:
         return FakeResponse(404, {"error": "no fake route"})
 
 
+class TestHydrusEmptyFile(unittest.TestCase):
+    def test_zero_byte_file_is_named_without_posting_to_hydrus(self):
+        session = FakeSession()
+        ti = TagIntegrator(settings=Settings(), session=session)
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "empty.jpg"
+            media.write_bytes(b"")
+            with patch("furtag_hydrus._notify") as notice:
+                result = ti._hydrus_add_file(media)
+
+        self.assertIsNone(result)
+        self.assertEqual(session.calls, [])
+        self.assertIn("0 bytes on disk", notice.call_args.args[0])
+
+
 class TestHydrusRouting(unittest.TestCase):
     def test_result_page_routing_new_vs_updated(self):
         session = FakeSession(routes=[

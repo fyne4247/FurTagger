@@ -187,6 +187,7 @@ DECODER_PROFILE_VERSION = 2  # v2: ImageMagick downscale for oversized sources
 #: Resolved lazily by ``_magick_binary()``; "unset" means "not looked up yet",
 #: None means "looked up, not installed".
 _MAGICK_CMD: Any = "unset"
+_MAGICK_MISSING_NOTIFIED = False
 # Written beside rendered PDF page PNGs so comic:/creator: survive later runs.
 PDF_META_FILE    = ".furtag_pdf.json"
 PDF_COMPLETE_FILE = ".furtag_pdf_complete.json"
@@ -2030,7 +2031,7 @@ class TagIntegrator(HydrusMixin):
 
     @staticmethod
     def _magick_binary() -> Optional[List[str]]:
-        """Resolve an ImageMagick invocation once per process (None if absent)."""
+        """Silently resolve an ImageMagick invocation (None if absent)."""
         global _MAGICK_CMD
         if _MAGICK_CMD != "unset":
             return _MAGICK_CMD
@@ -2043,21 +2044,25 @@ class TagIntegrator(HydrusMixin):
             if convert:
                 cmd = [convert]
         _MAGICK_CMD = cmd
-        if cmd is None:
-            notify("⚠️  ImageMagick not found; very large images cannot be "
-                   "thumbnailed for perceptual search. Install it with "
-                   "`brew install imagemagick`.")
         return cmd
 
     def _prepare_thumb_external(self, img: Path) -> Optional[BytesIO]:
         """Downscale an oversized source with ImageMagick, out of process.
 
-        Returns a PNG buffer, or None when ImageMagick is unavailable or fails.
+        Returns a PNG buffer, or None only when ImageMagick is unavailable.
+        Execution failures raise RetryableMediaError so one transient child
+        process failure cannot permanently seal the source as unreadable.
         Memory limits keep the child from trading a Pillow blow-up for its own;
         past them ImageMagick pages through its on-disk pixel cache instead.
         """
+        global _MAGICK_MISSING_NOTIFIED
         binary = self._magick_binary()
         if not binary:
+            if not _MAGICK_MISSING_NOTIFIED:
+                notify("⚠️  ImageMagick not found; very large images cannot be "
+                       "thumbnailed for perceptual search. Install it with "
+                       "`brew install imagemagick`.")
+                _MAGICK_MISSING_NOTIFIED = True
             return None
         cmd = binary + [
             "-limit", "memory", "512MiB",
@@ -2076,18 +2081,24 @@ class TagIntegrator(HydrusMixin):
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, timeout=180, check=False)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             notify(f"⚠️  ImageMagick timed out downscaling {img.name}.")
-            return None
+            raise RetryableMediaError(
+                f"ImageMagick timed out downscaling {img.name}") from e
         except OSError as e:
             notify(f"⚠️  ImageMagick could not run for {img.name}: {e}")
-            return None
+            raise RetryableMediaError(
+                f"ImageMagick could not run for {img.name}: {e}") from e
         if proc.returncode != 0 or not proc.stdout:
             detail = (proc.stderr or b"").decode(
                 "utf-8", "replace").strip().splitlines()
-            notify(f"⚠️  ImageMagick failed on {img.name}"
-                   + (f": {detail[-1][:200]}" if detail else ""))
-            return None
+            message = (f"ImageMagick failed on {img.name}"
+                       + (f": {detail[-1][:200]}" if detail else ""))
+            notify(f"⚠️  {message}")
+            # A nonzero exit can mean a transient disk-cache, memory, delegate,
+            # or process failure. Do not permanently seal an unchanged file on
+            # the strength of one failed child process.
+            raise RetryableMediaError(message)
         return BytesIO(proc.stdout)
 
     def _prepare_thumb(self, img: Path) -> Optional[BytesIO]:
@@ -2141,6 +2152,8 @@ class TagIntegrator(HydrusMixin):
                 Image.DecompressionBombError) as e:
             notify(f"❌ Pillow failed on {img.name}: {e}")
             return None
+        except RetryableMediaError:
+            raise
         except OSError as e:
             raise RetryableMediaError(
                 f"temporary image read failure for {img.name}: {e}") from e

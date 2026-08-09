@@ -77,12 +77,14 @@ class TestSourceToggles(unittest.TestCase):
 
 
 class TestThumbnailPreparation(unittest.TestCase):
-    def test_oversized_source_is_rejected_before_decode(self):
+    def test_oversized_source_without_imagemagick_is_rejected_before_decode(self):
         fake = MagicMock()
         fake.size = (8001, 8000)
         fake.__enter__.return_value = fake
 
         with patch("furtag.Image.open", return_value=fake), \
+                patch.object(TagIntegrator, "_prepare_thumb_external",
+                             return_value=None), \
                 patch("furtag.notify") as notice:
             thumb = TagIntegrator(settings=Settings())._prepare_thumb(
                 Path("oversized.png"))
@@ -630,6 +632,22 @@ class TestSauceNAOQuota(unittest.TestCase):
                             for m in messages))
         self.assertTrue(any("repeatedly returned HTTP 429" in m
                             for m in messages))
+
+
+class TestFluffleBackoff(unittest.TestCase):
+    def test_server_error_backs_off_and_stays_retryable(self):
+        ti = TagIntegrator(settings=Settings())
+        ti._prepare_thumb = MagicMock(return_value=MagicMock())
+        ti.pace["fluffle"].wait = MagicMock()
+        ti.pace["fluffle"].backoff = MagicMock()
+        ti.session.post = MagicMock(
+            return_value=MagicMock(status_code=503))
+
+        with self.assertRaisesRegex(
+                RetryableLookupError, "server error.*503.*backing off 15s"):
+            ti.fluffle_search(Path("server-error.png"))
+
+        ti.pace["fluffle"].backoff.assert_called_once_with(15.0)
 
 
 class TestJunkTags(unittest.TestCase):
