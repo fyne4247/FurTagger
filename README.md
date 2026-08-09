@@ -68,6 +68,10 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
   - `platformdirs`, `keyring`
   - `PySide6` (GUI)
   - `PyMuPDF` (optional PDF support)
+- **ImageMagick** (optional, `brew install imagemagick`) — only used to thumbnail
+  images too large to decode in process (over 64 megapixels, e.g. long comic
+  scans). Without it those files are skipped for perceptual search; everything
+  else works unchanged.
 
 ---
 

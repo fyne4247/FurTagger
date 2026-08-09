@@ -784,6 +784,16 @@ class HydrusMixin:
     def _hydrus_add_file(self, media: Path) -> Optional[HydrusAddFileResult]:
         """POST /add_files/add_file by path. Returns (SHA-256 hex, import status)
         on success — status 1 = newly imported, 2 = already in the db."""
+        # Hydrus rejects empty files with a generic status=4; catch it here so
+        # the log names the real problem instead of an opaque import failure.
+        try:
+            if media.stat().st_size == 0:
+                _notify(f"⚠️  Hydrus: {media.name} is 0 bytes on disk — nothing "
+                        f"to import. Delete or re-download it.")
+                return None
+        except OSError:
+            pass
+
         try:
             r = self._hydrus_post("add_files/add_file", {"path": str(media.resolve())}, 120)
         except requests.RequestException as e:
