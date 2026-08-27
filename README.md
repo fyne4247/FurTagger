@@ -128,6 +128,23 @@ Open **Credentials** in the GUI, or set environment variables:
 
 Resolution order: **environment → OS keyring**. Missing credentials disable only that source.
 
+All fields live in a single keyring item (`org.furtag.FurTag` / `credentials_v1`).
+Older builds used one item per field; FurTag folds those into the single item on
+first launch, which on macOS costs one burst of authorization prompts and then
+stops asking.
+
+### macOS: "Python wants to use your confidential information…"
+
+If that prompt returns no matter how often you click **Always Allow**, the app
+is running under an ad-hoc-signed Python (Homebrew's, when launched via
+`./FurTag.command`). macOS pins the grant to that binary's exact code hash, so
+every `brew upgrade python@3.14` silently revokes it. Two ways out:
+
+- Build and run the **signed `FurTag.app`** — see `packaging/README.md`
+  ("macOS — local use"). A self-signed certificate is enough and is free.
+- Or set the `FURTAG_*` variables above, which bypass the keyring entirely.
+  This is the simplest option for CLI use.
+
 Non-secret options (thresholds, source toggles, page configuration, sidecar patterns, rate limits, direct notes, optional URL enrichment, and Hydrus database identity) live in platform-specific `settings.json` via `platformdirs`.
 
 Each Hydrus review page has its own toggle, name, and limit (`0` means

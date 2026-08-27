@@ -6,10 +6,17 @@
 # Do not cross-compile. Signed builds are required before validating
 # keyring credential persistence across app updates.
 
+import os
 import sys
 from pathlib import Path
 
 block_cipher = None
+
+# Signing identity comes from the environment so no private identity name is
+# committed. Keychain ACLs bind to the code signature, so an ad-hoc or unsigned
+# build looks like a different app after every rebuild and the OS re-prompts
+# for saved credentials. See packaging/README.md.
+codesign_id = os.environ.get("FURTAG_CODESIGN_IDENTITY") or None
 
 # When SPECPATH is packaging/, parent is project root.
 try:
@@ -67,7 +74,7 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
-    codesign_identity=None,
+    codesign_identity=codesign_id,
     entitlements_file=None,
 )
 

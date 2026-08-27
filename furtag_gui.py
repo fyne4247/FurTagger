@@ -141,7 +141,7 @@ from furtag import (
     TagIntegrator, prompt_for_pdf_dpi, _nuke_candidates, _pdf_render_candidates,
     _is_furtag_sidecar, LEDGER_FILE, DUPLICATES_FILE,
     is_filesystem_root, perform_nuke, set_active_observer,
-    _normalize_pdf_meta,
+    _normalize_pdf_meta, notify_info,
 )
 from furtag_settings import (
     Settings, SettingsStore, RunOptions, ScanSummary, validate_run_preflight,
@@ -292,8 +292,8 @@ class CredentialsDialog(QDialog):
                 self, "Remove credentials",
                 "Remove all FurTag secrets from the OS keyring?") != QMessageBox.StandardButton.Yes:
             return
+        self.store.delete_all()
         for k in ALL_FIELDS:
-            self.store.delete(k)
             self.fields[k].clear()
 
 
@@ -992,9 +992,44 @@ class MainWindow(QMainWindow):
         # UI must exist first, since the bridge delivers in-thread signals
         # synchronously when emitted from the GUI thread.
         set_active_observer(QtObserver(self.bridge))
+        self._migrate_legacy_credentials()
         self.integrator.load_credentials_from_store(self.cred_store)
         self._load_last_used_folder()
         self._refresh_source_status()
+
+    def _migrate_legacy_credentials(self) -> None:
+        """Fold pre-consolidation per-field keyring items into one item.
+
+        Older builds stored one keyring item per credential, so macOS asked for
+        authorization once per field on every launch. Reading those items one
+        last time costs a single burst of prompts; everything written afterwards
+        lives in one item created by this app, which is trusted automatically.
+        """
+        try:
+            if not self.cred_store.needs_migration():
+                return
+        except Exception:
+            return
+
+        if sys.platform == "darwin":
+            QMessageBox.information(
+                self, "Updating saved credentials",
+                "FurTag is consolidating your saved credentials into a single "
+                "keychain entry so macOS stops asking on every launch.\n\n"
+                "macOS will ask for your login keychain password once per saved "
+                "credential during this one-time step. After it finishes, it "
+                "should not ask again.")
+
+        count, errors = self.cred_store.migrate_legacy_items()
+        if errors:
+            QMessageBox.warning(
+                self, "Credential migration",
+                "Some credentials could not be migrated. They are still saved "
+                "in the old format and you can re-enter them under "
+                "Hydrus → Credentials…\n\n" + "\n".join(errors[:10]))
+        elif count:
+            notify_info(
+                f"Consolidated {count} saved credential(s) into one keychain entry.")
 
     def _build_ui(self) -> None:
         central = QWidget()

@@ -21,7 +21,32 @@ Keyring ACLs key to the **code signature identity**, not just the bundle id.
 Unsigned or ad-hoc-signed rebuilds look like a different app to the OS, so
 saved credentials will appear to "vanish" after every rebuild.
 
-### macOS
+### macOS — local use (self-signed)
+
+This is enough to stop the repeating keychain prompt on your own machine.
+Notarization is **not** needed: it only matters for Gatekeeper, which never
+inspects an app you built locally rather than downloaded.
+
+1. Keychain Access → Certificate Assistant → *Create a Certificate…*
+   - Name: `FurTag Self-Signed`
+   - Identity Type: **Self Signed Root**
+   - Certificate Type: **Code Signing**
+2. Confirm it registered: `security find-identity -v -p codesigning`
+3. Build and sign:
+   ```bash
+   export FURTAG_CODESIGN_IDENTITY="FurTag Self-Signed"
+   ./packaging/build.sh
+   ```
+4. Verify: `codesign -dvvv dist/FurTag.app` — the Authority must name the
+   certificate. If it says `Signature=adhoc`, signing did not take effect.
+5. Launch `dist/FurTag.app` and let it migrate saved credentials (one burst of
+   prompts, once). Relaunch to confirm it is now silent.
+
+**Back the certificate up** — export it as a `.p12` into `certs/` (gitignored).
+The keychain ACL binds to *this* certificate. Recreating it produces a different
+designated requirement and the prompts return.
+
+### macOS — distribution (Developer ID)
 
 1. `codesign --deep --force --options runtime --sign "Developer ID Application: …" dist/FurTag.app`
 2. Notarize with `notarytool` / `xcrun notarytool submit`
@@ -29,6 +54,18 @@ saved credentials will appear to "vanish" after every rebuild.
 4. Only then verify that credentials saved in v1 still load after installing v2
 
 Bundle id: `org.furtag.FurTag` (stable across updates).
+
+### Why signing matters here
+
+A keychain "Always Allow" grant records the trusted app by its *designated
+requirement*. For ad-hoc-signed code that requirement is the exact `cdhash` of
+the binary, so any rebuild — or, when running from source, any
+`brew upgrade python@3.14` — invalidates every grant at once. A stable signing
+identity gives the bundle a requirement that survives rebuilds.
+
+Running from source (`./FurTag.command`) uses Homebrew's ad-hoc-signed Python
+and will therefore keep prompting. Use the signed `.app`, or set the `FURTAG_*`
+environment variables, which take precedence over the keychain.
 
 ### Windows
 
