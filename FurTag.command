@@ -4,6 +4,34 @@
 
 cd "$(dirname "$0")" || exit 1
 
+# ── Local credentials (optional) ─────────────────────────────────────────────
+# FurTag resolves every secret from its FURTAG_* environment variable before it
+# touches the OS keyring. That order matters on macOS: a keyring read from this
+# script prompts for the login keychain password on *every* launch, because the
+# Homebrew Python it runs is ad-hoc signed and so has no stable identity for the
+# keychain ACL to trust. Sourcing a local .env sidesteps the keychain entirely.
+#
+# To use it: cp .env.example .env, fill it in, keep it chmod 600. .env is
+# gitignored — never commit it. The signed FurTag.app does not need this; see
+# packaging/README.md.
+load_env_file() {
+    [ -f ".env" ] || return 0
+
+    perms=$(stat -f "%OLp" .env 2>/dev/null || stat -c "%a" .env 2>/dev/null)
+    if [ -n "$perms" ] && [ "$perms" != "600" ]; then
+        echo "🔒 Tightening permissions on .env (was $perms)…"
+        chmod 600 .env
+    fi
+
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+    echo "🔑 Loaded credentials from .env (keychain not used)."
+}
+
+load_env_file
+
 setup_venv() {
     if [ ! -x ".venv/bin/python" ]; then
         echo "🔧 First run: creating virtual environment…"

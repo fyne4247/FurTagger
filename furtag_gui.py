@@ -149,7 +149,10 @@ from furtag_settings import (
     FLUFFLE_MATCH_CLASSES, FLUFFLE_REVIEW_MODES, DEFAULT_PDF_DPI,
     DEFAULT_PDF_ARCHIVAL_DPI, remember_scan_path,
 )
-from furtag_credentials import CredentialStore, ALL_FIELDS, SECRET_FIELDS, FIELD_MAP
+from furtag_credentials import (
+    CredentialStore, ALL_FIELDS, SECRET_FIELDS, FIELD_MAP,
+    keyring_disabled, env_file_path,
+)
 from furtag_events import RunEvent, RunObserver
 from furtag_review import ReviewQueue, PendingReview
 
@@ -232,7 +235,16 @@ class CredentialsDialog(QDialog):
         layout = QVBoxLayout(self)
 
         usable, msg = store.keyring_status()
-        status = QLabel(msg if usable else f"⚠️ {msg}\nEnv vars (FURTAG_*) still work.")
+        if keyring_disabled():
+            # Not a warning: this is a working backend the dialog writes to.
+            status = QLabel(
+                f"Saving to <code>{env_file_path()}</code> — the OS keyring is "
+                "turned off, so you will not be asked for a keychain password. "
+                "Anyone who can read that file can read these credentials.")
+        elif usable:
+            status = QLabel(msg)
+        else:
+            status = QLabel(f"⚠️ {msg}\nEnv vars (FURTAG_*) still work.")
         status.setWordWrap(True)
         layout.addWidget(status)
 
@@ -288,9 +300,11 @@ class CredentialsDialog(QDialog):
             self.accept()
 
     def _clear(self) -> None:
+        where = (f"from {env_file_path().name}" if keyring_disabled()
+                 else "from the OS keyring")
         if QMessageBox.question(
                 self, "Remove credentials",
-                "Remove all FurTag secrets from the OS keyring?") != QMessageBox.StandardButton.Yes:
+                f"Remove all FurTag secrets {where}?") != QMessageBox.StandardButton.Yes:
             return
         self.store.delete_all()
         for k in ALL_FIELDS:

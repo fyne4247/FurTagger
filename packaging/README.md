@@ -27,10 +27,20 @@ This is enough to stop the repeating keychain prompt on your own machine.
 Notarization is **not** needed: it only matters for Gatekeeper, which never
 inspects an app you built locally rather than downloaded.
 
-1. Keychain Access → Certificate Assistant → *Create a Certificate…*
-   - Name: `FurTag Self-Signed`
-   - Identity Type: **Self Signed Root**
-   - Certificate Type: **Code Signing**
+1. Create the certificate — either way works:
+
+   ```bash
+   ./certs/make-self-signed.sh        # scripted: openssl + security import
+   ```
+
+   or by hand in Keychain Access → Certificate Assistant → *Create a
+   Certificate…* with Name `FurTag Self-Signed`, Identity Type **Self Signed
+   Root**, Certificate Type **Code Signing**.
+
+   The script writes `certs/furtag-signing.key` / `.crt` (gitignored) and marks
+   the certificate trusted for code signing in your login keychain. It is a
+   no-op if the identity already exists. To undo: delete "FurTag Self-Signed"
+   from Keychain Access.
 2. Confirm it registered: `security find-identity -v -p codesigning`
 3. Build and sign:
    ```bash
@@ -42,9 +52,11 @@ inspects an app you built locally rather than downloaded.
 5. Launch `dist/FurTag.app` and let it migrate saved credentials (one burst of
    prompts, once). Relaunch to confirm it is now silent.
 
-**Back the certificate up** — export it as a `.p12` into `certs/` (gitignored).
-The keychain ACL binds to *this* certificate. Recreating it produces a different
-designated requirement and the prompts return.
+**Back the certificate up** — `certs/furtag-signing.key` and `.crt` (both
+gitignored) *are* the backup if you used the script; otherwise export a `.p12`
+into `certs/`. The keychain ACL binds to *this* certificate. Re-running the
+script after deleting the identity generates a **new** key, which produces a
+different designated requirement — and the prompts come back.
 
 ### macOS — distribution (Developer ID)
 

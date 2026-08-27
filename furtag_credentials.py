@@ -4,6 +4,9 @@ Resolution order for each secret field:
 1. Environment variable ``FURTAG_<KEY>`` (uppercase, e.g. FURTAG_E621_API_KEY)
 2. OS keyring item under service ``org.furtag.FurTag``
 
+Setting ``FURTAG_DISABLE_KEYRING=1`` skips step 2 entirely, so no keychain
+access ever happens; see ``keyring_disabled``.
+
 Secrets never enter settings.json, progress events, or logs.
 
 All fields live in a *single* keyring item (account ``credentials_v1``) holding
@@ -18,15 +21,68 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 KEYRING_SERVICE = "org.furtag.FurTag"
 
 # Single keyring account holding the JSON blob of every field.
 BLOB_ACCOUNT = "credentials_v1"
+
+# Set to 1/true/yes to bypass the OS keyring completely and resolve every field
+# from FURTAG_* environment variables alone. This exists for running from source
+# on macOS: an ad-hoc-signed Python has no stable code identity, so the keychain
+# cannot remember an "Always Allow" grant and re-prompts on every launch. See
+# .env.example and packaging/README.md.
+DISABLE_KEYRING_ENV = "FURTAG_DISABLE_KEYRING"
+
+
+def keyring_disabled() -> bool:
+    """True when the user has opted out of the OS keyring entirely."""
+    return os.environ.get(DISABLE_KEYRING_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on"}
+
+
+# Where the credential file lives when the keyring is bypassed. FurTag.command
+# sources this file before launching, so values reach the app as FURTAG_*
+# variables; writing it back is what makes the Credentials dialog work with the
+# keyring off. Override for packaged builds that run outside the project dir.
+ENV_FILE_ENV = "FURTAG_ENV_FILE"
+
+_ENV_LINE = re.compile(r"^\s*(?:export\s+)?(FURTAG_[A-Z0-9_]+)\s*=")
+
+
+def env_file_path() -> Path:
+    """Absolute path of the .env file the keyring-disabled backend writes.
+
+    Source checkouts keep it beside the code, which is where ``FurTag.command``
+    sources it from. A frozen build cannot: ``__file__`` there points inside a
+    read-only temp extraction dir, so it uses the same user config directory
+    that settings.json lives in.
+    """
+    override = os.environ.get(ENV_FILE_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    if getattr(sys, "frozen", False):
+        try:
+            from platformdirs import user_config_dir
+            base = Path(user_config_dir("FurTag", "FurTag"))
+        except ImportError:
+            base = Path.home() / ".config" / "FurTag"
+        base.mkdir(parents=True, exist_ok=True)
+        return base / ".env"
+    return Path(__file__).resolve().parent / ".env"
+
+
+def _shell_quote(value: str) -> str:
+    """Quote a value so `. ./.env` reproduces it byte for byte."""
+    if value and not re.search(r"""[\s#"'$`\\!*?~<>|&;()\[\]{}]""", value):
+        return value
+    return "'" + value.replace("'", "'\\''") + "'"
 
 # Windows Credential Locker caps a credential blob at CRED_MAX_CREDENTIAL_BLOB_SIZE
 # (2560 bytes, stored as UTF-16). Refuse to write anything close to that ceiling
@@ -85,6 +141,9 @@ class CredentialStore:
 
     def keyring_status(self) -> Tuple[bool, str]:
         """Return (usable, message), including the last read error if any."""
+        if keyring_disabled():
+            return False, (f"Keyring disabled ({DISABLE_KEYRING_ENV}=1); "
+                           "credentials come from FURTAG_* variables")
         try:
             import keyring
             backend = keyring.get_keyring()
@@ -104,6 +163,11 @@ class CredentialStore:
     def _read_blob(self) -> Dict[str, str]:
         """Load (and cache) the consolidated JSON item. Never raises."""
         if self._blob is not None:
+            return self._blob
+        if keyring_disabled():
+            self._blob = {
+                f: v for f in FIELD_MAP
+                if (v := os.environ.get(FIELD_MAP[f][0], "").strip())}
             return self._blob
         blob: Dict[str, str] = {}
         try:
@@ -132,6 +196,9 @@ class CredentialStore:
         clean = {k: v for k, v in blob.items() if k in FIELD_MAP and v}
         if clean == self._read_blob():
             return
+        if keyring_disabled():
+            self._write_env_file(clean)
+            return
         import keyring
         if not clean:
             self._blob = {}
@@ -147,6 +214,67 @@ class CredentialStore:
                 f"limit ({len(raw)} used); shorten or unset a field")
         keyring.set_password(self.service, BLOB_ACCOUNT, raw)
         self._blob = clean
+
+    def _write_env_file(self, clean: Dict[str, str]) -> None:
+        """Rewrite the .env file in place, then update the live environment.
+
+        Existing comments, ordering, and any non-FurTag lines are preserved, so
+        the file stays the readable thing the user may also edit by hand. Fields
+        with no value are kept as empty assignments rather than deleted — that
+        documents what is available to set.
+        """
+        path = env_file_path()
+        wanted = {FIELD_MAP[f][0]: clean.get(f, "") for f in FIELD_MAP}
+
+        try:
+            existing = path.read_text().splitlines()
+        except FileNotFoundError:
+            existing = [
+                "# FurTag credentials — written by the Credentials dialog.",
+                "# Gitignored. Never commit or share this file.",
+                "",
+                f"{DISABLE_KEYRING_ENV}=1",
+                "",
+            ]
+        except OSError as e:
+            raise ValueError(f"could not read {path}: {e}") from e
+
+        seen, out = set(), []
+        for line in existing:
+            m = _ENV_LINE.match(line)
+            if m and m.group(1) in wanted:
+                name = m.group(1)
+                seen.add(name)
+                out.append(f"{name}={_shell_quote(wanted[name])}")
+            else:
+                out.append(line)
+        for name, value in wanted.items():
+            if name not in seen:
+                out.append(f"{name}={_shell_quote(value)}")
+
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            # Create the temp file already private — never widen, even briefly.
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write("\n".join(out).rstrip("\n") + "\n")
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+        except OSError as e:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise ValueError(f"could not write {path}: {e}") from e
+
+        # The launcher only sources .env at startup, so the running process
+        # needs its environment updated for the new values to take effect now.
+        for name, value in wanted.items():
+            if value:
+                os.environ[name] = value
+            else:
+                os.environ.pop(name, None)
+        self._blob = dict(clean)
 
     # ── field access ─────────────────────────────────────────────────────
 
@@ -214,6 +342,8 @@ class CredentialStore:
             self._write_blob({})
         except Exception:
             pass
+        if keyring_disabled():
+            return
         self._delete_legacy_items()
 
     # ── migration from the pre-consolidation layout ──────────────────────
@@ -226,6 +356,8 @@ class CredentialStore:
         Elsewhere the backends prompt-free, so a plain read is fine.
         """
         found: List[str] = []
+        if keyring_disabled():
+            return found
         if sys.platform == "darwin":
             for name in ALL_FIELDS:
                 try:
@@ -250,6 +382,8 @@ class CredentialStore:
 
     def needs_migration(self) -> bool:
         """True when legacy items exist and the consolidated item does not."""
+        if keyring_disabled():
+            return False
         if self._read_blob():
             return False
         return bool(self.legacy_fields())

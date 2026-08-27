@@ -8,12 +8,24 @@ cd "$ROOT"
 if [[ ! -d .venv ]]; then
   python3 -m venv .venv
 fi
-# shellcheck disable=SC1091
-source .venv/bin/activate
-pip install -q -r requirements.txt pyinstaller
+
+# Call the venv interpreter directly instead of sourcing bin/activate. activate
+# hardcodes the absolute path the venv was CREATED at, so renaming the project
+# directory leaves it exporting a PATH entry that no longer exists — every
+# `pip` / `pyinstaller` then silently resolves to whatever system Python is next
+# on PATH, and the build bundles the wrong interpreter's packages. Invoking
+# .venv/bin/python reads pyvenv.cfg instead and is immune to the rename.
+PY_BIN=".venv/bin/python"
+if [[ ! -x "$PY_BIN" ]]; then
+  echo "❌ $PY_BIN is missing — delete .venv and re-run to recreate it." >&2
+  exit 1
+fi
+
+"$PY_BIN" -m pip install -q -r requirements.txt pyinstaller
 
 echo "Building FurTag for $(uname -s)…"
-pyinstaller --noconfirm packaging/furtag.spec
+echo "  interpreter: $("$PY_BIN" -c 'import sys; print(sys.executable, sys.version.split()[0])')"
+"$PY_BIN" -m PyInstaller --noconfirm packaging/furtag.spec
 
 # ── macOS signing ────────────────────────────────────────────────────────────
 # Keychain ACLs bind to the code signature, not the bundle id. An unsigned or

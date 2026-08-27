@@ -8,6 +8,8 @@ credentials.txt
 *.credentials
 .env
 .env.*
+# …but the blank template is meant to be committed.
+!.env.example
 
 # Local Codex/app state — may contain conversation memory or machine paths
 .Codex/
@@ -22,6 +24,8 @@ docs/design-sqlite-content-cache.md
 # Signing / certificates / private keys (packaging)
 certs/*
 !certs/README.md
+# The generator is a tool, not a secret — the keys it writes stay ignored.
+!certs/make-self-signed.sh
 certificates/
 signing/
 *.p12

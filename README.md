@@ -127,6 +127,9 @@ Open **Credentials** in the GUI, or set environment variables:
 | Hydrus API URL / access key | `FURTAG_HYDRUS_API_URL` / `FURTAG_HYDRUS_ACCESS_KEY` |
 
 Resolution order: **environment → OS keyring**. Missing credentials disable only that source.
+Setting `FURTAG_DISABLE_KEYRING=1` drops the keyring step entirely — see
+[macOS: keychain prompts](#macos-python-wants-to-use-your-confidential-information)
+below.
 
 All fields live in a single keyring item (`org.furtag.FurTag` / `credentials_v1`).
 Older builds used one item per field; FurTag folds those into the single item on
@@ -140,10 +143,26 @@ is running under an ad-hoc-signed Python (Homebrew's, when launched via
 `./FurTag.command`). macOS pins the grant to that binary's exact code hash, so
 every `brew upgrade python@3.14` silently revokes it. Two ways out:
 
-- Build and run the **signed `FurTag.app`** — see `packaging/README.md`
-  ("macOS — local use"). A self-signed certificate is enough and is free.
-- Or set the `FURTAG_*` variables above, which bypass the keyring entirely.
-  This is the simplest option for CLI use.
+- **Turn the keyring off and use a local `.env` file** (simplest; works today):
+
+  ```bash
+  cp .env.example .env      # already gitignored
+  chmod 600 .env
+  ```
+
+  Keep `FURTAG_DISABLE_KEYRING=1` in it. `FurTag.command` sources `.env` before
+  launching, so FurTag never touches the keychain and never prompts. The GUI
+  **Credentials** dialog reads and writes this file, so you still fill it in
+  through the UI — hand-editing is optional. Set `FURTAG_ENV_FILE` to put the
+  file somewhere other than the project directory.
+
+  The trade: credentials sit in plaintext, readable by your user account. That
+  is fine on a personal machine and wrong on a shared one.
+
+- **Build and run the signed `FurTag.app`** — see `packaging/README.md`
+  ("macOS — local use"). Keeps secrets in the keychain and still stops the
+  prompts, because a stable signature is something macOS can remember. A free
+  self-signed certificate is enough.
 
 Non-secret options (thresholds, source toggles, page configuration, sidecar patterns, rate limits, direct notes, optional URL enrichment, and Hydrus database identity) live in platform-specific `settings.json` via `platformdirs`.
 

@@ -1,6 +1,8 @@
 """Credential store: env vars, keyring isolation, redaction."""
 
 import os
+import pathlib
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -100,3 +102,76 @@ class TestFieldMap(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKeyringDisabled(unittest.TestCase):
+    """FURTAG_DISABLE_KEYRING=1 must make the OS keyring completely untouched.
+
+    Running from source on macOS uses an ad-hoc-signed Python, which has no
+    stable code identity for a keychain ACL to trust — so every keyring read
+    re-prompts for the login password. The opt-out is only useful if *nothing*
+    reaches the keyring, startup migration probing included.
+    """
+
+    def setUp(self):
+        self.env = patch.dict(os.environ, {"FURTAG_DISABLE_KEYRING": "1"})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.keyring = MagicMock()
+        self.mod = patch.dict("sys.modules", {"keyring": self.keyring})
+        self.mod.start()
+        self.addCleanup(self.mod.stop)
+        self.store = CredentialStore(service="org.furtag.FurTag.test.disabled")
+
+    def test_read_never_touches_keyring(self):
+        with patch.dict(os.environ, {"FURTAG_E621_API_KEY": "from-env"}):
+            self.assertEqual(self.store.get("e621_api_key"), "from-env")
+        self.store.load_all()
+        self.keyring.get_password.assert_not_called()
+
+    def test_migration_is_skipped(self):
+        self.assertFalse(self.store.needs_migration())
+        self.assertEqual(self.store.legacy_fields(), [])
+        self.keyring.get_password.assert_not_called()
+
+    def test_save_writes_the_env_file_not_the_keyring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".env")
+            with patch.dict(os.environ, {"FURTAG_ENV_FILE": path}):
+                errors = self.store.save_fields({
+                    "e621_api_key": "written key",
+                    "danbooru_username": "someone",
+                })
+                self.assertEqual(errors, [])
+                body = pathlib.Path(path).read_text()
+                # Values with spaces must survive `. ./.env` intact.
+                self.assertIn("FURTAG_E621_API_KEY='written key'", body)
+                self.assertIn("FURTAG_DANBOORU_USERNAME=someone", body)
+                # Readable only by the owner — this is plaintext on disk.
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+                # And the running process sees it immediately.
+                self.assertEqual(self.store.get("e621_api_key"), "written key")
+        self.keyring.set_password.assert_not_called()
+
+    def test_single_field_set_preserves_the_others(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".env")
+            with patch.dict(os.environ, {"FURTAG_ENV_FILE": path}):
+                self.store.save_fields({"e621_api_key": "first",
+                                        "sauce_nao_api_key": "second"})
+                self.store.set("danbooru_username", "third")
+                self.assertEqual(self.store.get("e621_api_key"), "first")
+                self.assertEqual(self.store.get("sauce_nao_api_key"), "second")
+                self.assertEqual(self.store.get("danbooru_username"), "third")
+
+    def test_status_explains_why(self):
+        usable, message = self.store.keyring_status()
+        self.assertFalse(usable)
+        self.assertIn("FURTAG_DISABLE_KEYRING", message)
+
+    def test_unset_switch_still_uses_keyring(self):
+        with patch.dict(os.environ, {"FURTAG_DISABLE_KEYRING": "0"}):
+            store = CredentialStore(service="org.furtag.FurTag.test.enabled")
+            self.keyring.get_password.return_value = None
+            store.get("e621_api_key")
+            self.keyring.get_password.assert_called_once()
