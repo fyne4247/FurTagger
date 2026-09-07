@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
     QProgressBar, QScrollArea, QSpinBox, QSplitter, QTabWidget, QTextEdit,
     QVBoxLayout, QWidget, QInputDialog, QFrame, QSizePolicy,
+    QStackedWidget,
 )
 
 
@@ -144,7 +145,8 @@ from furtag import (
     _normalize_pdf_meta, notify_info,
 )
 from furtag_settings import (
-    Settings, SettingsStore, RunOptions, ScanSummary, validate_run_preflight,
+    Settings, SettingsStore, RunOptions, ScanSummary, HydrusScanSettings,
+    normalize_hydrus_scan, validate_run_preflight,
     validate_output_patterns, SidecarPatternError, PACE_FLOORS,
     FLUFFLE_MATCH_CLASSES, FLUFFLE_REVIEW_MODES, DEFAULT_PDF_DPI,
     DEFAULT_PDF_ARCHIVAL_DPI, remember_scan_path,
@@ -202,6 +204,330 @@ class ScanWorker(QThread):
             self.bridge.finished.emit(summary)
         except Exception as e:
             self.bridge.failed.emit(str(e))
+
+
+class HydrusScanWorker(QThread):
+    """Runs one database scan off the UI thread, like ScanWorker for folders."""
+
+    def __init__(self, integrator: TagIntegrator, scan: HydrusScanSettings,
+                 cancel_event: threading.Event, bridge: QtEventBridge) -> None:
+        super().__init__()
+        self.integrator = integrator
+        self.scan = scan
+        self.cancel_event = cancel_event
+        self.bridge = bridge
+
+    def run(self) -> None:
+        try:
+            summary = self.integrator.scan_hydrus_db(
+                self.scan,
+                observer=QtObserver(self.bridge),
+                cancel_event=self.cancel_event,
+                use_terminal_display=False,
+            )
+            self.bridge.finished.emit(summary)
+        except Exception as e:
+            self.bridge.failed.emit(str(e))
+
+
+class HydrusScanPanel(QWidget):
+    """Selection and budget for a Hydrus database scan.
+
+    Lives on the Scan tab rather than in Settings because it is what you decide
+    immediately before pressing Start — the counterpart of choosing a folder.
+    The values still persist, so the panel reopens on the last scan's settings.
+    """
+
+    changed = Signal()
+
+    def __init__(self, scan: HydrusScanSettings, parent=None) -> None:
+        super().__init__(parent)
+        self._services: List[Tuple[str, str]] = []
+        self._build()
+        self.load_from(scan)
+
+    def _build(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(6)
+
+        # ── What to scan ────────────────────────────────────────────────────
+        what = QGroupBox("Which files")
+        wf = QFormLayout(what)
+        wf.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        domain_row = QHBoxLayout()
+        self.domain = QComboBox()
+        self.domain.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.domain.setMinimumContentsLength(24)
+        self.refresh_domains_btn = QPushButton("Refresh")
+        self.refresh_domains_btn.setToolTip(
+            "Ask Hydrus which file domains exist. Needs a working connection.")
+        domain_row.addWidget(self.domain, stretch=1)
+        domain_row.addWidget(self.refresh_domains_btn)
+        wf.addRow("File domain", domain_row)
+
+        self.max_tags = QSpinBox()
+        self.max_tags.setRange(0, 100_000)
+        self.max_tags.setSpecialValueText("no limit")
+        self.max_tags.setToolTip(
+            "Only look at files with fewer than this many tags — the usual way "
+            "to target files nothing has identified yet. 0 scans regardless of "
+            "tag count.")
+        wf.addRow("Fewer than N tags", self.max_tags)
+
+        self.tag_count_service = QLineEdit()
+        self.tag_count_service.setPlaceholderText(
+            "all services (or a service name, e.g. my tags)")
+        self.tag_count_service.setToolTip(
+            "Count tags in one service only. Leave empty to count them all.")
+        wf.addRow("Counting tags in", self.tag_count_service)
+
+        self.limit = QSpinBox()
+        self.limit.setRange(0, 1_000_000)
+        self.limit.setSpecialValueText("no cap")
+        self.limit.setToolTip(
+            "Hydrus applies this after every other filter, so the cap is spent "
+            "on files that actually matched. With scan markers on, the next "
+            "run continues past them rather than starting over.")
+        wf.addRow("Stop after N files", self.limit)
+
+        self.images_only = QCheckBox("Images only")
+        self.images_only.setToolTip(
+            "The boorus FurTag queries are image galleries, so video and PDFs "
+            "would spend lookups on certain misses.")
+        wf.addRow(self.images_only)
+
+        self.status_filter = QComboBox()
+        self.status_filter.addItem("Inbox and archive", "any")
+        self.status_filter.addItem("Inbox only", "inbox")
+        self.status_filter.addItem("Archive only", "archive")
+        wf.addRow("File status", self.status_filter)
+
+        self.extra_predicates = QTextEdit()
+        self.extra_predicates.setPlaceholderText(
+            "One Hydrus search predicate per line, e.g.\n"
+            "system:import time < 30 days ago\n"
+            "-system:has notes")
+        self.extra_predicates.setMaximumHeight(64)
+        self.extra_predicates.setToolTip(
+            "Anything you could type into a Hydrus search page. A predicate "
+            "Hydrus rejects fails the whole search, so it is reported rather "
+            "than skipped.")
+        wf.addRow("Also require", self.extra_predicates)
+        root.addWidget(what)
+
+        # ── Deleted duplicates ──────────────────────────────────────────────
+        dupes = QGroupBox("Deleted duplicates")
+        df = QFormLayout(dupes)
+        df.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        blurb = QLabel(
+            "A file the boorus don't recognise may sit in a duplicate group "
+            "with a file you deleted that they do. Hydrus keeps the MD5s of "
+            "files it no longer stores, so those tags can be recovered onto "
+            "the file you kept. Only exact duplicates are used — never "
+            "alternates, which are different artwork.")
+        blurb.setWordWrap(True)
+        df.addRow(blurb)
+
+        self.dupe_mode = QComboBox()
+        self.dupe_mode.addItem("Don't look them up", "off")
+        self.dupe_mode.addItem("Only when the file didn't match", "on_miss")
+        self.dupe_mode.addItem("Always", "always")
+        df.addRow("Look up", self.dupe_mode)
+
+        self.max_dupes = QSpinBox()
+        self.max_dupes.setRange(0, 1_000)
+        self.max_dupes.setSpecialValueText("all")
+        self.max_dupes.setToolTip(
+            "Cap the extra lookups one crowded duplicate group can cost.")
+        df.addRow("At most, per file", self.max_dupes)
+        root.addWidget(dupes)
+
+        # ── Bookkeeping ─────────────────────────────────────────────────────
+        book = QGroupBox("Bookkeeping")
+        bf = QFormLayout(book)
+        bf.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        self.mark_tags = QCheckBox("Mark scanned files with tags in Hydrus")
+        self.mark_tags.setToolTip(
+            "Writes furtag:scanned plus furtag:matched or furtag:nomatch. This "
+            "is how a capped scan continues through the database instead of "
+            "re-examining the same files, and unlike a hidden ledger you can "
+            "search and undo it inside Hydrus.")
+        bf.addRow(self.mark_tags)
+
+        self.state_prefix = QLineEdit()
+        self.state_prefix.setPlaceholderText("furtag")
+        bf.addRow("Tag namespace", self.state_prefix)
+
+        self.state_service = QLineEdit()
+        self.state_service.setPlaceholderText(
+            "the output tag service (or a name, e.g. my tags)")
+        self.state_service.setToolTip(
+            "A local tag service keeps bookkeeping out of the tags you share.")
+        bf.addRow("Marker tag service", self.state_service)
+
+        self.skip_scanned = QCheckBox("Skip files a previous scan marked")
+        bf.addRow(self.skip_scanned)
+
+        self.write_report = QCheckBox("Write a report for each run")
+        self.write_report.setToolTip(
+            "A JSONL line per file plus a text summary, saved beside "
+            "settings.json.")
+        bf.addRow(self.write_report)
+        root.addWidget(book)
+
+        # ── Budgets ─────────────────────────────────────────────────────────
+        budget = QGroupBox("Budget")
+        gf = QFormLayout(budget)
+        gf.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        self.dry_run = QCheckBox("Dry run — report only, write nothing")
+        self.dry_run.setToolTip(
+            "Bulk-tagging a live database is hard to undo. This runs every "
+            "lookup and writes the report without touching Hydrus.")
+        gf.addRow(self.dry_run)
+
+        self.time_budget = QSpinBox()
+        self.time_budget.setRange(0, 10_080)
+        self.time_budget.setSpecialValueText("unlimited")
+        self.time_budget.setSuffix(" min")
+        gf.addRow("Stop after", self.time_budget)
+
+        self.max_errors = QSpinBox()
+        self.max_errors.setRange(0, 10_000)
+        self.max_errors.setSpecialValueText("never")
+        gf.addRow("Stop after N failures in a row", self.max_errors)
+        root.addWidget(budget)
+
+        # Built here but deliberately not added to this layout: the host
+        # pins it outside the scroll area, because the query you are about to
+        # run is the one thing that must never be scrolled out of sight.
+        self.preview = QLabel()
+        self.preview.setWordWrap(True)
+        self.preview.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        root.addStretch()
+
+        for widget, signal in (
+                (self.domain, "currentIndexChanged"),
+                (self.max_tags, "valueChanged"),
+                (self.limit, "valueChanged"),
+                (self.images_only, "toggled"),
+                (self.status_filter, "currentIndexChanged"),
+                (self.dupe_mode, "currentIndexChanged"),
+                (self.mark_tags, "toggled"),
+                (self.skip_scanned, "toggled"),
+                (self.dry_run, "toggled"),
+        ):
+            getattr(widget, signal).connect(self._on_changed)
+        for edit in (self.tag_count_service, self.state_prefix,
+                     self.state_service):
+            edit.textChanged.connect(self._on_changed)
+        self.extra_predicates.textChanged.connect(self._on_changed)
+        self.mark_tags.toggled.connect(self._update_enabled)
+        self.dupe_mode.currentIndexChanged.connect(self._update_enabled)
+
+    def _on_changed(self, *_args) -> None:
+        self.changed.emit()
+
+    def _update_enabled(self, *_args) -> None:
+        marking = self.mark_tags.isChecked()
+        for widget in (self.state_prefix, self.state_service,
+                       self.skip_scanned):
+            widget.setEnabled(marking)
+        self.max_dupes.setEnabled(self.dupe_mode.currentData() != "off")
+
+    def has_services(self) -> bool:
+        """Whether Hydrus has been asked what file domains exist."""
+        return bool(self._services)
+
+    def set_services(self, services: List[Tuple[str, str]]) -> None:
+        """Populate the domain list, keeping the current selection if it survives."""
+        wanted = self.domain.currentData() or ""
+        self._services = list(services)
+        self.domain.blockSignals(True)
+        self.domain.clear()
+        self.domain.addItem("Hydrus default (all local files)", "")
+        for name, key in self._services:
+            self.domain.addItem(name, key)
+        index = self.domain.findData(wanted)
+        self.domain.setCurrentIndex(max(0, index))
+        self.domain.blockSignals(False)
+        self._on_changed()
+
+    def load_from(self, scan: HydrusScanSettings) -> None:
+        if scan.file_service_key and not self._services:
+            # Remember the saved domain even before Hydrus has been asked what
+            # exists, so reopening the panel offline does not silently reset it.
+            self._services = [
+                (scan.file_service_name or scan.file_service_key,
+                 scan.file_service_key)]
+        self.set_services(self._services)
+        index = self.domain.findData(scan.file_service_key or "")
+        self.domain.setCurrentIndex(max(0, index))
+        self.max_tags.setValue(scan.max_tag_count)
+        self.tag_count_service.setText(scan.tag_count_service)
+        self.limit.setValue(scan.limit)
+        self.images_only.setChecked(scan.images_only)
+        status = ("inbox" if scan.inbox_only
+                  else "archive" if scan.archive_only else "any")
+        self.status_filter.setCurrentIndex(
+            max(0, self.status_filter.findData(status)))
+        self.extra_predicates.setPlainText("\n".join(scan.extra_predicates))
+        mode = (scan.deleted_duplicates_when
+                if scan.include_deleted_duplicates else "off")
+        self.dupe_mode.setCurrentIndex(max(0, self.dupe_mode.findData(mode)))
+        self.max_dupes.setValue(scan.max_deleted_duplicates)
+        self.mark_tags.setChecked(scan.mark_state_tags)
+        self.state_prefix.setText(scan.state_tag_prefix)
+        self.state_service.setText(scan.state_tag_service)
+        self.skip_scanned.setChecked(scan.skip_already_scanned)
+        self.write_report.setChecked(scan.write_report)
+        self.dry_run.setChecked(scan.dry_run)
+        self.time_budget.setValue(scan.time_budget_minutes)
+        self.max_errors.setValue(scan.max_consecutive_errors)
+        self._update_enabled()
+
+    def to_scan_settings(self) -> HydrusScanSettings:
+        scan = HydrusScanSettings()
+        scan.file_service_key = self.domain.currentData() or ""
+        scan.file_service_name = (
+            self.domain.currentText() if scan.file_service_key else "")
+        scan.max_tag_count = self.max_tags.value()
+        scan.tag_count_service = self.tag_count_service.text().strip()
+        scan.limit = self.limit.value()
+        scan.images_only = self.images_only.isChecked()
+        status = self.status_filter.currentData()
+        scan.inbox_only = status == "inbox"
+        scan.archive_only = status == "archive"
+        scan.extra_predicates = [
+            line.strip()
+            for line in self.extra_predicates.toPlainText().splitlines()
+            if line.strip()]
+        mode = self.dupe_mode.currentData()
+        scan.include_deleted_duplicates = mode != "off"
+        scan.deleted_duplicates_when = mode if mode != "off" else "on_miss"
+        scan.max_deleted_duplicates = self.max_dupes.value()
+        scan.mark_state_tags = self.mark_tags.isChecked()
+        scan.state_tag_prefix = self.state_prefix.text().strip() or "furtag"
+        scan.state_tag_service = self.state_service.text().strip()
+        scan.skip_already_scanned = (
+            self.skip_scanned.isChecked() and scan.mark_state_tags)
+        scan.write_report = self.write_report.isChecked()
+        scan.dry_run = self.dry_run.isChecked()
+        scan.time_budget_minutes = self.time_budget.value()
+        scan.max_consecutive_errors = self.max_errors.value()
+        normalize_hydrus_scan(scan)
+        return scan
+
+    def set_preview(self, predicates: List[str]) -> None:
+        query = " AND ".join(predicates) if predicates else "everything"
+        domain = self.domain.currentText()
+        text = f"<b>Hydrus query:</b> {query}<br><b>Domain:</b> {domain}"
+        if self.dry_run.isChecked():
+            text += "<br><b>Dry run — nothing will be written.</b>"
+        self.preview.setText(text)
 
 
 class DiscoverWorker(QThread):
@@ -908,6 +1234,10 @@ class SettingsPanel(QWidget):
         """Keep hidden persistent history in sync with the main window."""
         self._initial.history.recent_scan_paths = list(paths)
 
+    def set_hydrus_scan(self, scan: HydrusScanSettings) -> None:
+        """Database-scan settings are edited on the Scan tab, not here."""
+        self._initial.hydrus_scan = scan
+
     def _rotate_hydrus_profile_uuid(self) -> None:
         answer = QMessageBox.question(
             self, "New Hydrus database?",
@@ -985,7 +1315,7 @@ class MainWindow(QMainWindow):
 
         self.folder: Optional[Path] = None
         self.inventory: Optional[dict] = None
-        self.scan_worker: Optional[ScanWorker] = None
+        self.scan_worker: Optional[QThread] = None  # folder or Hydrus scan
         self.discover_workers: List[DiscoverWorker] = []
         self._folder_generation = 0
         self.cancel_event = threading.Event()
@@ -997,6 +1327,8 @@ class MainWindow(QMainWindow):
         self.bridge.inventory_failed.connect(self._on_inventory_failed)
         self._closing = False
         self._review_count = 0
+        # Read while the UI is built, so it must exist before _build_ui().
+        self._last_report_path = ""
 
         self._build_ui()
         _fit_window_to_screen(self, prefer_w=900, prefer_h=640)
@@ -1099,6 +1431,26 @@ class MainWindow(QMainWindow):
         scan_lay.setContentsMargins(4, 8, 4, 4)
         scan_lay.setSpacing(6)
 
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("Scan:"))
+        self.scan_source = QComboBox()
+        self.scan_source.addItem("A folder on disk", "folder")
+        self.scan_source.addItem("The Hydrus database", "hydrus")
+        self.scan_source.setToolTip(
+            "A folder scan matches by hash and then perceptually, and writes "
+            "sidecars or imports. A database scan works on files Hydrus "
+            "already has: hash lookups only, tagged in place.")
+        self.scan_source.currentIndexChanged.connect(self._on_scan_source_changed)
+        source_row.addWidget(self.scan_source)
+        source_row.addStretch()
+        scan_lay.addLayout(source_row)
+
+        self.target_stack = QStackedWidget()
+        folder_page = QWidget()
+        folder_lay = QVBoxLayout(folder_page)
+        folder_lay.setContentsMargins(0, 0, 0, 0)
+        folder_lay.setSpacing(6)
+
         folder_row = QHBoxLayout()
         self.drop = DropFolderLabel()
         self.drop.folder_dropped.connect(self._set_folder)
@@ -1115,7 +1467,7 @@ class MainWindow(QMainWindow):
         folder_row.addWidget(self.drop, stretch=1)
         folder_row.addWidget(self.browse_btn)
         folder_row.addWidget(self.index_btn)
-        scan_lay.addLayout(folder_row)
+        folder_lay.addLayout(folder_row)
 
         recent_row = QHBoxLayout()
         recent_row.addWidget(QLabel("Recent:"))
@@ -1131,12 +1483,12 @@ class MainWindow(QMainWindow):
         self.clear_recents_btn.clicked.connect(self._clear_recent_folders)
         recent_row.addWidget(self.recent_folders, stretch=1)
         recent_row.addWidget(self.clear_recents_btn)
-        scan_lay.addLayout(recent_row)
+        folder_lay.addLayout(recent_row)
         self._refresh_recent_folders()
 
         self.inventory_label = QLabel("Choose a folder to scan.")
         self.inventory_label.setWordWrap(True)
-        scan_lay.addWidget(self.inventory_label)
+        folder_lay.addWidget(self.inventory_label)
 
         # Session options — wrap on narrow windows via a flow-like row
         opts = QHBoxLayout()
@@ -1152,7 +1504,23 @@ class MainWindow(QMainWindow):
         opts.addWidget(self.opt_import_unmatched)
         opts.addWidget(self.opt_sync_sidecars)
         opts.addStretch()
-        scan_lay.addLayout(opts)
+        folder_lay.addLayout(opts)
+        self.target_stack.addWidget(folder_page)
+
+        self.hydrus_panel = HydrusScanPanel(self.settings.hydrus_scan)
+        self.hydrus_panel.changed.connect(self._refresh_scan_preview)
+        self.hydrus_panel.refresh_domains_btn.clicked.connect(
+            self._refresh_hydrus_domains)
+        self.hydrus_scroll = _wrap_scroll(self.hydrus_panel)
+        # The panel's own width is what it needs; only vertical scrolling
+        # should ever appear, or the group boxes get a spurious h-scrollbar.
+        self.hydrus_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.target_stack.addWidget(self.hydrus_scroll)
+        self._scan_lay = scan_lay
+        scan_lay.addWidget(self.target_stack)
+        self.hydrus_panel.preview.setParent(scan)
+        scan_lay.addWidget(self.hydrus_panel.preview)
 
         # Progress cards
         prog = QHBoxLayout()
@@ -1203,6 +1571,7 @@ class MainWindow(QMainWindow):
         bottom.setStretchFactor(0, 1)
         bottom.setStretchFactor(1, 2)
         bottom.setSizes([80, 140])
+        self._bottom_splitter = bottom
         scan_lay.addWidget(bottom, stretch=1)
 
         self.summary_label = QLabel("")
@@ -1216,6 +1585,11 @@ class MainWindow(QMainWindow):
         self.another_btn = QPushButton("Scan Another Folder")
         self.reveal_btn = QPushButton("Reveal Results")
         self.reset_btn = QPushButton("Reset…")
+        self.open_report_btn = QPushButton("Open Report")
+        self.open_report_btn.setToolTip(
+            "Open the summary this database scan wrote.")
+        self.open_report_btn.setEnabled(False)
+        self.open_report_btn.clicked.connect(self._open_scan_report)
         self.another_btn.setToolTip(
             "Keep current settings and pick a different folder to scan.")
         self.reveal_btn.setToolTip(
@@ -1231,7 +1605,7 @@ class MainWindow(QMainWindow):
         self.reveal_btn.clicked.connect(self._reveal)
         self.reset_btn.clicked.connect(self._reset)
         for b in (self.start_btn, self.cancel_btn, self.another_btn,
-                  self.reveal_btn, self.reset_btn):
+                  self.reveal_btn, self.reset_btn, self.open_report_btn):
             actions.addWidget(b)
         scan_lay.addLayout(actions)
 
@@ -1242,6 +1616,149 @@ class MainWindow(QMainWindow):
         self.settings_panel.source_settings_changed.connect(
             self._refresh_source_status)
         self.main_tabs.addTab(self.settings_panel, "Settings")
+
+        # Runs last: it toggles widgets from both the scan tab and the panel.
+        self._on_scan_source_changed()
+
+    # ── Scan source ─────────────────────────────────────────────────────────
+
+    def _scan_source(self) -> str:
+        return self.scan_source.currentData() or "folder"
+
+    def _on_scan_source_changed(self, *_args) -> None:
+        hydrus = self._scan_source() == "hydrus"
+        self.target_stack.setCurrentIndex(1 if hydrus else 0)
+        self._scan_lay.setStretchFactor(self.target_stack, 3 if hydrus else 0)
+        self._scan_lay.setStretchFactor(self._bottom_splitter, 1 if hydrus else 3)
+        self.target_stack.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding if hydrus
+            else QSizePolicy.Policy.Maximum)
+        # A database scan is hash-tier only, and its results live in Hydrus —
+        # so the perceptual card and every folder-shaped action would be lying.
+        self.perc_card["box"].setVisible(not hydrus)
+        self.review_badge.setVisible(not hydrus)
+        for button in (self.another_btn, self.reveal_btn, self.reset_btn):
+            button.setVisible(not hydrus)
+        self.open_report_btn.setVisible(hydrus)
+        self.hydrus_panel.preview.setVisible(hydrus)
+        self.open_report_btn.setEnabled(bool(self._last_report_path))
+        self.summary_label.setText("")
+        if hydrus:
+            self.start_btn.setEnabled(True)
+            if not self.hydrus_panel.has_services() and self.integrator.has_hydrus:
+                self._refresh_hydrus_domains()
+            self._refresh_scan_preview()
+        else:
+            self.start_btn.setEnabled(bool(self.inventory))
+
+    def _refresh_scan_preview(self) -> None:
+        if self._scan_source() != "hydrus":
+            return
+        scan = self.hydrus_panel.to_scan_settings()
+        self.hydrus_panel.set_preview(
+            self.integrator.hydrus_scan_predicates(scan))
+
+    def _refresh_hydrus_domains(self) -> None:
+        """Ask Hydrus which file domains exist. Local API, so done inline."""
+        if not self.integrator.has_hydrus:
+            QMessageBox.information(
+                self, "Hydrus", "Connect to Hydrus first "
+                "(Hydrus → Credentials…, then Reconnect).")
+            return
+        QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            services = self.integrator.hydrus_file_services()
+        finally:
+            QGuiApplication.restoreOverrideCursor()
+        if not services:
+            self._add_issue("Hydrus returned no file domains.")
+            return
+        self.hydrus_panel.set_services(services)
+        self._log(f"Hydrus: {len(services)} file domain(s) available.")
+
+    def _start_hydrus_scan(self) -> None:
+        if self.scan_worker and self.scan_worker.isRunning():
+            return
+        s = self.settings_panel.to_settings()
+        scan = self.hydrus_panel.to_scan_settings()
+        s.hydrus_scan = scan
+        # Keep the panel's copy authoritative so Save as default persists it.
+        self.settings_panel.set_hydrus_scan(scan)
+        self.settings.hydrus_scan = scan
+        self.integrator.apply_settings(s)
+        self.integrator.cancel_event.clear()
+        self.integrator.load_credentials_from_store(self.cred_store)
+        self._refresh_source_status()
+
+        problems: List[str] = []
+        if not self.integrator.has_hydrus:
+            problems.append(
+                "Hydrus is not connected. A database scan reads from and "
+                "writes to Hydrus, so there is nothing to scan without it.")
+        elif not self.integrator.hydrus_can_search_files:
+            problems.append(
+                "The Hydrus access key needs the 'Search for and Fetch "
+                "Files' permission.")
+        if not self.integrator.enabled_hash_services():
+            problems.append(
+                "No exact-hash source is enabled and available. Enable e621, "
+                "InkBunny, Danbooru, or Gelbooru and check its credentials.")
+        if (scan.include_deleted_duplicates
+                and not self.integrator.hydrus_can_manage_relationships):
+            self._add_issue(
+                "Deleted-duplicate lookups need the Hydrus 'Manage File "
+                "Relationships' permission; kept files will still be scanned.")
+        if problems:
+            QMessageBox.warning(self, "Cannot start", "\n\n".join(problems))
+            return
+
+        if not scan.dry_run and scan.limit == 0:
+            answer = QMessageBox.question(
+                self, "Scan the whole domain?",
+                "No file cap is set, so this will look up every matching file "
+                "in the domain and write tags to Hydrus as it goes.\n\n"
+                "Consider a dry run, or a cap, for the first pass. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        self.cancel_event = threading.Event()
+        self._set_running(True)
+        self.summary_label.setText("")
+        self._set_source_totals({})
+        self.issues.clear()
+        self._last_report_path = ""
+        self.open_report_btn.setEnabled(False)
+        self._log(
+            "Starting Hydrus database scan"
+            + (" (dry run)" if scan.dry_run else "")
+            + f" — {scan.file_service_name or 'default domain'}")
+        self.scan_worker = HydrusScanWorker(
+            self.integrator, scan, self.cancel_event, self.bridge)
+        self.scan_worker.start()
+
+    def _hydrus_summary_text(self, summary: ScanSummary) -> str:
+        label = "CANCELLED" if summary.cancelled else "DONE"
+        verb = "would tag" if self.hydrus_panel.dry_run.isChecked() else "tagged"
+        parts = [
+            f"{label} ({summary.stop_reason or 'completed'}): "
+            f"{summary.scanned} looked up · {verb} {summary.tagged} · "
+            f"no match {summary.unmatched} · retryable errors "
+            f"{summary.errors} · skipped {summary.skipped}"
+        ]
+        if summary.deleted_duplicates_examined:
+            parts.append(
+                f"{summary.matched_via_deleted_duplicate} matched only via a "
+                f"deleted duplicate ({summary.deleted_duplicates_examined} "
+                f"looked up)")
+        return " · ".join(parts)
+
+    def _open_scan_report(self) -> None:
+        if not self._last_report_path:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self._last_report_path))
 
     def _make_track_card(self, title: str) -> dict:
         box = QGroupBox(title)
@@ -1483,6 +2000,9 @@ class MainWindow(QMainWindow):
         self.settings_panel.setEnabled(not indexing)
 
     def _start(self) -> None:
+        if self._scan_source() == "hydrus":
+            self._start_hydrus_scan()
+            return
         if not self.folder:
             QMessageBox.information(self, "Start", "Choose a folder first.")
             return
@@ -1553,6 +2073,8 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, running: bool) -> None:
         self.start_btn.setEnabled(not running)
+        self.scan_source.setEnabled(not running)
+        self.hydrus_panel.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
         self.reset_btn.setEnabled(not running)
         self.settings_panel.setEnabled(not running)
@@ -1636,6 +2158,16 @@ class MainWindow(QMainWindow):
     def _on_finished(self, summary: ScanSummary) -> None:
         self._set_running(False)
         self._set_source_totals(summary.source_hits)
+        if self._scan_source() == "hydrus":
+            self.summary_label.setText(self._hydrus_summary_text(summary))
+            self._log(self.summary_label.text())
+            self._last_report_path = summary.report_path
+            self.open_report_btn.setEnabled(bool(summary.report_path))
+            if summary.report_path:
+                self._log(f"Report: {summary.report_path}")
+            if self._closing and not self.discover_workers:
+                self.close()
+            return
         label = "CANCELLED" if summary.cancelled else "DONE"
         self.summary_label.setText(
             f"{label}: tagged {summary.tagged} · unmatched {summary.unmatched} · "
