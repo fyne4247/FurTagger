@@ -41,6 +41,9 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
 - **Resumable sidecar sync** — push existing `<file>.txt` / `<file>.urls.txt` into Hydrus without re-searching; successful payloads are checkpointed in the ledger.
 - **Configurable live result pages** — New Imports, Newly Tagged, and Duplicate Tagged can update while a scan is running (10-second default cadence) or be created at the end. Each page has its own enabled state, name, and limit; Already Tagged is a separate one-shot pre-scan page.
 - **Deleted-file duplicates** — when import hits a previously deleted file, tags/URLs can be applied to current Hydrus duplicate-group members (same URL policy as a normal push). FurTag retains the original SHA and target hashes. A successful empty relationship query is terminal for that Hydrus database; missing permission or API failure remains retryable, and a policy-disabled result reopens if the option is enabled later.
+- **Database scan (hash tier)** — scan files already in Hydrus instead of a folder. Hydrus supplies each file's MD5 without transferring a byte, so the four-booru exact-hash fan-out runs unchanged and tags/URLs/notes go straight back onto the file. Selection is a Hydrus query: file domain, `system:number of tags < N`, images only, inbox/archive, free-form predicates, and a `system:limit` cap applied last. Time and consecutive-failure budgets, plus a dry-run mode that writes nothing. Perceptual matching is not part of this mode — run it over a folder for that.
+- **Deleted duplicates recovered onto the kept file** — a kept file no booru recognises may share a duplicate group with a deleted file they do. Hydrus keeps the MD5s of files it no longer stores, so those are free extra lookups whose tags belong to the surviving file. Only relationship `8` (duplicate) is followed; alternates are different artwork and are never used. Recovered files appear on the Duplicate Tagged page.
+- **Scan bookkeeping as tags** — a database scan marks `furtag:scanned` plus `furtag:matched`/`furtag:nomatch` in a configurable tag service and excludes `-furtag:scanned` next run, so a capped scan walks the database across runs. Files whose lookups errored stay unmarked and are retried. Each run writes a JSONL report and a text summary beside `settings.json`.
 - **Database-scoped checkpoints** — Hydrus completion state is bound to a persisted, non-secret database identity plus API origin. If the database is replaced at the same address, use **Hydrus → Use a new/replaced Hydrus database…** to rotate the identity and revalidate old decisions.
 
 ### Reliability
@@ -94,6 +97,18 @@ python3 -m venv .venv
 # or
 .venv/bin/python furtag.py
 ```
+
+At the start of each pass the CLI asks whether to scan a folder or the Hydrus
+database. The database scan is hash-tier only and configures itself
+interactively — file domain, tag-count ceiling, file cap, deleted-duplicate
+handling, and a dry run — defaulting to whatever the last scan used, so pressing
+Enter throughout continues where the previous one stopped.
+
+In the GUI the same choice is the **Scan:** selector at the top of the Scan tab.
+Switching to **The Hydrus database** replaces the folder picker with the scan's
+options and shows the exact Hydrus query it will run; progress, issues, the run
+log, and Cancel are shared with folder scans. The perceptual card is hidden
+because this mode does not use it.
 
 Hydrus review pages are configured persistently on the GUI's **Settings →
 Hydrus** tab. The CLI uses those saved settings; it no longer asks for a shared
