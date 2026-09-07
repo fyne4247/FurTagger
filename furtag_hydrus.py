@@ -28,11 +28,21 @@ from furtag_urls import UrlWritePolicy, is_enrichable_post_url, partition_urls
 
 if TYPE_CHECKING:
     from furtag import FileItem, Ledger, LedgerManager
+    from furtag_settings import HydrusScanSettings
 
 # Keep batch sizes next to the API that consumes them.
 HYDRUS_HASH_LOOKUP_BATCH = 256  # well below the Client API's 2 MB GET limit
 HYDRUS_PAGE_BATCH = 256         # hashes per manage_pages call
 HYDRUS_RELATIONSHIP_DUPLICATES = "8"  # Hydrus duplicate-status enum; "3" = alternates
+# Hydrus service types that name a searchable local file domain: 2 is a
+# concrete local domain ("my files" and any the user added), 15 is "all local
+# files", 21 is "all my files". Deliberately excluded: 0 is a *tag* repository
+# (which otherwise shows up in the list looking like a domain), 1 is a remote
+# file repository whose files need not be here, and 14 is the trash.
+HYDRUS_FILE_SERVICE_TYPES = (2, 15, 21)
+
+_SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
+_MD5_RE = re.compile(r"[0-9a-fA-F]{32}")
 
 
 @dataclass
@@ -482,6 +492,244 @@ class HydrusMixin:
                        f"normal imports for this run ({e}).")
                 return None
         return current
+
+
+
+    # ── Database scan (hash tier only) ───────────────────────────────────────
+
+    def hydrus_file_services(self) -> List[Tuple[str, str]]:
+        """(display name, service_key) for every searchable local file domain.
+
+        Tag repositories and remote file repositories are filtered out: a scan
+        can only look up and tag files this client actually holds.
+        """
+        if not self.has_hydrus:
+            return []
+        try:
+            r = self.session.get(
+                f"{self.hydrus_api_url}/get_services",
+                headers=self._hydrus_headers(), timeout=10)
+            r.raise_for_status()
+            data = r.json()
+        except (requests.RequestException, ValueError) as e:
+            _notify(f"⚠️  Hydrus: couldn't list file services ({e}).")
+            return []
+        services = data.get("services_v2")
+        if isinstance(services, list):
+            entries = [(s.get("name") or "", s.get("type"),
+                        s.get("service_key") or "")
+                       for s in services if isinstance(s, dict)]
+        else:
+            legacy = data.get("services") or {}
+            entries = [(name, (info or {}).get("type"),
+                        (info or {}).get("service_key") or "")
+                       for name, info in legacy.items()]
+        return [(name, key) for name, typ, key in entries
+                if key and typ in HYDRUS_FILE_SERVICE_TYPES]
+
+    def hydrus_scan_predicates(self, scan: "HydrusScanSettings") -> List[str]:
+        """Translate a scan's selection settings into Hydrus search predicates.
+
+        Everything expressible as a predicate belongs here rather than in a
+        client-side filter: Hydrus applies ``system:limit`` after the rest of
+        the query, so a capped scan spends its budget on files that actually
+        match instead of discarding most of what it fetched.
+        """
+        predicates: List[str] = []
+        if scan.images_only:
+            # The hash tier is MD5-exact and the boorus FurTag queries are
+            # image galleries; video and PDFs would burn lookups on misses.
+            predicates.append("system:filetype = image")
+        if scan.max_tag_count > 0:
+            service = scan.tag_count_service.strip()
+            scope = f" ({service})" if service else ""
+            predicates.append(
+                f"system:number of tags{scope} < {scan.max_tag_count}")
+        if scan.inbox_only:
+            predicates.append("system:inbox")
+        elif scan.archive_only:
+            predicates.append("system:archive")
+        if scan.skip_already_scanned and scan.mark_state_tags:
+            predicates.append(f"-{self.hydrus_scan_tag(scan, 'scanned')}")
+        predicates.extend(scan.extra_predicates)
+        if scan.limit > 0:
+            # Last, and only once: a second system:limit in extra_predicates
+            # would make which one wins a Hydrus implementation detail.
+            if not any(p.replace(" ", "").startswith("system:limit")
+                       for p in predicates):
+                predicates.append(f"system:limit = {scan.limit}")
+        return predicates
+
+    @staticmethod
+    def hydrus_scan_tag(scan: "HydrusScanSettings", state: str) -> str:
+        """The namespaced bookkeeping tag for one scan outcome."""
+        return f"{scan.state_tag_prefix}:{state}"
+
+    def hydrus_scan_search(self, scan: "HydrusScanSettings") -> List[str]:
+        """SHA-256s of the current files this scan should look up.
+
+        Raises RuntimeError rather than degrading: an empty result from a
+        broken query is indistinguishable from a genuinely empty domain, and
+        silently "scanning nothing" is the worst possible failure here.
+        """
+        if not self.has_hydrus:
+            raise RuntimeError("Hydrus is not configured.")
+        if not self.hydrus_can_search_files:
+            raise RuntimeError(
+                "The Hydrus access key needs the 'Search for and Fetch Files' "
+                "permission to scan the database.")
+        params: Dict[str, str] = {
+            "tags": json.dumps(self.hydrus_scan_predicates(scan)),
+            "return_hashes": "true",
+            "return_file_ids": "false",
+            "file_sort_type": str(scan.sort_type),
+            "file_sort_asc": "true" if scan.sort_ascending else "false",
+        }
+        if scan.file_service_key:
+            params["file_service_key"] = scan.file_service_key
+        try:
+            r = self.session.get(
+                f"{self.hydrus_api_url}/get_files/search_files",
+                headers=self._hydrus_headers(), params=params, timeout=120)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+            hashes = r.json().get("hashes") or []
+        except (requests.RequestException, ValueError) as e:
+            raise RuntimeError(f"Hydrus search failed: {e}") from e
+        return [h.lower() for h in hashes
+                if isinstance(h, str) and _SHA256_RE.fullmatch(h)]
+
+    def hydrus_duplicate_members(
+            self, hashes: List[str]) -> Dict[str, List[str]]:
+        """Map each hash to its exact-duplicate group members.
+
+        Only relationship "8" is followed. Hydrus's "3" is *alternates* —
+        recolours, WIPs, and edits — which are different artwork, so their
+        booru tags would be wrong for the file being scanned.
+
+        A failed lookup yields no members for that batch rather than raising;
+        duplicate expansion is an enhancement, and losing it must not abort a
+        scan whose primary hashes are perfectly good.
+        """
+        if not (self.has_hydrus and self.hydrus_can_manage_relationships):
+            return {}
+        wanted = [h for h in hashes if _SHA256_RE.fullmatch(h or "")]
+        out: Dict[str, List[str]] = {}
+        for offset in range(0, len(wanted), HYDRUS_HASH_LOOKUP_BATCH):
+            batch = wanted[offset:offset + HYDRUS_HASH_LOOKUP_BATCH]
+            try:
+                r = self.session.get(
+                    f"{self.hydrus_api_url}/manage_file_relationships/"
+                    "get_file_relationships",
+                    headers=self._hydrus_headers(),
+                    params={"hashes": json.dumps(batch)}, timeout=60)
+                if r.status_code != 200:
+                    raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+                payload = r.json().get("file_relationships") or {}
+            except (requests.RequestException, ValueError, RuntimeError) as e:
+                self._notify_repeated_issue(
+                    "hydrus_relationships",
+                    "Hydrus duplicate-relationship lookups",
+                    f"⚠️  Hydrus: duplicate lookup failed for a batch of "
+                    f"{len(batch)} files ({e}); scanning them without their "
+                    f"deleted duplicates.")
+                continue
+            for file_hash, relations in payload.items():
+                if not isinstance(relations, dict):
+                    continue
+                members = sorted({
+                    h.lower() for h in
+                    relations.get(HYDRUS_RELATIONSHIP_DUPLICATES) or []
+                    if isinstance(h, str) and _SHA256_RE.fullmatch(h)
+                    and h.lower() != file_hash.lower()})
+                if members:
+                    out[file_hash.lower()] = members
+        return out
+
+    def hydrus_md5_map(self, hashes: Iterable[str]) -> Dict[str, str]:
+        """SHA-256 → MD5 for any hash Hydrus knows, deleted files included.
+
+        Hydrus keeps the non-SHA hashes of files it no longer stores, which is
+        exactly what makes a deleted duplicate worth looking up at all.
+        """
+        if not self.has_hydrus:
+            return {}
+        wanted = sorted({h.lower() for h in hashes
+                         if isinstance(h, str) and _SHA256_RE.fullmatch(h)})
+        out: Dict[str, str] = {}
+        for offset in range(0, len(wanted), HYDRUS_HASH_LOOKUP_BATCH):
+            batch = wanted[offset:offset + HYDRUS_HASH_LOOKUP_BATCH]
+            try:
+                r = self.session.get(
+                    f"{self.hydrus_api_url}/get_files/file_hashes",
+                    headers=self._hydrus_headers(),
+                    params={
+                        "hashes": json.dumps(batch),
+                        "source_hash_type": "sha256",
+                        "desired_hash_type": "md5",
+                    }, timeout=60)
+                if r.status_code != 200:
+                    raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+                mapping = r.json().get("hashes") or {}
+            except (requests.RequestException, ValueError, RuntimeError) as e:
+                self._notify_repeated_issue(
+                    "hydrus_md5_map", "Hydrus MD5 lookups",
+                    f"⚠️  Hydrus: MD5 lookup failed for a batch of "
+                    f"{len(batch)} files ({e}).")
+                continue
+            for sha256, md5 in mapping.items():
+                if (isinstance(sha256, str) and isinstance(md5, str)
+                        and _MD5_RE.fullmatch(md5)):
+                    out[sha256.lower()] = md5.lower()
+        return out
+
+    def hydrus_scan_state_service(self, scan: "HydrusScanSettings") -> str:
+        """Resolve (and memoise) the tag service the scan writes markers to."""
+        if not scan.mark_state_tags:
+            return ""
+        requested = scan.state_tag_service.strip()
+        if not requested:
+            return self.hydrus_tag_service_key
+        cached = getattr(self, "_hydrus_scan_state_key", None)
+        if isinstance(cached, tuple) and cached[0] == requested:
+            return cached[1]
+        try:
+            key = self._hydrus_resolve_tag_service(requested)
+        except (requests.RequestException, ValueError) as e:
+            _notify(f"⚠️  Hydrus: couldn't resolve scan tag service "
+                   f"'{requested}' ({e}); using the output tag service.")
+            key = self.hydrus_tag_service_key
+        if not key:
+            _notify(f"⚠️  Hydrus tag service '{requested}' not found; scan "
+                   f"markers go to the output tag service instead.")
+            key = self.hydrus_tag_service_key
+        self._hydrus_scan_state_key = (requested, key)
+        return key
+
+    def hydrus_mark_scan_state(
+            self, file_hash: str, tags: Set[str],
+            scan: "HydrusScanSettings") -> None:
+        """Write this scan's bookkeeping tags for one file.
+
+        These are the scan's resume record: ``-furtag:scanned`` in the next
+        run's query is what makes a capped scan walk the database instead of
+        re-examining its first N files forever. Unlike the ledger they live in
+        Hydrus, so the user can see, search, and undo them.
+        """
+        service_key = self.hydrus_scan_state_service(scan)
+        if not (service_key and tags):
+            return
+        body = {
+            "hash": file_hash,
+            "service_keys_to_tags": {service_key: sorted(tags)},
+            # Bookkeeping, not content: if the user deleted "furtag:nomatch"
+            # by hand they meant it, and re-adding it would fight them.
+            "override_previously_deleted_mappings": False,
+        }
+        r = self._hydrus_post("add_tags/add_tags", body, 30)
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"scan marker add_tags HTTP {r.status_code}: {r.text[:200]}")
 
 
     def _sidecar_sync_signature(
