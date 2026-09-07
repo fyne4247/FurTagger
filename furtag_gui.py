@@ -1104,8 +1104,17 @@ class MainWindow(QMainWindow):
         self.drop.folder_dropped.connect(self._set_folder)
         self.browse_btn = QPushButton("Browse…")
         self.browse_btn.clicked.connect(self._browse_folder)
+        self.index_btn = QPushButton("Index")
+        self.index_btn.setToolTip(
+            "Count what is in this folder so a scan can start. Runs by itself "
+            "when you pick a folder; the folder restored at launch waits for "
+            "you to press this, so a large library does not tie up the window "
+            "on every start.")
+        self.index_btn.setEnabled(False)
+        self.index_btn.clicked.connect(self._begin_discovery)
         folder_row.addWidget(self.drop, stretch=1)
         folder_row.addWidget(self.browse_btn)
+        folder_row.addWidget(self.index_btn)
         scan_lay.addLayout(folder_row)
 
         recent_row = QHBoxLayout()
@@ -1302,7 +1311,7 @@ class MainWindow(QMainWindow):
         for raw in self.settings.history.recent_scan_paths:
             path = Path(raw)
             if path.is_dir():
-                self._set_folder(str(path))
+                self._set_folder(str(path), auto_index=False)
                 return
 
     def _remember_folder(self, folder: Path) -> None:
@@ -1353,7 +1362,10 @@ class MainWindow(QMainWindow):
             return
         self._set_folder(str(path))
 
-    def _set_folder(self, path: str) -> None:
+    def _set_folder(self, path: str, *, auto_index: bool = True) -> None:
+        """Select *path*. With ``auto_index=False`` the folder is only shown —
+        indexing waits for the Index button. Startup uses that so restoring the
+        last folder cannot grey out the whole window before it is usable."""
         if self.scan_worker and self.scan_worker.isRunning():
             QMessageBox.information(
                 self, "Scan running",
@@ -1366,11 +1378,29 @@ class MainWindow(QMainWindow):
                 f"Cannot scan this folder because it is not available:\n{folder}")
             return
         self.folder = folder
+        # Bump first so any in-flight worker for the previous folder is stale.
         self._folder_generation += 1
-        generation = self._folder_generation
         self.drop.setText(str(self.folder))
         self._remember_folder(self.folder)
         self._refresh_review_badge()
+        self.inventory = None
+        self.start_btn.setEnabled(False)
+        if not auto_index:
+            self.inventory_label.setText(
+                "Not indexed yet — press Index to count what is here.")
+            self.index_btn.setEnabled(True)
+            return
+        self._begin_discovery()
+
+    def _begin_discovery(self) -> None:
+        """Index the selected folder on a worker thread."""
+        if not self.folder or not self.folder.is_dir():
+            return
+        if self.scan_worker and self.scan_worker.isRunning():
+            return
+        self._folder_generation += 1
+        generation = self._folder_generation
+        self.inventory = None
         self.inventory_label.setText("Indexing…")
         self.start_btn.setEnabled(False)
         self._set_indexing(True)
@@ -1443,6 +1473,7 @@ class MainWindow(QMainWindow):
                 and self.scan_worker.isRunning()):
             return
         self.browse_btn.setEnabled(not indexing)
+        self.index_btn.setEnabled(not indexing and self.folder is not None)
         self.drop.setEnabled(not indexing)
         self.recent_folders.setEnabled(not indexing)
         self.clear_recents_btn.setEnabled(
@@ -1541,6 +1572,12 @@ class MainWindow(QMainWindow):
             # Informational/success (BF-12) — run log only, not the issue pane.
             if event.message:
                 self._log(event.message)
+            return
+        if event.kind == "index_progress":
+            # Indexing runs before a scan, so it owns the inventory line.
+            self.inventory_label.setText(
+                f"Indexing… {event.index:,} folders · "
+                f"{event.total:,} media found")
             return
         if event.kind == "print" and event.message:
             self._log(event.message)
@@ -1671,6 +1708,7 @@ class MainWindow(QMainWindow):
         self.inventory_label.setText("Choose a folder to scan.")
         self.summary_label.setText("")
         self.start_btn.setEnabled(False)
+        self.index_btn.setEnabled(False)
 
     def _reveal(self) -> None:
         if self.folder and self.folder.is_dir():

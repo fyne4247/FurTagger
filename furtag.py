@@ -551,6 +551,18 @@ def notify_info(msg: str) -> None:
     notify(msg, severity="info")
 
 
+def notify_progress(kind: str, **fields: Any) -> None:
+    """Structured progress for the active observer, outside a run().
+
+    ``TagIntegrator._emit`` routes through the run's own observer, which only
+    exists inside ``run()``. Indexing happens before that — and on a large
+    library it can take minutes — so it reports through the module-level
+    observer the GUI installs at startup. Frontends that do not handle *kind*
+    ignore it.
+    """
+    _active_observer.emit(RunEvent(kind=kind, **fields))
+
+
 def _natural_key(s: str) -> List:
     """Sort key that orders embedded numbers numerically, so `PAGE2` precedes
     `PAGE10` instead of the lexical `PAGE1, PAGE10, PAGE2`. `re.split` on `(\\d+)`
@@ -1871,6 +1883,7 @@ class TagIntegrator(HydrusMixin):
             root: Optional[Path] = None,
             search_profile_hash: Optional[str] = None,
             require_output_complete: bool = True,
+            present: Optional[Set[str]] = None,
     ) -> bool:
         """Shared completeness predicate for index and finalize (BF-05).
 
@@ -1892,7 +1905,7 @@ class TagIntegrator(HydrusMixin):
             self.direct_notes_effective()
             and ledger.needs_direct_notes(
                 fn, st.st_size, st.st_mtime, mtime_ns=mtime_ns))
-        has_sidecar = self.has_sidecar(path)
+        has_sidecar = self.has_sidecar(path, present=present)
         rec = ledger._fresh_record(
             fn, st.st_size, st.st_mtime, mtime_ns=mtime_ns)
         # A pre-existing/manual sidecar with no ledger row remains a supported
@@ -3172,8 +3185,16 @@ class TagIntegrator(HydrusMixin):
         return list(dict.fromkeys((self.json_sidecar_path(media),
                                    media.with_suffix(media.suffix + ".json"))))
 
-    def has_sidecar(self, media: Path) -> bool:
+    def has_sidecar(self, media: Path,
+                    present: Optional[Set[str]] = None) -> bool:
         """True if any recognized sidecar exists (configured + legacy .txt).
+
+        *present* is the set of filenames already listed for ``media``'s own
+        directory. Every sidecar candidate is a sibling of the media file, so
+        a membership test answers "does it exist?" without a syscall. Passing
+        it turns up to six per-file ``stat`` calls — nearly all of which return
+        ENOENT in a library without sidecars — into dictionary lookups. That is
+        the dominant index cost on USB and network volumes.
 
         Legacy ``.txt`` sidecars are always recognized even when the format
         setting is JSON, so switching formats never re-scans a library.
@@ -3184,10 +3205,13 @@ class TagIntegrator(HydrusMixin):
         future scan (same root cause as the Reset-deletes-metadata bug).
         """
         for p in self._tag_sidecar_candidates(media) + self._url_sidecar_candidates(media):
+            if present is not None and p.name not in present:
+                continue
             if p.exists():
                 return True
         return any(p.is_file() and _looks_like_furtag_json_sidecar(p)
-                   for p in self._json_sidecar_candidates(media))
+                   for p in self._json_sidecar_candidates(media)
+                   if present is None or p.name in present)
 
     def read_sidecar_payload(self, media: Path) -> Tuple[Set[str], Set[str]]:
         """Read tags and URLs from any supported sidecar shape beside *media*."""
@@ -3873,7 +3897,8 @@ class TagIntegrator(HydrusMixin):
 
     def _directory_manifest(
             self, directory: Path,
-            stats: Dict[str, os.stat_result]) -> str:
+            stats: Dict[str, os.stat_result],
+            present: Optional[Set[str]] = None) -> str:
         """Digest the exact directory state used by the wholesale-skip path.
 
         Count + total bytes cannot distinguish renames, swaps, same-size edits,
@@ -3891,6 +3916,10 @@ class TagIntegrator(HydrusMixin):
                 + self._json_sidecar_candidates(media)
             )
             for sidecar in dict.fromkeys(candidates):
+                # See has_sidecar: skip the stat for names the directory
+                # listing already proves are absent.
+                if present is not None and sidecar.name not in present:
+                    continue
                 try:
                     sidecar_st = sidecar.stat()
                 except OSError:
@@ -3934,6 +3963,14 @@ class TagIntegrator(HydrusMixin):
         items: List[FileItem] = []
         candidate_dirs: Set[Path] = set()
 
+        # Invariant for the whole walk — each of these digests settings only,
+        # so recomputing them per directory was pure overhead on a deep tree.
+        profile = self.search_profile_hash()
+        output_policy = self.output_policy_hash()
+        direct_notes = self.direct_notes_effective()
+        sidecars_req = bool(self.write_sidecars)
+        sidecar_format = self.sidecar_format_key()
+
         for dp, dirs, files in os.walk(root):
             scanned_dirs += 1
             _prune_hidden_walk_dirs(dirs)
@@ -3941,14 +3978,26 @@ class TagIntegrator(HydrusMixin):
             if excluded_dirs:
                 dirs[:] = [d for d in dirs if dp_path / d not in excluded_dirs]
 
+            # One listing serves both the media filter and every sidecar
+            # existence question below, so no sibling needs its own stat.
+            # Directories count too: `.exists()` succeeded for them before,
+            # so including them keeps the manifest digest bit-identical and
+            # existing directory seals valid.
+            present = set(files) | set(dirs)
             media_files = [fn for fn in sorted(files)
                            if not fn.startswith(".") and self._media_kind(fn)]
             discovered_media += len(media_files)
-            if sys.stdout.isatty() and scanned_dirs % 100 == 0:
-                sys.stdout.write(
-                    f"\r  indexed {scanned_dirs:,} folders · "
-                    f"{discovered_media:,} media found")
-                sys.stdout.flush()
+            if scanned_dirs % 25 == 0:
+                # The GUI shows a static "Indexing…" otherwise, which on a
+                # 150k-file library is indistinguishable from a hang.
+                notify_progress(
+                    "index_progress", index=scanned_dirs,
+                    total=discovered_media, current=dp_path.name)
+                if sys.stdout.isatty():
+                    sys.stdout.write(
+                        f"\r  indexed {scanned_dirs:,} folders · "
+                        f"{discovered_media:,} media found")
+                    sys.stdout.flush()
             if not media_files:
                 continue
 
@@ -3964,16 +4013,13 @@ class TagIntegrator(HydrusMixin):
                 stats[fn] = st
                 total_size += st.st_size
             count = len(stats)
-            manifest = self._directory_manifest(dp_path, stats)
-            profile = self.search_profile_hash()
-            sidecars_req = bool(self.write_sidecars)
-            output_policy = self.output_policy_hash()
+            manifest = self._directory_manifest(dp_path, stats, present=present)
             if count and dir_ledger.fingerprint_matches(
                     count, total_size, manifest,
-                    self.direct_notes_effective(),
+                    direct_notes,
                     search_profile_hash=profile,
                     sidecars_required=sidecars_req,
-                    sidecar_format=self.sidecar_format_key(),
+                    sidecar_format=sidecar_format,
                     output_policy_hash=output_policy):
                 media += count
                 seen += count
@@ -3995,8 +4041,8 @@ class TagIntegrator(HydrusMixin):
                 if self.local_path_complete(
                         p, dir_ledger, st, is_pdf_page=is_pdf_page,
                         root=root, search_profile_hash=profile,
-                        require_output_complete=False):
-                    if self.has_sidecar(p) and not is_pdf_page:
+                        require_output_complete=False, present=present):
+                    if self.has_sidecar(p, present=present) and not is_pdf_page:
                         tagged += 1
                     else:
                         seen += 1

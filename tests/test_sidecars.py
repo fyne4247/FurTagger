@@ -459,3 +459,52 @@ class TestForeignTxtNotOurSidecar(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDirectoryListingShortcut(unittest.TestCase):
+    """Passing the directory listing must not change any observable result.
+
+    index() hands `present` — the filenames it already listed during the walk —
+    to has_sidecar and _directory_manifest so absent siblings cost a dict lookup
+    instead of a stat that returns ENOENT. If that shortcut altered the manifest
+    digest, every sealed directory would re-open and the whole library would
+    rescan, so the digest must stay bit-identical.
+    """
+
+    def setUp(self):
+        self.ti = TagIntegrator(settings=Settings())
+        self.d = Path(tempfile.mkdtemp())
+        (self.d / "a.png").write_bytes(b"\x89PNG" + b"0" * 32)
+        (self.d / "a.png.txt").write_text("tag1\ntag2\n")
+        (self.d / "b.jpg").write_bytes(b"\xff\xd8" + b"0" * 32)
+        (self.d / "b.jpg.url.txt").write_text("https://example.invalid/1\n")
+        (self.d / "c.gif").write_bytes(b"GIF89a" + b"0" * 32)
+        (self.d / "e.png").write_bytes(b"\x89PNG" + b"0" * 32)
+        (self.d / "e.png.json").write_text(
+            '{"category":"gallery-dl","tags":["not-ours"]}')
+        self.names = sorted(p.name for p in self.d.iterdir())
+        self.present = set(self.names)
+        self.stats = {n: (self.d / n).stat()
+                      for n in self.names if self.ti._media_kind(n)}
+
+    def test_manifest_digest_is_identical(self):
+        self.assertEqual(
+            self.ti._directory_manifest(self.d, self.stats),
+            self.ti._directory_manifest(self.d, self.stats,
+                                        present=self.present))
+
+    def test_has_sidecar_agrees_for_every_file(self):
+        for name in self.stats:
+            media = self.d / name
+            self.assertEqual(
+                self.ti.has_sidecar(media),
+                self.ti.has_sidecar(media, present=self.present),
+                f"has_sidecar disagreed for {name}")
+
+    def test_a_sidecar_missing_from_the_listing_is_treated_as_absent(self):
+        # Guards the contract: `present` is authoritative, so a caller that
+        # passes a stale listing gets "absent", never a surprise stat.
+        without = self.present - {"a.png.txt"}
+        self.assertTrue(self.ti.has_sidecar(self.d / "a.png"))
+        self.assertFalse(
+            self.ti.has_sidecar(self.d / "a.png", present=without))
