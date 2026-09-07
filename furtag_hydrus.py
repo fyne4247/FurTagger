@@ -527,6 +527,35 @@ class HydrusMixin:
         return [(name, key) for name, typ, key in entries
                 if key and typ in HYDRUS_FILE_SERVICE_TYPES]
 
+    def hydrus_tag_services(self) -> List[Tuple[str, str]]:
+        """(display name, service name) for every tag service, local first.
+
+        The *name* is returned rather than the key because these feed a
+        "system:number of tags (<service>)" predicate, which Hydrus parses by
+        name.
+        """
+        if not self.has_hydrus:
+            return []
+        try:
+            r = self.session.get(
+                f"{self.hydrus_api_url}/get_services",
+                headers=self._hydrus_headers(), timeout=10)
+            r.raise_for_status()
+            data = r.json()
+        except (requests.RequestException, ValueError) as e:
+            _notify(f"⚠️  Hydrus: couldn't list tag services ({e}).")
+            return []
+        services = data.get("services_v2")
+        if isinstance(services, list):
+            entries = [(s.get("name") or "", s.get("type"))
+                       for s in services if isinstance(s, dict)]
+        else:
+            entries = [(name, (info or {}).get("type"))
+                       for name, info in (data.get("services") or {}).items()]
+        local = sorted(n for n, t in entries if n and t == 5)
+        remote = sorted(n for n, t in entries if n and t == 0)
+        return [(n, n) for n in local + remote]
+
     def hydrus_scan_predicates(self, scan: "HydrusScanSettings") -> List[str]:
         """Translate a scan's selection settings into Hydrus search predicates.
 

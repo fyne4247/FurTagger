@@ -95,6 +95,28 @@ class TestFileDomains(unittest.TestCase):
              ("all my files", "allmine")])
 
 
+    def test_tag_services_are_listed_local_first(self):
+        session = FakeSession([
+            ("GET", "get_services", FakeResponse(200, {
+                "services_v2": [
+                    {"name": "public tag repository", "type": 0,
+                     "service_key": "ptr"},
+                    {"name": "my tags", "type": 5, "service_key": "mine"},
+                    {"name": "downloader tags", "type": 5,
+                     "service_key": "dl"},
+                    {"name": "Furry Porn", "type": 2, "service_key": "local"},
+                ],
+            })),
+        ])
+        ti = _integrator(session)
+        # Names, not keys: they feed "system:number of tags (<service>)",
+        # which Hydrus parses by name. Local services sort first.
+        self.assertEqual(
+            ti.hydrus_tag_services(),
+            [("downloader tags", "downloader tags"), ("my tags", "my tags"),
+             ("public tag repository", "public tag repository")])
+
+
 class TestDuplicateExpansion(unittest.TestCase):
     def test_only_duplicates_are_followed_never_alternates(self):
         alternate = "d" * 64

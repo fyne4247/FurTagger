@@ -243,6 +243,8 @@ class HydrusScanPanel(QWidget):
     def __init__(self, scan: HydrusScanSettings, parent=None) -> None:
         super().__init__(parent)
         self._services: List[Tuple[str, str]] = []
+        self._tag_services: List[Tuple[str, str]] = []
+        self._dupes = (True, "on_miss", 8)
         self._build()
         self.load_from(scan)
 
@@ -261,12 +263,16 @@ class HydrusScanPanel(QWidget):
         self.domain.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.domain.setMinimumContentsLength(24)
-        self.refresh_domains_btn = QPushButton("Refresh")
-        self.refresh_domains_btn.setToolTip(
-            "Ask Hydrus which file domains exist. Needs a working connection.")
+        self.refresh_services_btn = QPushButton("Refresh")
+        self.refresh_services_btn.setToolTip(
+            "Ask Hydrus which file domains and tag services exist. Needs a "
+            "working connection.")
         domain_row.addWidget(self.domain, stretch=1)
-        domain_row.addWidget(self.refresh_domains_btn)
+        domain_row.addWidget(self.refresh_services_btn)
         wf.addRow("File domain", domain_row)
+        self.domain_help = QLabel()
+        self.domain_help.setWordWrap(True)
+        wf.addRow("", self.domain_help)
 
         self.max_tags = QSpinBox()
         self.max_tags.setRange(0, 100_000)
@@ -277,11 +283,11 @@ class HydrusScanPanel(QWidget):
             "tag count.")
         wf.addRow("Fewer than N tags", self.max_tags)
 
-        self.tag_count_service = QLineEdit()
-        self.tag_count_service.setPlaceholderText(
-            "all services (or a service name, e.g. my tags)")
+        self.tag_count_service = QComboBox()
         self.tag_count_service.setToolTip(
-            "Count tags in one service only. Leave empty to count them all.")
+            "Which service's tags the count above refers to. The default "
+            "counts every service at once, so a file with tags in any of them "
+            "no longer looks untagged.")
         wf.addRow("Counting tags in", self.tag_count_service)
 
         self.limit = QSpinBox()
@@ -318,31 +324,20 @@ class HydrusScanPanel(QWidget):
         wf.addRow("Also require", self.extra_predicates)
         root.addWidget(what)
 
-        # ── Deleted duplicates ──────────────────────────────────────────────
+        # Deleted duplicates are not a decision worth surfacing: they cost
+        # nothing when a file already matched (they are only tried on a miss),
+        # they can only ever add tags the boorus already hold for that exact
+        # picture, and the settings remain editable from the CLI for anyone who
+        # wants to turn them off. The panel just says that it happens.
         dupes = QGroupBox("Deleted duplicates")
-        df = QFormLayout(dupes)
-        df.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        dl = QVBoxLayout(dupes)
         blurb = QLabel(
-            "A file the boorus don't recognise may sit in a duplicate group "
-            "with a file you deleted that they do. Hydrus keeps the MD5s of "
-            "files it no longer stores, so those tags can be recovered onto "
-            "the file you kept. Only exact duplicates are used — never "
-            "alternates, which are different artwork.")
+            "When nothing recognises a file, FurTag also looks up any "
+            "duplicate you deleted. Hydrus keeps their hashes, so their tags "
+            "can be recovered onto the file you kept. Exact duplicates only — "
+            "never alternates, which are different artwork.")
         blurb.setWordWrap(True)
-        df.addRow(blurb)
-
-        self.dupe_mode = QComboBox()
-        self.dupe_mode.addItem("Don't look them up", "off")
-        self.dupe_mode.addItem("Only when the file didn't match", "on_miss")
-        self.dupe_mode.addItem("Always", "always")
-        df.addRow("Look up", self.dupe_mode)
-
-        self.max_dupes = QSpinBox()
-        self.max_dupes.setRange(0, 1_000)
-        self.max_dupes.setSpecialValueText("all")
-        self.max_dupes.setToolTip(
-            "Cap the extra lookups one crowded duplicate group can cost.")
-        df.addRow("At most, per file", self.max_dupes)
+        dl.addWidget(blurb)
         root.addWidget(dupes)
 
         # ── Bookkeeping ─────────────────────────────────────────────────────
@@ -415,46 +410,80 @@ class HydrusScanPanel(QWidget):
                 (self.limit, "valueChanged"),
                 (self.images_only, "toggled"),
                 (self.status_filter, "currentIndexChanged"),
-                (self.dupe_mode, "currentIndexChanged"),
                 (self.mark_tags, "toggled"),
                 (self.skip_scanned, "toggled"),
                 (self.dry_run, "toggled"),
         ):
             getattr(widget, signal).connect(self._on_changed)
-        for edit in (self.tag_count_service, self.state_prefix,
-                     self.state_service):
+        self.tag_count_service.currentIndexChanged.connect(self._on_changed)
+        for edit in (self.state_prefix, self.state_service):
             edit.textChanged.connect(self._on_changed)
         self.extra_predicates.textChanged.connect(self._on_changed)
         self.mark_tags.toggled.connect(self._update_enabled)
-        self.dupe_mode.currentIndexChanged.connect(self._update_enabled)
+        self.domain.currentIndexChanged.connect(self._update_enabled)
 
     def _on_changed(self, *_args) -> None:
         self.changed.emit()
 
     def _update_enabled(self, *_args) -> None:
+        self._update_domain_help()
         marking = self.mark_tags.isChecked()
         for widget in (self.state_prefix, self.state_service,
                        self.skip_scanned):
             widget.setEnabled(marking)
-        self.max_dupes.setEnabled(self.dupe_mode.currentData() != "off")
 
     def has_services(self) -> bool:
         """Whether Hydrus has been asked what file domains exist."""
         return bool(self._services)
 
-    def set_services(self, services: List[Tuple[str, str]]) -> None:
-        """Populate the domain list, keeping the current selection if it survives."""
+    #: Hydrus's own names for its two virtual local domains, and what each
+    #: actually covers. Both read like plain domains in the dropdown, and the
+    #: difference between them is not guessable from the names.
+    DOMAIN_NOTES = {
+        "hydrus local file storage":
+            "everything Hydrus stores, including the trash and its own "
+            "repository update files",
+        "combined local file domains":
+            "every local domain at once, without the trash — the default",
+    }
+
+    def set_services(self, services: List[Tuple[str, str]],
+                     tag_services: Optional[List[Tuple[str, str]]] = None
+                     ) -> None:
+        """Populate both pickers, keeping the current choices if they survive."""
         wanted = self.domain.currentData() or ""
         self._services = list(services)
         self.domain.blockSignals(True)
         self.domain.clear()
-        self.domain.addItem("Hydrus default (all local files)", "")
+        self.domain.addItem("Hydrus default (all your files, no trash)", "")
         for name, key in self._services:
             self.domain.addItem(name, key)
+            note = self.DOMAIN_NOTES.get(name.lower())
+            if note:
+                self.domain.setItemData(
+                    self.domain.count() - 1, note, Qt.ItemDataRole.ToolTipRole)
         index = self.domain.findData(wanted)
         self.domain.setCurrentIndex(max(0, index))
         self.domain.blockSignals(False)
+
+        if tag_services is not None:
+            self._tag_services = list(tag_services)
+        wanted_tags = self.tag_count_service.currentData() or ""
+        self.tag_count_service.blockSignals(True)
+        self.tag_count_service.clear()
+        self.tag_count_service.addItem("All tag services", "")
+        for label, name in self._tag_services:
+            self.tag_count_service.addItem(label, name)
+        index = self.tag_count_service.findData(wanted_tags)
+        self.tag_count_service.setCurrentIndex(max(0, index))
+        self.tag_count_service.blockSignals(False)
+        self._update_domain_help()
         self._on_changed()
+
+    def _update_domain_help(self) -> None:
+        note = self.DOMAIN_NOTES.get(self.domain.currentText().lower())
+        self.domain_help.setText(f"<i>{note}</i>" if note else "")
+        self.domain_help.setVisible(bool(note))
 
     def load_from(self, scan: HydrusScanSettings) -> None:
         if scan.file_service_key and not self._services:
@@ -467,7 +496,8 @@ class HydrusScanPanel(QWidget):
         index = self.domain.findData(scan.file_service_key or "")
         self.domain.setCurrentIndex(max(0, index))
         self.max_tags.setValue(scan.max_tag_count)
-        self.tag_count_service.setText(scan.tag_count_service)
+        index = self.tag_count_service.findData(scan.tag_count_service)
+        self.tag_count_service.setCurrentIndex(max(0, index))
         self.limit.setValue(scan.limit)
         self.images_only.setChecked(scan.images_only)
         status = ("inbox" if scan.inbox_only
@@ -475,10 +505,11 @@ class HydrusScanPanel(QWidget):
         self.status_filter.setCurrentIndex(
             max(0, self.status_filter.findData(status)))
         self.extra_predicates.setPlainText("\n".join(scan.extra_predicates))
-        mode = (scan.deleted_duplicates_when
-                if scan.include_deleted_duplicates else "off")
-        self.dupe_mode.setCurrentIndex(max(0, self.dupe_mode.findData(mode)))
-        self.max_dupes.setValue(scan.max_deleted_duplicates)
+        # Not shown, so remembered verbatim and written back unchanged —
+        # the CLI can still turn duplicate lookups off.
+        self._dupes = (scan.include_deleted_duplicates,
+                       scan.deleted_duplicates_when,
+                       scan.max_deleted_duplicates)
         self.mark_tags.setChecked(scan.mark_state_tags)
         self.state_prefix.setText(scan.state_tag_prefix)
         self.state_service.setText(scan.state_tag_service)
@@ -495,7 +526,7 @@ class HydrusScanPanel(QWidget):
         scan.file_service_name = (
             self.domain.currentText() if scan.file_service_key else "")
         scan.max_tag_count = self.max_tags.value()
-        scan.tag_count_service = self.tag_count_service.text().strip()
+        scan.tag_count_service = self.tag_count_service.currentData() or ""
         scan.limit = self.limit.value()
         scan.images_only = self.images_only.isChecked()
         status = self.status_filter.currentData()
@@ -505,10 +536,8 @@ class HydrusScanPanel(QWidget):
             line.strip()
             for line in self.extra_predicates.toPlainText().splitlines()
             if line.strip()]
-        mode = self.dupe_mode.currentData()
-        scan.include_deleted_duplicates = mode != "off"
-        scan.deleted_duplicates_when = mode if mode != "off" else "on_miss"
-        scan.max_deleted_duplicates = self.max_dupes.value()
+        (scan.include_deleted_duplicates, scan.deleted_duplicates_when,
+         scan.max_deleted_duplicates) = self._dupes
         scan.mark_state_tags = self.mark_tags.isChecked()
         scan.state_tag_prefix = self.state_prefix.text().strip() or "furtag"
         scan.state_tag_service = self.state_service.text().strip()
@@ -1327,8 +1356,13 @@ class MainWindow(QMainWindow):
         self.bridge.inventory_failed.connect(self._on_inventory_failed)
         self._closing = False
         self._review_count = 0
-        # Read while the UI is built, so it must exist before _build_ui().
+        # Both are read while the UI is built, so they must exist first.
         self._last_report_path = ""
+        self._scan_tab = 0
+        # addTab() emits currentChanged while the run surface below the tabs
+        # does not exist yet, so the handler has to know to stand down.
+        self._ui_ready = False
+        self._split_user_set = False
 
         self._build_ui()
         _fit_window_to_screen(self, prefer_w=900, prefer_h=640)
@@ -1420,36 +1454,26 @@ class MainWindow(QMainWindow):
             Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(self.status_label)
 
-        # Top-level Scan | Settings — keeps the window short enough for laptops
+        # Configuration on top, run output below, with a splitter between so
+        # either half can be given the room. Each scan mode is a tab of its
+        # own rather than a stack inside one: the database options are a tall
+        # form, and nesting them in a short pane meant scrolling a box inside
+        # a window that had space to spare.
+        self.split = QSplitter(Qt.Orientation.Vertical)
+        self.split.setChildrenCollapsible(False)
+        root.addWidget(self.split, stretch=1)
+
         self.main_tabs = QTabWidget()
         self.main_tabs.setDocumentMode(True)
-        root.addWidget(self.main_tabs, stretch=1)
+        self.main_tabs.currentChanged.connect(self._on_tab_changed)
+        self.split.addWidget(self.main_tabs)
 
-        # ── Scan tab ─────────────────────────────────────────────────────
+        # ── Folder scan tab ──────────────────────────────────────────────
         scan = QWidget()
         scan_lay = QVBoxLayout(scan)
         scan_lay.setContentsMargins(4, 8, 4, 4)
         scan_lay.setSpacing(6)
-
-        source_row = QHBoxLayout()
-        source_row.addWidget(QLabel("Scan:"))
-        self.scan_source = QComboBox()
-        self.scan_source.addItem("A folder on disk", "folder")
-        self.scan_source.addItem("The Hydrus database", "hydrus")
-        self.scan_source.setToolTip(
-            "A folder scan matches by hash and then perceptually, and writes "
-            "sidecars or imports. A database scan works on files Hydrus "
-            "already has: hash lookups only, tagged in place.")
-        self.scan_source.currentIndexChanged.connect(self._on_scan_source_changed)
-        source_row.addWidget(self.scan_source)
-        source_row.addStretch()
-        scan_lay.addLayout(source_row)
-
-        self.target_stack = QStackedWidget()
-        folder_page = QWidget()
-        folder_lay = QVBoxLayout(folder_page)
-        folder_lay.setContentsMargins(0, 0, 0, 0)
-        folder_lay.setSpacing(6)
+        folder_lay = scan_lay
 
         folder_row = QHBoxLayout()
         self.drop = DropFolderLabel()
@@ -1505,22 +1529,35 @@ class MainWindow(QMainWindow):
         opts.addWidget(self.opt_sync_sidecars)
         opts.addStretch()
         folder_lay.addLayout(opts)
-        self.target_stack.addWidget(folder_page)
+        folder_lay.addStretch()
+        self.main_tabs.addTab(scan, "Folder Scan")
 
+        # ── Hydrus database tab ──────────────────────────────────────────
+        hydrus_tab = QWidget()
+        hydrus_lay = QVBoxLayout(hydrus_tab)
+        hydrus_lay.setContentsMargins(4, 8, 4, 4)
+        hydrus_lay.setSpacing(6)
         self.hydrus_panel = HydrusScanPanel(self.settings.hydrus_scan)
         self.hydrus_panel.changed.connect(self._refresh_scan_preview)
-        self.hydrus_panel.refresh_domains_btn.clicked.connect(
-            self._refresh_hydrus_domains)
-        self.hydrus_scroll = _wrap_scroll(self.hydrus_panel)
-        # The panel's own width is what it needs; only vertical scrolling
-        # should ever appear, or the group boxes get a spurious h-scrollbar.
-        self.hydrus_scroll.setHorizontalScrollBarPolicy(
+        self.hydrus_panel.refresh_services_btn.clicked.connect(
+            self._refresh_hydrus_services)
+        scroll = _wrap_scroll(self.hydrus_panel)
+        # Only ever scroll vertically: the form's natural width is the width
+        # it needs, and a horizontal bar under the group boxes is pure noise.
+        scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.target_stack.addWidget(self.hydrus_scroll)
-        self._scan_lay = scan_lay
-        scan_lay.addWidget(self.target_stack)
-        self.hydrus_panel.preview.setParent(scan)
-        scan_lay.addWidget(self.hydrus_panel.preview)
+        hydrus_lay.addWidget(scroll, stretch=1)
+        # Pinned outside the scroll area: the query about to run is the last
+        # thing read before Start, so it must never be what scrolled away.
+        self.hydrus_panel.preview.setParent(hydrus_tab)
+        hydrus_lay.addWidget(self.hydrus_panel.preview)
+        self.main_tabs.addTab(hydrus_tab, "Hydrus Scan")
+
+        # ── Shared run surface ───────────────────────────────────────────
+        run = QWidget()
+        scan_lay = QVBoxLayout(run)
+        scan_lay.setContentsMargins(4, 4, 4, 4)
+        scan_lay.setSpacing(6)
 
         # Progress cards
         prog = QHBoxLayout()
@@ -1571,7 +1608,6 @@ class MainWindow(QMainWindow):
         bottom.setStretchFactor(0, 1)
         bottom.setStretchFactor(1, 2)
         bottom.setSizes([80, 140])
-        self._bottom_splitter = bottom
         scan_lay.addWidget(bottom, stretch=1)
 
         self.summary_label = QLabel("")
@@ -1609,7 +1645,14 @@ class MainWindow(QMainWindow):
             actions.addWidget(b)
         scan_lay.addLayout(actions)
 
-        self.main_tabs.addTab(scan, "Scan")
+        self.split.addWidget(run)
+        self.split.setStretchFactor(0, 3)
+        self.split.setStretchFactor(1, 2)
+        # A QTabWidget takes its height from its tallest page, so the short
+        # folder form would otherwise sit above the same gap the database
+        # form needs. Each mode gets its own default split, until the user
+        # drags the divider — after which their choice is what matters.
+        self.split.splitterMoved.connect(self._remember_split)
 
         # ── Settings tab (scrollable pages) ──────────────────────────────
         self.settings_panel = SettingsPanel(self.settings)
@@ -1617,37 +1660,63 @@ class MainWindow(QMainWindow):
             self._refresh_source_status)
         self.main_tabs.addTab(self.settings_panel, "Settings")
 
-        # Runs last: it toggles widgets from both the scan tab and the panel.
-        self._on_scan_source_changed()
+        # Runs last: it toggles widgets from both scan tabs and the panel.
+        self._ui_ready = True
+        self._on_tab_changed(self.main_tabs.currentIndex())
 
     # ── Scan source ─────────────────────────────────────────────────────────
 
-    def _scan_source(self) -> str:
-        return self.scan_source.currentData() or "folder"
+    #: Tab indices of the two scan modes. Settings is a third tab and does
+    #: not change which mode the shared Start button acts on.
+    TAB_FOLDER, TAB_HYDRUS = 0, 1
 
-    def _on_scan_source_changed(self, *_args) -> None:
+    def _scan_source(self) -> str:
+        return "hydrus" if self._scan_tab == self.TAB_HYDRUS else "folder"
+
+    def _on_tab_changed(self, index: int) -> None:
+        # Selecting Settings must not retarget Start at nothing, so the last
+        # scan tab stays the active mode until the other one is chosen.
+        if index in (self.TAB_FOLDER, self.TAB_HYDRUS):
+            self._scan_tab = index
+        # A QTabWidget asks every page for its size hint, so the tallest one
+        # sets the height of all of them. Ignoring the hidden pages lets the
+        # short folder form actually be short.
+        for i in range(self.main_tabs.count()):
+            page = self.main_tabs.widget(i)
+            page.setSizePolicy(
+                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Preferred if i == index
+                else QSizePolicy.Policy.Ignored)
+        self.main_tabs.widget(index).adjustSize()
+        self._apply_scan_mode()
+
+    def _remember_split(self, *_args) -> None:
+        self._split_user_set = True
+
+    def _apply_scan_mode(self) -> None:
+        if not self._ui_ready:
+            return
         hydrus = self._scan_source() == "hydrus"
-        self.target_stack.setCurrentIndex(1 if hydrus else 0)
-        self._scan_lay.setStretchFactor(self.target_stack, 3 if hydrus else 0)
-        self._scan_lay.setStretchFactor(self._bottom_splitter, 1 if hydrus else 3)
-        self.target_stack.setSizePolicy(
-            QSizePolicy.Policy.Preferred,
-            QSizePolicy.Policy.Expanding if hydrus
-            else QSizePolicy.Policy.Maximum)
-        # A database scan is hash-tier only, and its results live in Hydrus —
-        # so the perceptual card and every folder-shaped action would be lying.
+        # A database scan is hash-tier only and its results live in Hydrus, so
+        # the perceptual card and every folder-shaped action would be lying.
         self.perc_card["box"].setVisible(not hydrus)
         self.review_badge.setVisible(not hydrus)
         for button in (self.another_btn, self.reveal_btn, self.reset_btn):
             button.setVisible(not hydrus)
         self.open_report_btn.setVisible(hydrus)
-        self.hydrus_panel.preview.setVisible(hydrus)
         self.open_report_btn.setEnabled(bool(self._last_report_path))
+        if not self._split_user_set:
+            total = max(400, self.split.height() or 880)
+            top = int(total * (0.66 if hydrus else 0.28))
+            self.split.setSizes([top, total - top])
+        # Switching tabs mid-run must not clear the summary or re-enable Start.
+        if self.scan_worker and self.scan_worker.isRunning():
+            return
         self.summary_label.setText("")
         if hydrus:
             self.start_btn.setEnabled(True)
             if not self.hydrus_panel.has_services() and self.integrator.has_hydrus:
-                self._refresh_hydrus_domains()
+                self._refresh_hydrus_services()
             self._refresh_scan_preview()
         else:
             self.start_btn.setEnabled(bool(self.inventory))
@@ -1659,8 +1728,11 @@ class MainWindow(QMainWindow):
         self.hydrus_panel.set_preview(
             self.integrator.hydrus_scan_predicates(scan))
 
-    def _refresh_hydrus_domains(self) -> None:
-        """Ask Hydrus which file domains exist. Local API, so done inline."""
+    def _refresh_hydrus_services(self) -> None:
+        """Ask Hydrus which file domains and tag services exist.
+
+        The API is local, so this runs inline rather than on a worker.
+        """
         if not self.integrator.has_hydrus:
             QMessageBox.information(
                 self, "Hydrus", "Connect to Hydrus first "
@@ -1668,14 +1740,17 @@ class MainWindow(QMainWindow):
             return
         QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            services = self.integrator.hydrus_file_services()
+            domains = self.integrator.hydrus_file_services()
+            tag_services = self.integrator.hydrus_tag_services()
         finally:
             QGuiApplication.restoreOverrideCursor()
-        if not services:
+        if not domains:
             self._add_issue("Hydrus returned no file domains.")
             return
-        self.hydrus_panel.set_services(services)
-        self._log(f"Hydrus: {len(services)} file domain(s) available.")
+        self.hydrus_panel.set_services(domains, tag_services)
+        self._log(
+            f"Hydrus: {len(domains)} file domain(s), "
+            f"{len(tag_services)} tag service(s).")
 
     def _start_hydrus_scan(self) -> None:
         if self.scan_worker and self.scan_worker.isRunning():
@@ -2073,8 +2148,10 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, running: bool) -> None:
         self.start_btn.setEnabled(not running)
-        self.scan_source.setEnabled(not running)
         self.hydrus_panel.setEnabled(not running)
+        # The tab bar is the mode switch now: changing modes mid-run would
+        # point Cancel and the summary at a scan that is not the live one.
+        self.main_tabs.tabBar().setEnabled(not running)
         self.cancel_btn.setEnabled(running)
         self.reset_btn.setEnabled(not running)
         self.settings_panel.setEnabled(not running)
