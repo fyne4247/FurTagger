@@ -64,6 +64,7 @@ import subprocess
 import sys
 import threading
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -79,12 +80,15 @@ from furtag_settings import (
     DEFAULT_PDF_DPI,
     DEFAULT_TAG_PATTERN,
     DEFAULT_URL_PATTERN,
+    HydrusScanSettings,
     RunOptions,
     ScanSummary,
     Settings,
     SettingsStore,
     atomic_write_text,
+    normalize_hydrus_scan,
     render_sidecar_name,
+    resolve_settings_path,
 )
 from furtag_events import NullObserver, RunEvent, RunObserver, TerminalObserver
 from furtag_review import PendingReview, ReviewQueue
@@ -1433,6 +1437,132 @@ def prompt_for_pdf_meta(pdfs: List[Path]) -> Dict[str, Dict[str, str]]:
 
 
 # ── TagIntegrator ────────────────────────────────────────────────────────────
+
+@dataclass
+class HydrusScanOutcome:
+    """One file's result: a report status, a display line, and the detail."""
+    status: str          # matched | nomatch | error | skipped | dry_run
+    result: str
+    detail: Dict[str, Any] = field(default_factory=dict)
+
+
+def hydrus_scan_report_dir() -> Path:
+    """Where scan reports live — beside settings.json, not in the library."""
+    return resolve_settings_path().parent / "scans"
+
+
+class HydrusScanReport:
+    """Append-only JSONL record of one database scan, plus a text summary.
+
+    JSONL rather than one JSON document because a scan can run for hours and
+    be cancelled at any point: every line is already on disk and readable, and
+    a later "retry the failures" pass can filter the file directly. The text
+    summary is written once at the end for humans.
+    """
+
+    def __init__(self, scan: "HydrusScanSettings", *, enabled: bool = True,
+                 directory: Optional[Path] = None) -> None:
+        self.scan = scan
+        self.started = time.time()
+        self.counts: Dict[str, int] = {}
+        self.path: Optional[Path] = None
+        self._handle = None
+        if not enabled:
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(self.started))
+        base = (directory or hydrus_scan_report_dir())
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            self.path = base / f"hydrus-scan-{stamp}.jsonl"
+            self._handle = self.path.open("a", encoding="utf-8")
+            self._write({
+                "event": "start",
+                "time": stamp,
+                "dry_run": scan.dry_run,
+                "file_service": scan.file_service_name or "(default)",
+                "deleted_duplicates": (
+                    scan.deleted_duplicates_when
+                    if scan.include_deleted_duplicates else "off"),
+            })
+        except OSError as e:
+            self.path = None
+            self._handle = None
+            notify(f"⚠️  Couldn't open a scan report ({e}); the scan will run "
+                   f"without one.")
+
+    def _write(self, payload: Dict[str, Any]) -> None:
+        if self._handle is None:
+            return
+        try:
+            self._handle.write(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+            self._handle.flush()
+        except (OSError, TypeError, ValueError) as e:
+            self._close()
+            notify(f"⚠️  Scan report write failed ({e}); continuing without it.")
+
+    def record(self, file_hash: str, status: str, **detail: Any) -> None:
+        self.counts[status] = self.counts.get(status, 0) + 1
+        self._write({"event": "file", "hash": file_hash,
+                     "status": status, **detail})
+
+    def _close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+    def finish(self, summary: ScanSummary) -> str:
+        """Close the JSONL, write the sibling text summary, return its path."""
+        elapsed = time.time() - self.started
+        self._write({
+            "event": "end",
+            "elapsed_seconds": round(elapsed, 1),
+            "stop_reason": summary.stop_reason or "completed",
+            "counts": dict(self.counts),
+        })
+        self._close()
+        if self.path is None:
+            return ""
+        lines = [
+            "FurTag Hydrus database scan",
+            time.strftime("%Y-%m-%d %H:%M:%S",
+                          time.localtime(self.started)),
+            f"Domain:    {self.scan.file_service_name or '(Hydrus default)'}",
+            f"Selected:  {summary.total_items} file(s)",
+            f"Ended:     {summary.stop_reason or 'completed'}"
+            f"  after {elapsed / 60:.1f} min",
+            "",
+            f"Tagged:    {summary.tagged}",
+            f"No match:  {summary.unmatched}",
+            f"Errors:    {summary.errors}   (left unmarked — retried next run)",
+            f"Skipped:   {summary.skipped}",
+            "",
+            f"Deleted duplicates looked up: "
+            f"{summary.deleted_duplicates_examined}",
+            f"Files matched only via one:   "
+            f"{summary.matched_via_deleted_duplicate}",
+            "",
+            "Source hits: " + ("  ".join(
+                f"{name} {count}"
+                for name, count in sorted(summary.source_hits.items())
+                if count) or "none"),
+            "",
+            f"Per-file detail: {self.path.name}",
+        ]
+        if self.scan.dry_run:
+            lines.insert(
+                2, "DRY RUN — nothing was written to Hydrus.")
+        text_path = self.path.with_suffix(".txt")
+        try:
+            atomic_write_text(text_path, "\n".join(lines) + "\n")
+        except OSError as e:
+            notify(f"⚠️  Couldn't write the scan summary ({e}).")
+            return str(self.path)
+        return str(text_path)
+
 
 class TagIntegrator(HydrusMixin):
 
@@ -5482,6 +5612,359 @@ class TagIntegrator(HydrusMixin):
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 
+
+    # ── Hydrus database scan ─────────────────────────────────────────────────
+
+    def scan_hydrus_db(
+            self,
+            scan: Optional["HydrusScanSettings"] = None,
+            observer: Optional[RunObserver] = None,
+            cancel_event: Optional[threading.Event] = None,
+            use_terminal_display: bool = True,
+    ) -> ScanSummary:
+        """Look up files already in Hydrus by MD5 and push what the boorus know.
+
+        The hash tier only ever needed an MD5, and Hydrus will hand over the
+        MD5 of any file it knows without transferring a byte — so a database
+        scan is the same `hash_tier` fan-out the folder pipeline runs, fed from
+        `search_files` instead of a directory walk. There is no local file, so
+        no ledger and no sidecars: the record of what was scanned lives in
+        Hydrus as tags, and the run's detail goes to a JSONL report.
+        """
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError("A scan is already running in this process.")
+        try:
+            if scan is None:
+                scan = self.settings.hydrus_scan
+            prev_observer = self._observer
+            disp = LiveDisplay() if use_terminal_display else None
+            self._observer = observer or TerminalObserver(disp)
+            prev_active = set_active_observer(self._observer)
+            self._display_detached = False
+            global _display
+            prev_display = _display
+            if disp is not None:
+                _display = disp
+            self._hydrus_start_result_page_run()
+            try:
+                return self._scan_hydrus_db_impl(scan, cancel_event)
+            finally:
+                self._hydrus_finalize_result_page_run()
+                self._detach_display()
+                _display = prev_display
+                set_active_observer(prev_active)
+                self._observer = prev_observer
+        finally:
+            self._run_lock.release()
+
+    def _scan_hydrus_db_impl(
+            self, scan: "HydrusScanSettings",
+            cancel_event: Optional[threading.Event]) -> ScanSummary:
+        self.cancel_event = (
+            cancel_event if cancel_event is not None else threading.Event())
+        self._fatal_network_error = False
+        with self._repeated_issue_lock:
+            self._repeated_issues.clear()
+        self._bind_cancel_to_pacers()
+
+        summary = ScanSummary(
+            source_hits={k: 0 for k in
+                         ("e621", "inkbunny", "danbooru",
+                          "gelbooru", "fluffle", "saucenao")})
+        # Refuse before opening a report: an aborted scan should not leave an
+        # empty file behind for the user to wonder about.
+        services = self.enabled_hash_services()
+        if not services:
+            raise RuntimeError(
+                "No exact-hash sources are enabled; a database scan would "
+                "have nothing to ask. Enable e621, InkBunny, Danbooru, or "
+                "Gelbooru first.")
+        report = HydrusScanReport(scan, enabled=scan.write_report)
+
+        self._emit("begin_phase", track="hash",
+                   phase="Phase · selecting files from Hydrus", total=0)
+        hashes = self.hydrus_scan_search(scan)
+        summary.total_items = len(hashes)
+        if not hashes:
+            notify_info(
+                "Hydrus scan: no files matched the selection "
+                f"({'; '.join(self.hydrus_scan_predicates(scan)) or 'no filters'}).")
+            summary.stop_reason = "nothing selected"
+            summary.report_path = report.finish(summary)
+            self._flush_repeated_issues()
+            return summary
+        notify_info(f"Hydrus scan: {len(hashes)} file(s) selected.")
+
+        # Resolve every MD5 up front — kept files and, when enabled, the
+        # deleted members of their duplicate groups. Two batched calls cover
+        # the whole run, so the per-file loop below is pure booru work.
+        duplicates: Dict[str, List[str]] = {}
+        if scan.include_deleted_duplicates:
+            if not self.hydrus_can_manage_relationships:
+                notify(
+                    "⚠️  Deleted-duplicate lookups need the Hydrus 'Manage "
+                    "File Relationships' permission; scanning kept files only.")
+            else:
+                self._emit("begin_phase", track="hash",
+                           phase="Phase · finding duplicate groups",
+                           total=len(hashes))
+                duplicates = self.hydrus_duplicate_members(hashes)
+
+        current = self._hydrus_current_sha256s(
+            {h for members in duplicates.values() for h in members})
+        if current is None:
+            # Without a currency check every group member looks deleted, and
+            # tagging one that is merely a second kept file is out of scope for
+            # this run. Drop the expansion rather than guess.
+            if duplicates:
+                notify("⚠️  Hydrus: couldn't tell which duplicate-group "
+                       "members are still present; scanning kept files only.")
+            duplicates = {}
+            current = set()
+
+        deleted_for: Dict[str, List[str]] = {}
+        for kept, members in duplicates.items():
+            gone = [h for h in members if h not in current and h != kept]
+            if not gone:
+                continue
+            if scan.max_deleted_duplicates > 0:
+                gone = gone[:scan.max_deleted_duplicates]
+            deleted_for[kept] = gone
+        summary.deleted_duplicates_examined = sum(
+            len(v) for v in deleted_for.values())
+        if deleted_for:
+            notify_info(
+                f"Hydrus scan: {summary.deleted_duplicates_examined} deleted "
+                f"duplicate(s) across {len(deleted_for)} file(s) will also be "
+                f"looked up.")
+
+        self._emit("begin_phase", track="hash",
+                   phase="Phase · resolving MD5s", total=len(hashes))
+        md5s = self.hydrus_md5_map(
+            list(hashes) + [h for v in deleted_for.values() for h in v])
+
+        hash_interval = max(
+            (self.pace[s].interval for s in services), default=0.0)
+        self._emit(
+            "begin_phase", track="hash",
+            phase=("Phase · Hydrus database scan ("
+                   + "·".join(s for s in HASH_SOURCES if self.source_enabled(s))
+                   + ")"),
+            total=len(hashes), extra={"interval": hash_interval})
+
+        deadline = (
+            time.monotonic() + scan.time_budget_minutes * 60
+            if scan.time_budget_minutes > 0 else None)
+        consecutive_errors = 0
+        hash_workers = self._hash_worker_count(services)
+
+        with cf.ThreadPoolExecutor(max_workers=hash_workers) as ex:
+            for i, file_hash in enumerate(hashes):
+                if self.cancelled():
+                    summary.cancelled = True
+                    summary.stop_reason = "cancelled"
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    summary.stop_reason = (
+                        f"time budget reached ({scan.time_budget_minutes} min)")
+                    break
+                if (scan.max_consecutive_errors > 0
+                        and consecutive_errors >= scan.max_consecutive_errors):
+                    summary.stop_reason = (
+                        f"{consecutive_errors} consecutive failures")
+                    break
+
+                short = file_hash[:12]
+                nxt = hashes[i + 1][:12] if i + 1 < len(hashes) else ""
+                self._emit("start_file", track="hash", index=i + 1,
+                           current=short, nxt=nxt)
+
+                md5 = md5s.get(file_hash)
+                if not md5:
+                    summary.skipped += 1
+                    consecutive_errors += 1
+                    self._emit("finish_file", track="hash",
+                               result="skipped — Hydrus has no MD5")
+                    report.record(file_hash, "skipped", reason="no md5")
+                    continue
+
+                outcome = self._scan_one_hydrus_file(
+                    file_hash, md5, deleted_for.get(file_hash, []),
+                    md5s, scan, ex, summary)
+                report.record(file_hash, outcome.status, **outcome.detail)
+                if outcome.status == "error":
+                    consecutive_errors += 1
+                else:
+                    consecutive_errors = 0
+                self._emit("finish_file", track="hash", result=outcome.result)
+
+        self._flush_repeated_issues()
+        if not summary.stop_reason:
+            summary.stop_reason = "completed"
+        summary.report_path = report.finish(summary)
+        return summary
+
+    def _hash_worker_count(self, services: List[str]) -> int:
+        configured = self.settings.performance.hash_worker_count
+        return max(1, configured or len(services))
+
+    def _scan_one_hydrus_file(
+            self, file_hash: str, md5: str, deleted: List[str],
+            md5s: Dict[str, str], scan: "HydrusScanSettings",
+            ex: cf.Executor, summary: ScanSummary) -> "HydrusScanOutcome":
+        """Look one Hydrus file up and push what came back onto that file."""
+        item = FileItem(
+            path=Path(file_hash[:12]), relpath=file_hash, size=0, mtime=0.0,
+            kind="image", md5=md5)
+        result = self.hash_tier(item, ex)
+        metadata = result.metadata
+        sources = list(result.sources)
+        errors = set(item.lookup_errors)
+        via_duplicate: List[str] = []
+
+        # A deleted duplicate is the same picture under a different encoding,
+        # so a booru that knows it is describing the file that is still here.
+        # Only relationship "8" reaches this point; alternates never do.
+        want_duplicates = bool(deleted) and (
+            scan.deleted_duplicates_when == "always"
+            or not (metadata.tags or metadata.urls))
+        if want_duplicates:
+            for dup_hash in deleted:
+                if self.cancelled():
+                    break
+                dup_md5 = md5s.get(dup_hash)
+                if not dup_md5 or dup_md5 == md5:
+                    continue
+                dup_item = FileItem(
+                    path=Path(dup_hash[:12]), relpath=dup_hash, size=0,
+                    mtime=0.0, kind="image", md5=dup_md5)
+                dup_result = self.hash_tier(dup_item, ex)
+                errors |= dup_item.lookup_errors
+                if dup_result.metadata.tags or dup_result.metadata.urls:
+                    metadata.merge(dup_result.metadata)
+                    via_duplicate.append(dup_hash)
+                    for source in dup_result.sources:
+                        if source not in sources:
+                            sources.append(source)
+
+        detail: Dict[str, Any] = {
+            "md5": md5,
+            "sources": sources,
+            "tags": len(metadata.tags),
+            "urls": len(metadata.urls),
+            "deleted_duplicates": len(deleted),
+            "matched_via": via_duplicate,
+        }
+        if errors:
+            detail["errors"] = sorted(errors)
+
+        # Cancellation is not a miss either, and `hash_tier` reports a
+        # cancelled lookup as neither hit nor error — so without this a file
+        # interrupted mid-fan-out would be marked furtag:nomatch on partial
+        # evidence and never looked at again.
+        if self.cancelled():
+            return HydrusScanOutcome("cancelled", "cancelled", detail)
+
+        # A source that errored is not a miss. Leaving the file unmarked is the
+        # whole retry mechanism here: the next scan's "-furtag:scanned" will
+        # still select it, exactly as the folder pipeline leaves such a file
+        # unresolved in its ledger rather than sealing it as nomatch.
+        if errors:
+            summary.errors += 1
+            failed = "+".join(sorted(errors))
+            if metadata.tags or metadata.urls:
+                return HydrusScanOutcome(
+                    "error", f"partial match — retry later ({failed})", detail)
+            return HydrusScanOutcome(
+                "error", f"lookup failed ({failed})", detail)
+
+        summary.scanned += 1
+        if not (metadata.tags or metadata.urls):
+            self._mark_scan_state(file_hash, scan, "nomatch")
+            summary.unmatched += 1
+            return HydrusScanOutcome("nomatch", "no match", detail)
+
+        if scan.dry_run:
+            summary.tagged += 1
+            if via_duplicate:
+                summary.matched_via_deleted_duplicate += 1
+            for source in sources:
+                summary.source_hits[source] = summary.source_hits.get(
+                    source, 0) + 1
+            return HydrusScanOutcome(
+                "dry_run",
+                f"would write {len(metadata.tags)} tag(s) "
+                f"[{'+'.join(sources) or 'none'}]", detail)
+
+        if not self._push_scan_metadata(file_hash, metadata):
+            summary.errors += 1
+            detail["errors"] = sorted(set(detail.get("errors", [])) | {"output"})
+            return HydrusScanOutcome("error", "Hydrus write failed", detail)
+
+        self._mark_scan_state(file_hash, scan, "matched")
+        # "updated" is the Newly Tagged page; "duplicates" is Duplicate Tagged,
+        # which is where a file whose tags came from a deleted duplicate
+        # belongs — same meaning it has in the folder pipeline.
+        self._hydrus_add_to_page(
+            "duplicates" if via_duplicate else "updated", file_hash)
+        summary.tagged += 1
+        if via_duplicate:
+            summary.matched_via_deleted_duplicate += 1
+        for source in sources:
+            summary.source_hits[source] = summary.source_hits.get(source, 0) + 1
+        suffix = (f" via {len(via_duplicate)} deleted duplicate(s)"
+                  if via_duplicate else "")
+        return HydrusScanOutcome(
+            "matched",
+            f"{len(metadata.tags)} tag(s) [{'+'.join(sources)}]{suffix}",
+            detail)
+
+    def _push_scan_metadata(
+            self, file_hash: str, metadata: SourceMetadata) -> bool:
+        """Write tags/URLs/notes onto one existing Hydrus file."""
+        ok = True
+        try:
+            if metadata.tags:
+                self._hydrus_add_tags(file_hash, metadata.tags)
+        except Exception as e:
+            self._notify_repeated_issue(
+                "scan_add_tags", "Hydrus scan tag writes",
+                f"⚠️  Hydrus: tagging {file_hash[:12]} failed ({e}).")
+            return False
+        if (metadata.notes and self.hydrus_direct_notes_enabled
+                and self.hydrus_can_edit_notes):
+            try:
+                self._hydrus_set_notes(file_hash, metadata.notes)
+            except Exception as e:
+                ok = False
+                self._notify_repeated_issue(
+                    "scan_notes", "Hydrus scan note writes",
+                    f"⚠️  Hydrus: note write for {file_hash[:12]} failed ({e}).")
+        if metadata.urls and self.hydrus_can_edit_urls:
+            if not self._hydrus_route_urls(
+                    Path(file_hash[:12]), file_hash, metadata.urls,
+                    url_policy=UrlWritePolicy.ENRICH_HASH_POSTS,
+                    force_associate_urls=metadata.force_associate_urls):
+                ok = False
+        return ok
+
+    def _mark_scan_state(
+            self, file_hash: str, scan: "HydrusScanSettings",
+            state: str) -> None:
+        """Best-effort bookkeeping tag; never fails the file it describes."""
+        if not scan.mark_state_tags or scan.dry_run:
+            return
+        tags = {self.hydrus_scan_tag(scan, "scanned"),
+                self.hydrus_scan_tag(scan, state)}
+        try:
+            self.hydrus_mark_scan_state(file_hash, tags, scan)
+        except Exception as e:
+            self._notify_repeated_issue(
+                "scan_state_tags", "Hydrus scan marker writes",
+                f"⚠️  Hydrus: couldn't mark {file_hash[:12]} as {state} ({e}); "
+                f"it will be re-scanned next run.")
+
+
 def _unescape_path(raw: str) -> str:
     """Turn a Finder drag-and-drop path into a plain filesystem path.
 
@@ -5921,10 +6404,156 @@ def prompt_for_another_folder() -> bool:
     if not sys.stdin.isatty():
         return False
     try:
-        answer = input("\n📂 Scan another folder? [y/N]: ").strip().lower()
+        answer = input("\n📂 Run another scan? [y/N]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
     return answer in {"y", "yes"}
+
+
+def prompt_for_scan_target(has_hydrus: bool) -> str:
+    """'folder' or 'hydrus' — what this pass should work on."""
+    if not (has_hydrus and sys.stdin.isatty()):
+        return "folder"
+    try:
+        answer = input(
+            "\n🎯 Scan a [f]older on disk, or the [h]ydrus database? "
+            "[F/h]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return "folder"
+    return "hydrus" if answer in {"h", "hydrus", "db"} else "folder"
+
+
+def prompt_for_hydrus_scan(ti: "TagIntegrator",
+                           settings: Settings) -> Optional[HydrusScanSettings]:
+    """Configure one database scan interactively. None → the user backed out.
+
+    Saved settings supply every default, so answering with Enter throughout
+    repeats the previous scan — which, with ``-furtag:scanned`` in the query,
+    means "carry on where the last one stopped".
+    """
+    scan = deepcopy(settings.hydrus_scan)
+
+    def ask(prompt: str, default: str) -> str:
+        try:
+            answer = input(f"{prompt} [{default}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raise KeyboardInterrupt
+        return answer or default
+
+    def ask_int(prompt: str, default: int) -> int:
+        while True:
+            raw = ask(prompt, str(default))
+            try:
+                return max(0, int(raw))
+            except ValueError:
+                print("   Please enter a whole number.")
+
+    def ask_bool(prompt: str, default: bool) -> bool:
+        answer = ask(f"{prompt} [y/n]", "y" if default else "n").lower()
+        return answer.startswith("y")
+
+    try:
+        services = ti.hydrus_file_services()
+        if services:
+            print("\n📁 File domains:")
+            print("   0) Hydrus default (all local files)")
+            for i, (name, _key) in enumerate(services, start=1):
+                print(f"   {i}) {name}")
+            current = 0
+            for i, (_name, key) in enumerate(services, start=1):
+                if key == scan.file_service_key:
+                    current = i
+            choice = ask_int("   Which domain?", current)
+            if 1 <= choice <= len(services):
+                scan.file_service_name, scan.file_service_key = (
+                    services[choice - 1])
+            else:
+                scan.file_service_name = scan.file_service_key = ""
+
+        print("\n🔎 What to look at (0 = no limit):")
+        scan.max_tag_count = ask_int(
+            "   Only files with fewer than N tags", scan.max_tag_count)
+        scan.limit = ask_int("   Stop after N files", scan.limit)
+        scan.images_only = ask_bool("   Images only", scan.images_only)
+
+        print("\n👥 Deleted duplicates")
+        print("   A kept file the boorus don't know may share a duplicate "
+              "group with\n   a deleted file they do. Those hashes survive "
+              "deletion, so their tags\n   can be recovered onto the file you "
+              "still have.")
+        scan.include_deleted_duplicates = ask_bool(
+            "   Look them up", scan.include_deleted_duplicates)
+        if scan.include_deleted_duplicates:
+            always = ask_bool(
+                "   Even when the kept file already matched",
+                scan.deleted_duplicates_when == "always")
+            scan.deleted_duplicates_when = "always" if always else "on_miss"
+
+        print("\n📝 Bookkeeping")
+        scan.mark_state_tags = ask_bool(
+            f"   Mark files with '{scan.state_tag_prefix}:scanned' tags in "
+            f"Hydrus", scan.mark_state_tags)
+        if scan.mark_state_tags:
+            scan.skip_already_scanned = ask_bool(
+                "   Skip files a previous scan already marked",
+                scan.skip_already_scanned)
+        else:
+            scan.skip_already_scanned = False
+        scan.dry_run = ask_bool(
+            "   Dry run (report only, write nothing)", scan.dry_run)
+    except KeyboardInterrupt:
+        print("\n↩️  Cancelled.")
+        return None
+
+    normalize_hydrus_scan(scan)
+    predicates = ti.hydrus_scan_predicates(scan)
+    print("\n🔍 Hydrus query: "
+          + (" AND ".join(predicates) if predicates else "(everything)"))
+    print(f"   Domain: {scan.file_service_name or 'Hydrus default'}")
+    if scan.dry_run:
+        print("   DRY RUN — nothing will be written.")
+    try:
+        if not input("\n▶️  Start this scan? [Y/n]: ").strip().lower() in {
+                "", "y", "yes"}:
+            return None
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+    settings.hydrus_scan = scan
+    return scan
+
+
+def _run_hydrus_scan(ti: "TagIntegrator", settings: Settings,
+                     store: SettingsStore) -> None:
+    """One interactive database scan, from configuration to summary."""
+    scan = prompt_for_hydrus_scan(ti, settings)
+    if scan is None:
+        return
+    try:
+        store.save(settings)
+    except OSError as e:
+        notify(f"⚠️  Couldn't save scan settings ({e}); running anyway.")
+    try:
+        summary = ti.scan_hydrus_db(scan)
+    except RuntimeError as e:
+        print(f"\n‼️  {e}")
+        return
+    except KeyboardInterrupt:
+        ti.request_cancel()
+        print("\n⛔ Interrupted — files already marked stay marked.")
+        return
+
+    verb = "would tag" if scan.dry_run else "tagged"
+    print(f"\n📊 Hydrus scan {summary.stop_reason}: "
+          f"{summary.scanned} looked up, {summary.tagged} {verb}, "
+          f"{summary.unmatched} no match, {summary.errors} retryable "
+          f"error(s), {summary.skipped} skipped.")
+    if summary.deleted_duplicates_examined:
+        print(f"   {summary.matched_via_deleted_duplicate} file(s) matched "
+              f"only through a deleted duplicate "
+              f"({summary.deleted_duplicates_examined} looked up).")
+    if summary.report_path:
+        print(f"   Report: {summary.report_path}")
 
 
 def prompt_for_folder(settings: Optional[Settings] = None) -> Path:
@@ -6029,6 +6658,12 @@ def main() -> None:
             prompt_for_unmatched_import() if ti.hydrus_import else False)
 
     while True:
+        if prompt_for_scan_target(ti.has_hydrus) == "hydrus":
+            _run_hydrus_scan(ti, settings, store)
+            if not prompt_for_another_folder():
+                break
+            continue
+
         root = prompt_for_folder(settings)
         opts = RunOptions.from_settings(ti.settings)
         opts.import_unmatched = ti.hydrus_import_unmatched
