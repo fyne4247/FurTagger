@@ -29,7 +29,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+    QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
     QProgressBar, QScrollArea, QSpinBox, QSplitter, QTabWidget, QTextEdit,
     QVBoxLayout, QWidget, QInputDialog, QFrame, QSizePolicy,
@@ -993,6 +994,7 @@ class SettingsPanel(QWidget):
         # Hydrus pages
         hy = QWidget()
         hf = QFormLayout(hy)
+        hf.setVerticalSpacing(4)
         self.exact_url_enrichment = QCheckBox(
             "Also scrape exact URLs through Hydrus (slow)")
         self.exact_url_enrichment.setToolTip(
@@ -1055,10 +1057,10 @@ class SettingsPanel(QWidget):
         live_interval_layout.addRow(
             "Live update interval", self.live_page_interval)
         self.hydrus_profile_label = QLabel()
-        self.rotate_hydrus_profile = QPushButton(
-            "Use a new/replaced Hydrus database…")
+        self.rotate_hydrus_profile = QPushButton("Reset…")
         self.rotate_hydrus_profile.setToolTip(
-            "Rotate FurTag's non-secret Hydrus database identity. Use this "
+            "Use a new or replaced Hydrus database: rotates FurTag's "
+            "non-secret Hydrus database identity. Use this "
             "only after replacing the Hydrus database at this API address; "
             "existing completion checkpoints will be revalidated.")
         self.rotate_hydrus_profile.clicked.connect(
@@ -1069,18 +1071,27 @@ class SettingsPanel(QWidget):
         metadata_form.addRow(self.exact_url_enrichment)
         metadata_form.addRow("Downloader page name",
                              self.exact_url_enrichment_page_name)
-        metadata_note = QLabel(
+        metadata_group.setToolTip(
             "Hydrus owns this downloader page, so review-page limits and "
             "publication modes do not apply to it.")
-        metadata_note.setWordWrap(True)
-        metadata_form.addRow(metadata_note)
         hf.addRow(metadata_group)
         hf.addRow(self.results_pages)
-        for group in page_groups:
-            hf.addRow(group)
+        # The four review pages are the same short form four times over, so
+        # they go two by two rather than end to end. Stacked, they were most
+        # of the reason this page had to be scrolled.
+        page_grid = QGridLayout()
+        page_grid.setContentsMargins(0, 0, 0, 0)
+        page_grid.setHorizontalSpacing(8)
+        for i, group in enumerate(page_groups):
+            page_grid.addWidget(group, i // 2, i % 2)
+        page_grid.setColumnStretch(0, 1)
+        page_grid.setColumnStretch(1, 1)
+        hf.addRow(page_grid)
         hf.addRow(self.live_page_interval_box)
-        hf.addRow("Database identity", self.hydrus_profile_label)
-        hf.addRow(self.rotate_hydrus_profile)
+        identity_row = QHBoxLayout()
+        identity_row.addWidget(self.hydrus_profile_label, stretch=1)
+        identity_row.addWidget(self.rotate_hydrus_profile)
+        hf.addRow("Database identity", identity_row)
         self._add_tab("Hydrus", hy)
         self.results_pages.toggled.connect(
             self._update_page_interval_visibility)
@@ -1449,7 +1460,8 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
         act_settings = QAction("Settings…", self)
         act_settings.setToolTip("Open the Settings tab (scan defaults, sources, Hydrus options).")
-        act_settings.triggered.connect(lambda: self.main_tabs.setCurrentIndex(1))
+        act_settings.triggered.connect(
+            lambda: self.main_tabs.setCurrentIndex(self.TAB_SETTINGS))
         act_quit = QAction("Quit", self)
         act_quit.setShortcut(QKeySequence.StandardKey.Quit)
         act_quit.triggered.connect(self.close)
@@ -1457,29 +1469,30 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(act_quit)
 
-        # Hydrus menu — credentials + a manual reconnect that re-checks the
-        # API without restarting the app (the connection is otherwise only
-        # re-verified automatically before a scan or after editing credentials).
-        hydrus_menu = self.menuBar().addMenu("&Hydrus")
-        act_creds = QAction("Credentials…", self)
-        act_creds.setToolTip("Set the Hydrus Client API address and access key.")
-        act_creds.triggered.connect(self._edit_credentials)
-        act_reconnect = QAction("Reconnect / Rescan Sources", self)
-        act_reconnect.setToolTip(
-            "Re-check Hydrus and other configured sources right now, without "
-            "restarting FurTag.")
-        act_reconnect.triggered.connect(self._reconnect_sources)
-        hydrus_menu.addAction(act_creds)
-        hydrus_menu.addAction(act_reconnect)
-
         # Source status (always visible) — colored dots so they read as
-        # indicators, not clickable buttons.
+        # indicators, not clickable buttons. The two actions that change what
+        # those dots say sit on the same row: they used to be a Hydrus menu,
+        # which hid the only two settings that were not in the window.
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
         self.status_label.setTextFormat(Qt.TextFormat.RichText)
         self.status_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        root.addWidget(self.status_label)
+        self.creds_btn = QPushButton("Credentials…")
+        self.creds_btn.setToolTip(
+            "Set the Hydrus Client API address and access key.")
+        self.creds_btn.clicked.connect(self._edit_credentials)
+        self.reconnect_btn = QPushButton("Reconnect")
+        self.reconnect_btn.setToolTip(
+            "Re-check Hydrus and other configured sources right now, without "
+            "restarting FurTag. The connection is otherwise only re-verified "
+            "before a scan or after editing credentials.")
+        self.reconnect_btn.clicked.connect(self._reconnect_sources)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status_label, stretch=1)
+        status_row.addWidget(self.creds_btn)
+        status_row.addWidget(self.reconnect_btn)
+        root.addLayout(status_row)
 
         # Configuration on top, run output below, with a splitter between so
         # either half can be given the room. Each scan mode is a tab of its
@@ -1690,7 +1703,7 @@ class MainWindow(QMainWindow):
 
     #: Tab indices of the two scan modes. Settings is a third tab and does
     #: not change which mode the shared Start button acts on.
-    TAB_FOLDER, TAB_HYDRUS = 0, 1
+    TAB_FOLDER, TAB_HYDRUS, TAB_SETTINGS = 0, 1, 2
 
     def _scan_source(self) -> str:
         return "hydrus" if self._scan_tab == self.TAB_HYDRUS else "folder"
@@ -1710,6 +1723,12 @@ class MainWindow(QMainWindow):
                 QSizePolicy.Policy.Preferred if i == index
                 else QSizePolicy.Policy.Ignored)
         self.main_tabs.widget(index).adjustSize()
+        # Nothing on the run surface applies while you are editing settings,
+        # and it was taking two thirds of the window — which is what forced
+        # the settings pages to scroll. Hand the whole window over instead.
+        # A run cannot be in progress here: the tab bar is disabled while one
+        # is, so this can only be reached between runs.
+        self.split.widget(1).setVisible(index != self.TAB_SETTINGS)
         self._apply_scan_mode()
 
     def _remember_split(self, *_args) -> None:
@@ -1717,6 +1736,10 @@ class MainWindow(QMainWindow):
 
     def _apply_scan_mode(self) -> None:
         if not self._ui_ready:
+            return
+        # The splitter has one visible half on Settings, so there are no
+        # sizes to divide and the scan controls below are not on screen.
+        if self.main_tabs.currentIndex() == self.TAB_SETTINGS:
             return
         hydrus = self._scan_source() == "hydrus"
         # A database scan is hash-tier only and its results live in Hydrus, so
@@ -2199,6 +2222,9 @@ class MainWindow(QMainWindow):
         self.recent_folders.setEnabled(not running)
         self.clear_recents_btn.setEnabled(
             not running and bool(self.settings.history.recent_scan_paths))
+        # Both re-open connections the running scan is using.
+        self.creds_btn.setEnabled(not running)
+        self.reconnect_btn.setEnabled(not running)
 
     @Slot(object)
     def _on_event(self, event: RunEvent) -> None:
