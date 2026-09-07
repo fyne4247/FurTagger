@@ -88,7 +88,7 @@ from furtag_settings import (
 )
 from furtag_events import NullObserver, RunEvent, RunObserver, TerminalObserver
 from furtag_review import PendingReview, ReviewQueue
-from furtag_credentials import CredentialStore
+from furtag_credentials import CredentialStore, SECRET_FIELDS, redact_secrets
 from furtag_urls import UrlWritePolicy
 from furtag_hydrus import (
     HydrusMixin,
@@ -118,6 +118,13 @@ THUMB_SOURCE_MAX_PIXELS = 64_000_000
 # Seconds to pause the Fluffle lane after a 5xx, so a transient backend outage
 # doesn't chew through the remaining queue at full rate.
 FLUFFLE_SERVER_ERROR_BACKOFF = 15.0
+
+# Gelbooru drops TLS connections readily when the four hash lanes all fire at
+# once. A single dropped handshake is usually a one-off, so retry the request
+# in-place before giving up on the file; a lane that keeps refusing gets paused
+# instead, for the same reason Fluffle's 5xx path backs off.
+GELBOORU_CONNECT_ATTEMPTS = 2
+GELBOORU_CONNECT_BACKOFF = 10.0
 
 # Minimum seconds between successive requests to each service, chosen from each
 # API's documented / recommended limit. Because the four hash boorus run
@@ -532,6 +539,26 @@ def set_active_observer(observer: Optional[RunObserver]) -> RunObserver:
 _PERCEPTUAL_DONE = object()
 
 
+#: Live secret values, newest snapshot wins. Read from every worker thread and
+#: rewritten only by load_credentials(), so it is replaced as a whole tuple
+#: rather than mutated — a reader always sees one complete snapshot.
+_known_secrets: Tuple[str, ...] = ()
+
+
+def register_secrets(values: Iterable[str]) -> None:
+    """Record credential values so notify() can strip them from log text."""
+    global _known_secrets
+    # Longest first: an API key that contains a shorter secret as a substring
+    # must be masked whole, not left as a partially-redacted fragment.
+    _known_secrets = tuple(sorted(
+        {v for v in values if v and len(v) >= 4}, key=len, reverse=True))
+
+
+def redact(text: str) -> str:
+    """Mask every known credential value in *text*."""
+    return redact_secrets(text, list(_known_secrets))
+
+
 def notify(msg: str, *, severity: str = "warning") -> None:
     """User-facing messages for the active observer (BF-12).
 
@@ -541,9 +568,15 @@ def notify(msg: str, *, severity: str = "warning") -> None:
 
     Never ``print`` from inside the processing loop — that corrupts the live
     panel.
+
+    Every message is redacted on the way out. ``requests`` puts the full
+    request URL in its exception text, so an API key passed as a query
+    parameter (Gelbooru, SauceNAO) otherwise lands verbatim in the GUI log and
+    in any screenshot of it. Redacting here rather than at each raise site
+    means a new source cannot forget to do it.
     """
     kind = "log" if severity == "info" else "issue"
-    _active_observer.emit(RunEvent(kind=kind, message=str(msg)))
+    _active_observer.emit(RunEvent(kind=kind, message=redact(str(msg))))
 
 
 def notify_info(msg: str) -> None:
@@ -1631,6 +1664,9 @@ class TagIntegrator(HydrusMixin):
         """
         if cfg is None:
             cfg = CredentialStore().load_all().as_cfg()
+        # Before anything can fail and be logged: notify() masks these, and a
+        # credential load is the only moment the set can change.
+        register_secrets(cfg.get(f, "") for f in SECRET_FIELDS)
         print("🔑 Loading credentials from secure store / environment")
 
         # Credential editing is live in the GUI. Clear every capability derived
@@ -2582,31 +2618,51 @@ class TagIntegrator(HydrusMixin):
     # ── Gelbooru API ─────────────────────────────────────────────────────────
 
     def _gelbooru_get(self, params: Dict) -> Optional[object]:
-        self.pace["gelbooru"].wait()
-        if self.cancelled():
-            raise RetryableLookupError("Gelbooru lookup cancelled")
-        try:
-            r = self.session.get(
-                "https://gelbooru.com/index.php",
-                params={**params, "api_key": self.gelbooru_api_key,
-                        "user_id": self.gelbooru_user_id},
-                headers={"User-Agent": "HydrusIntegrator/5.0"},
-                timeout=15,
-            )
-            if r.status_code in (401, 403):
-                raise self._reject_source_auth(
-                    "gelbooru",
-                    "‼️  Gelbooru authentication rejected – disabled until "
-                    "credentials are reloaded.")
-            if r.status_code == 404:
-                return []
-            if r.status_code != 200:
+        """One Gelbooru API call, retried once past a dropped connection.
+
+        Gelbooru closes connections mid-handshake often enough that a lone
+        ``SSLEOFError`` says nothing about the file being looked up — the same
+        MD5 usually succeeds on the next attempt. Only transport failures are
+        retried: a bad response the server actually sent is a real answer and
+        is raised as it stands. Once the retry is also spent the lane pauses,
+        so a Gelbooru outage doesn't burn the rest of the queue at full rate.
+        """
+        last: Optional[Exception] = None
+        for attempt in range(GELBOORU_CONNECT_ATTEMPTS):
+            self.pace["gelbooru"].wait()
+            if self.cancelled():
+                raise RetryableLookupError("Gelbooru lookup cancelled")
+            try:
+                r = self.session.get(
+                    "https://gelbooru.com/index.php",
+                    params={**params, "api_key": self.gelbooru_api_key,
+                            "user_id": self.gelbooru_user_id},
+                    headers={"User-Agent": "HydrusIntegrator/5.0"},
+                    timeout=15,
+                )
+            except requests.RequestException as e:
+                last = e
+                continue
+            try:
+                if r.status_code in (401, 403):
+                    raise self._reject_source_auth(
+                        "gelbooru",
+                        "‼️  Gelbooru authentication rejected – disabled until "
+                        "credentials are reloaded.")
+                if r.status_code == 404:
+                    return []
+                if r.status_code != 200:
+                    raise RetryableLookupError(
+                        f"Gelbooru returned HTTP {r.status_code}")
+                return r.json()
+            except ValueError as e:
                 raise RetryableLookupError(
-                    f"Gelbooru returned HTTP {r.status_code}")
-            return r.json()
-        except (requests.RequestException, ValueError) as e:
-            raise RetryableLookupError(
-                f"Gelbooru request failed: {e}") from e
+                    f"Gelbooru request failed: {e}") from e
+        self.pace["gelbooru"].backoff(GELBOORU_CONNECT_BACKOFF)
+        raise RetryableLookupError(
+            f"Gelbooru request failed after {GELBOORU_CONNECT_ATTEMPTS} "
+            f"attempts: {last}; backing off "
+            f"{GELBOORU_CONNECT_BACKOFF:g}s") from last
 
     def gelbooru_lookup_by_md5(self, md5: str) -> Tuple[Set[str], Set[str]]:
         if not md5 or not self.has_gelbooru:

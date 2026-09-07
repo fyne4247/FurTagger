@@ -1467,3 +1467,62 @@ class TestAuthRejectionKeepsFilesUnresolved(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGelbooruConnectionRetry(unittest.TestCase):
+    """A dropped TLS connection is a transport fault, not an answer.
+
+    Gelbooru closes connections mid-handshake under the concurrent hash tier,
+    which used to cost the file its Gelbooru lookup outright. Transport faults
+    now retry; anything the server actually replied with is taken at face
+    value and must NOT be retried.
+    """
+
+    def _integrator(self, session):
+        ti = TagIntegrator(settings=Settings(), session=session)
+        ti.gelbooru_user_id = "2000017"
+        ti.gelbooru_api_key = "secret-gelbooru-key"
+        ti.has_gelbooru = True
+        return ti
+
+    def test_a_dropped_connection_is_retried_and_can_succeed(self):
+        attempts = []
+
+        class Flaky(FakeSession):
+            def get(self, url, **kwargs):
+                attempts.append(url)
+                if len(attempts) == 1:
+                    raise requests.exceptions.SSLError(
+                        "EOF occurred in violation of protocol")
+                return FakeResponse(200, {"post": [{"id": 7}]})
+
+        ti = self._integrator(Flaky())
+        self.assertEqual(ti._gelbooru_get({"tags": "md5:abc"}),
+                         {"post": [{"id": 7}]})
+        self.assertEqual(len(attempts), 2)
+
+    def test_exhausted_retries_back_off_the_lane(self):
+        class Dead(FakeSession):
+            def get(self, url, **kwargs):
+                raise requests.exceptions.SSLError("EOF")
+
+        ti = self._integrator(Dead())
+        ti.pace["gelbooru"].interval = 0.0
+        with self.assertRaises(RetryableLookupError):
+            ti._gelbooru_get({"tags": "md5:abc"})
+        # The lane is pushed into the future, so the rest of the queue does not
+        # hammer a host that just refused every attempt.
+        self.assertGreater(ti.pace["gelbooru"]._next, 0.0)
+
+    def test_an_http_error_is_not_retried(self):
+        calls = []
+
+        class Broken(FakeSession):
+            def get(self, url, **kwargs):
+                calls.append(url)
+                return FakeResponse(503)
+
+        ti = self._integrator(Broken())
+        with self.assertRaises(RetryableLookupError):
+            ti._gelbooru_get({"tags": "md5:abc"})
+        self.assertEqual(len(calls), 1, "a real HTTP reply must not retry")

@@ -683,3 +683,55 @@ class TestUrlEnrichmentBoundary(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSecretRedaction(unittest.TestCase):
+    """Credential values must never reach an observer.
+
+    `requests` puts the full request URL in its exception text, so a key sent
+    as a query parameter (Gelbooru, SauceNAO) used to arrive verbatim in the
+    GUI issue pane — and in any screenshot of it. notify() is the single choke
+    point every user-facing message passes through, so redaction lives there.
+    """
+
+    def setUp(self):
+        self._saved = furtag._known_secrets
+        self.obs = RecordingObserver()
+        self._prev = set_active_observer(self.obs)
+
+    def tearDown(self):
+        set_active_observer(self._prev)
+        furtag._known_secrets = self._saved
+
+    def test_a_registered_key_is_masked_in_an_error_message(self):
+        key = "7f523cde31a265523740f4317e979bbf"
+        furtag.register_secrets([key])
+        notify(f"❌ gelbooru failed on a.gif: ...&api_key={key}&user_id=2000017")
+        message = self.obs.events[-1].message
+        self.assertNotIn(key, message)
+        self.assertIn("***", message)
+        # Everything else survives — a redacted log is still a useful log.
+        self.assertIn("a.gif", message)
+        self.assertIn("user_id=2000017", message)
+
+    def test_load_credentials_registers_every_secret_field(self):
+        ti = TagIntegrator(settings=Settings())
+        with contextlib.redirect_stdout(io.StringIO()):
+            ti.load_credentials(cfg={
+                "gelbooru_user_id": "2000017",
+                "gelbooru_api_key": "gel-secret-value",
+                "sauce_nao_api_key": "sauce-secret-value",
+                "e621_username": "someone",
+            })
+        notify("gel-secret-value and sauce-secret-value leaked")
+        message = self.obs.events[-1].message
+        self.assertNotIn("gel-secret-value", message)
+        self.assertNotIn("sauce-secret-value", message)
+        # A username is not a secret and stays readable.
+        notify("user someone")
+        self.assertIn("someone", self.obs.events[-1].message)
+
+    def test_a_longer_secret_containing_a_shorter_one_is_masked_whole(self):
+        furtag.register_secrets(["abcd", "abcd1234efgh"])
+        notify("key=abcd1234efgh")
+        self.assertEqual(self.obs.events[-1].message, "key=***")
