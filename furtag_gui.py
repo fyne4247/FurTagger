@@ -1728,7 +1728,11 @@ class MainWindow(QMainWindow):
         # the settings pages to scroll. Hand the whole window over instead.
         # A run cannot be in progress here: the tab bar is disabled while one
         # is, so this can only be reached between runs.
-        self.split.widget(1).setVisible(index != self.TAB_SETTINGS)
+        #
+        # Guarded because addTab() emits currentChanged for the first tab,
+        # which happens before the run surface joins the splitter.
+        if self._ui_ready:
+            self.split.widget(1).setVisible(index != self.TAB_SETTINGS)
         self._apply_scan_mode()
 
     def _remember_split(self, *_args) -> None:
