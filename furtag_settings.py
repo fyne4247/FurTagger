@@ -62,6 +62,13 @@ DEFAULT_JSON_PATTERN = "{name}{ext}.json"
 FLUFFLE_MATCH_CLASSES = ("exact", "tossUp", "alternative", "unlikely")
 FLUFFLE_REVIEW_MODES = ("off", "tossups", "tossups_alternatives")
 HYDRUS_PAGE_MODES = ("live", "end_of_run")
+HYDRUS_SCAN_DUPLICATE_MODES = ("on_miss", "always")
+# Hydrus file_sort_type values FurTag exposes. Import time is the only one
+# that makes a capped scan resumable: a stable order means run two starts
+# where run one stopped instead of resampling the same head of the DB.
+HYDRUS_SCAN_SORT_TYPES = (0, 1, 2, 3, 4, 8)
+DEFAULT_HYDRUS_SCAN_LIMIT = 500
+DEFAULT_SCAN_STATE_TAG_PREFIX = "furtag"
 
 
 @dataclass
@@ -121,6 +128,51 @@ class HydrusSettings:
 
 
 @dataclass
+class HydrusScanSettings:
+    """Selection and budget for a Hydrus database scan (hash tier only).
+
+    Everything in the first block becomes a Hydrus search predicate, so the
+    client does the filtering server-side and FurTag never enumerates files it
+    has no intention of looking up.
+    """
+
+    # ── What to scan ────────────────────────────────────────────────────────
+    file_service_key: str = ""      # "" → Hydrus's default (all local files)
+    file_service_name: str = ""     # display only; the key is authoritative
+    images_only: bool = True        # the hash tier cannot help with video
+    max_tag_count: int = 0          # 0 = off → "system:number of tags < N"
+    tag_count_service: str = ""     # optional service qualifier for the above
+    inbox_only: bool = False
+    archive_only: bool = False
+    extra_predicates: List[str] = field(default_factory=list)
+    limit: int = DEFAULT_HYDRUS_SCAN_LIMIT   # 0 = no cap (whole domain)
+    sort_type: int = 0              # 0 = import time; see HYDRUS_SCAN_SORT_TYPES
+    sort_ascending: bool = True
+
+    # ── Deleted duplicates ──────────────────────────────────────────────────
+    # A kept file whose MD5 no booru knows may sit in a duplicate group with a
+    # deleted member the boorus *do* know. Those hashes survive deletion in
+    # Hydrus, so they are free extra lookups whose results belong to the file
+    # that is still here. Only relationship "8" (duplicate) is followed —
+    # alternates are deliberately different images.
+    include_deleted_duplicates: bool = True
+    deleted_duplicates_when: str = "on_miss"   # "on_miss" | "always"
+    max_deleted_duplicates: int = 8            # per kept file, 0 = unlimited
+
+    # ── Bookkeeping ─────────────────────────────────────────────────────────
+    mark_state_tags: bool = True
+    state_tag_service: str = ""     # "" → the configured output tag service
+    state_tag_prefix: str = DEFAULT_SCAN_STATE_TAG_PREFIX
+    skip_already_scanned: bool = True
+    write_report: bool = True
+
+    # ── Budgets ─────────────────────────────────────────────────────────────
+    dry_run: bool = False
+    time_budget_minutes: int = 0    # 0 = unlimited
+    max_consecutive_errors: int = 25  # 0 = never stop early
+
+
+@dataclass
 class SourceSettings:
     e621_enabled: bool = True
     inkbunny_enabled: bool = True
@@ -175,6 +227,8 @@ class Settings:
     version: int = SETTINGS_VERSION
     output: OutputSettings = field(default_factory=OutputSettings)
     hydrus: HydrusSettings = field(default_factory=HydrusSettings)
+    hydrus_scan: HydrusScanSettings = field(
+        default_factory=HydrusScanSettings)
     sources: SourceSettings = field(default_factory=SourceSettings)
     matching: MatchingSettings = field(default_factory=MatchingSettings)
     pdf: PdfSettings = field(default_factory=PdfSettings)
@@ -220,6 +274,8 @@ class Settings:
                 hydrus_data.get("build_already_tagged_page", False))
             for prefix in ("new_imports", "newly_tagged", "duplicate_tagged"):
                 setattr(base.hydrus, f"{prefix}_page_mode", "live")
+        base.hydrus_scan = _merge_dataclass(
+            HydrusScanSettings, data.get("hydrus_scan"))
         base.sources = _merge_dataclass(SourceSettings, data.get("sources"))
         base.matching = _merge_dataclass(MatchingSettings, data.get("matching"))
         base.pdf = _merge_dataclass(PdfSettings, data.get("pdf"))
@@ -319,6 +375,7 @@ def _normalize_settings(s: Settings) -> None:
             0, int(s.performance.hash_worker_count))
     except (TypeError, ValueError):
         s.performance.hash_worker_count = 0
+    normalize_hydrus_scan(s.hydrus_scan)
     s.history.recent_scan_paths = normalize_recent_scan_paths(
         s.history.recent_scan_paths)
     # Stable non-secret Hydrus DB binding; generate once if missing.
@@ -327,6 +384,62 @@ def _normalize_settings(s: Settings) -> None:
         s.hydrus.hydrus_profile_uuid = str(uuid.uuid4())
     else:
         s.hydrus.hydrus_profile_uuid = profile.strip()
+
+
+def normalize_hydrus_scan(scan: "HydrusScanSettings") -> None:
+    """Clamp a Hydrus-scan section and drop predicates Hydrus would reject.
+
+    Predicates are free text the user can type, and a malformed one fails the
+    whole ``search_files`` call rather than being ignored — so anything that is
+    not a non-empty string is dropped here, once, instead of at each caller.
+    """
+    for attr, lo, hi in (
+            ("limit", 0, 1_000_000),
+            ("max_tag_count", 0, 100_000),
+            ("max_deleted_duplicates", 0, 1_000),
+            ("time_budget_minutes", 0, 10_080),
+            ("max_consecutive_errors", 0, 10_000),
+    ):
+        try:
+            setattr(scan, attr, max(lo, min(hi, int(getattr(scan, attr)))))
+        except (TypeError, ValueError):
+            setattr(scan, attr, getattr(HydrusScanSettings(), attr))
+    try:
+        sort_type = int(scan.sort_type)
+    except (TypeError, ValueError):
+        sort_type = 0
+    scan.sort_type = sort_type if sort_type in HYDRUS_SCAN_SORT_TYPES else 0
+    if scan.deleted_duplicates_when not in HYDRUS_SCAN_DUPLICATE_MODES:
+        scan.deleted_duplicates_when = "on_miss"
+    # inbox and archive are complements; asking for both matches nothing, which
+    # would look like an empty database rather than a contradictory filter.
+    if scan.inbox_only and scan.archive_only:
+        scan.inbox_only = scan.archive_only = False
+    predicates = scan.extra_predicates
+    if not isinstance(predicates, list):
+        predicates = []
+    seen: set[str] = set()
+    cleaned: List[str] = []
+    for raw in predicates:
+        if not isinstance(raw, str):
+            continue
+        text = raw.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        cleaned.append(text)
+    scan.extra_predicates = cleaned
+    prefix = scan.state_tag_prefix
+    if not isinstance(prefix, str) or not prefix.strip():
+        prefix = DEFAULT_SCAN_STATE_TAG_PREFIX
+    # A namespace separator in the prefix would produce "a:b:scanned", which is
+    # not a tag Hydrus namespaces the way the user expects.
+    scan.state_tag_prefix = prefix.strip().strip(":").lower() or (
+        DEFAULT_SCAN_STATE_TAG_PREFIX)
+    for attr in ("file_service_key", "file_service_name", "tag_count_service",
+                 "state_tag_service"):
+        value = getattr(scan, attr)
+        setattr(scan, attr, value.strip() if isinstance(value, str) else "")
 
 
 def normalize_hydrus_api_origin(api_url: str) -> str:
@@ -444,6 +557,17 @@ class ScanSummary:
     source_hits: Dict[str, int] = field(default_factory=dict)
     cancelled: bool = False
     total_items: int = 0
+    # ── Hydrus database scans only ──────────────────────────────────────────
+    # A scan looks up files in place, so "tagged" counts files whose Hydrus
+    # record gained something. These break that down and record why the run
+    # ended, which matters when a budget stopped it partway.
+    scanned: int = 0
+    errors: int = 0
+    skipped: int = 0
+    deleted_duplicates_examined: int = 0
+    matched_via_deleted_duplicate: int = 0
+    stop_reason: str = ""
+    report_path: str = ""
 
     def empty(self) -> bool:
         return (self.tagged == 0 and self.unmatched == 0 and
