@@ -77,6 +77,25 @@ def _fit_window_to_screen(window: QWidget, prefer_w: int = 900, prefer_h: int = 
         window.move(x, y)
 
 
+class _TypeableSpinBox(QSpinBox):
+    """A spin box whose special-value text does not block typing.
+
+    With text such as "no limit" showing, a click lands the caret in the
+    middle of the words and every typed digit is rejected as invalid. Taking
+    the whole text on focus means the first keystroke replaces it instead.
+    """
+
+    def focusInEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        super().focusInEvent(event)
+        QTimer.singleShot(0, self.selectAll)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        had_focus = self.hasFocus()
+        super().mousePressEvent(event)
+        if not had_focus and self.specialValueText() and self.value() == self.minimum():
+            self.selectAll()
+
+
 def _wrap_scroll(widget: QWidget) -> QScrollArea:
     """Put *widget* in a scroll area that can shrink below its contents."""
     scroll = QScrollArea()
@@ -249,24 +268,38 @@ class HydrusScanPanel(QWidget):
         self.load_from(scan)
 
     def _build(self) -> None:
-        root = QVBoxLayout(self)
+        # Three columns side by side, not one tall stack: the window is wider
+        # than it is tall, and a form that shows whole without scrolling is
+        # the whole point of giving the scan its own tab.
+        root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(6)
+        root.setSpacing(10)
+        left, mid, right = QVBoxLayout(), QVBoxLayout(), QVBoxLayout()
+        for column, stretch in ((left, 4), (mid, 3), (right, 3)):
+            column.setSpacing(6)
+            root.addLayout(column, stretch=stretch)
 
         # ── What to scan ────────────────────────────────────────────────────
         what = QGroupBox("Which files")
         wf = QFormLayout(what)
-        wf.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        wf.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         domain_row = QHBoxLayout()
         self.domain = QComboBox()
         self.domain.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.domain.setMinimumContentsLength(24)
-        self.refresh_services_btn = QPushButton("Refresh")
+        # A hard floor, since a combo's minimum is otherwise tiny and this is
+        # the first thing to get squeezed when three columns share a window.
+        self.domain.setMinimumWidth(150)
+        self.domain.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.refresh_services_btn = QPushButton("↻")
+        self.refresh_services_btn.setFixedWidth(30)
         self.refresh_services_btn.setToolTip(
-            "Ask Hydrus which file domains and tag services exist. Needs a "
-            "working connection.")
+            "Refresh: ask Hydrus which file domains and tag services exist. "
+            "Needs a working connection.")
         domain_row.addWidget(self.domain, stretch=1)
         domain_row.addWidget(self.refresh_services_btn)
         wf.addRow("File domain", domain_row)
@@ -274,7 +307,7 @@ class HydrusScanPanel(QWidget):
         self.domain_help.setWordWrap(True)
         wf.addRow("", self.domain_help)
 
-        self.max_tags = QSpinBox()
+        self.max_tags = _TypeableSpinBox()
         self.max_tags.setRange(0, 100_000)
         self.max_tags.setSpecialValueText("no limit")
         self.max_tags.setToolTip(
@@ -290,7 +323,7 @@ class HydrusScanPanel(QWidget):
             "no longer looks untagged.")
         wf.addRow("Counting tags in", self.tag_count_service)
 
-        self.limit = QSpinBox()
+        self.limit = _TypeableSpinBox()
         self.limit.setRange(0, 1_000_000)
         self.limit.setSpecialValueText("no cap")
         self.limit.setToolTip(
@@ -310,7 +343,11 @@ class HydrusScanPanel(QWidget):
         self.status_filter.addItem("Inbox only", "inbox")
         self.status_filter.addItem("Archive only", "archive")
         wf.addRow("File status", self.status_filter)
+        left.addWidget(what)
+        left.addStretch()
 
+        also = QGroupBox("Also require")
+        al = QVBoxLayout(also)
         self.extra_predicates = QTextEdit()
         self.extra_predicates.setPlaceholderText(
             "One Hydrus search predicate per line, e.g.\n"
@@ -321,30 +358,18 @@ class HydrusScanPanel(QWidget):
             "Anything you could type into a Hydrus search page. A predicate "
             "Hydrus rejects fails the whole search, so it is reported rather "
             "than skipped.")
-        wf.addRow("Also require", self.extra_predicates)
-        root.addWidget(what)
+        al.addWidget(self.extra_predicates)
 
-        # Deleted duplicates are not a decision worth surfacing: they cost
-        # nothing when a file already matched (they are only tried on a miss),
-        # they can only ever add tags the boorus already hold for that exact
-        # picture, and the settings remain editable from the CLI for anyone who
-        # wants to turn them off. The panel just says that it happens.
-        dupes = QGroupBox("Deleted duplicates")
-        dl = QVBoxLayout(dupes)
-        blurb = QLabel(
-            "When nothing recognises a file, FurTag also looks up any "
-            "duplicate you deleted. Hydrus keeps their hashes, so their tags "
-            "can be recovered onto the file you kept. Exact duplicates only — "
-            "never alternates, which are different artwork.")
-        blurb.setWordWrap(True)
-        dl.addWidget(blurb)
-        root.addWidget(dupes)
+        # Deleted duplicates are looked up automatically on a miss and are not
+        # mentioned here at all: they cost nothing when a file already
+        # matched, can only add tags the boorus hold for that exact picture,
+        # and stay editable from the CLI for anyone who wants them off.
 
         # ── Bookkeeping ─────────────────────────────────────────────────────
         book = QGroupBox("Bookkeeping")
         bf = QFormLayout(book)
         bf.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        self.mark_tags = QCheckBox("Mark scanned files with tags in Hydrus")
+        self.mark_tags = QCheckBox("Mark scanned files with tags")
         self.mark_tags.setToolTip(
             "Writes furtag:scanned plus furtag:matched or furtag:nomatch. This "
             "is how a capped scan continues through the database instead of "
@@ -371,29 +396,32 @@ class HydrusScanPanel(QWidget):
             "A JSONL line per file plus a text summary, saved beside "
             "settings.json.")
         bf.addRow(self.write_report)
-        root.addWidget(book)
+        mid.addWidget(book)
+        mid.addStretch()
 
         # ── Budgets ─────────────────────────────────────────────────────────
         budget = QGroupBox("Budget")
         gf = QFormLayout(budget)
         gf.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        self.dry_run = QCheckBox("Dry run — report only, write nothing")
+        self.dry_run = QCheckBox("Dry run (report only)")
         self.dry_run.setToolTip(
             "Bulk-tagging a live database is hard to undo. This runs every "
             "lookup and writes the report without touching Hydrus.")
         gf.addRow(self.dry_run)
 
-        self.time_budget = QSpinBox()
+        self.time_budget = _TypeableSpinBox()
         self.time_budget.setRange(0, 10_080)
         self.time_budget.setSpecialValueText("unlimited")
         self.time_budget.setSuffix(" min")
         gf.addRow("Stop after", self.time_budget)
 
-        self.max_errors = QSpinBox()
+        self.max_errors = _TypeableSpinBox()
         self.max_errors.setRange(0, 10_000)
         self.max_errors.setSpecialValueText("never")
-        gf.addRow("Stop after N failures in a row", self.max_errors)
-        root.addWidget(budget)
+        gf.addRow("Max failures in a row", self.max_errors)
+        right.addWidget(budget)
+        right.addWidget(also)
+        right.addStretch()
 
         # Built here but deliberately not added to this layout: the host
         # pins it outside the scroll area, because the query you are about to
@@ -402,7 +430,6 @@ class HydrusScanPanel(QWidget):
         self.preview.setWordWrap(True)
         self.preview.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        root.addStretch()
 
         for widget, signal in (
                 (self.domain, "currentIndexChanged"),
@@ -1541,15 +1568,10 @@ class MainWindow(QMainWindow):
         self.hydrus_panel.changed.connect(self._refresh_scan_preview)
         self.hydrus_panel.refresh_services_btn.clicked.connect(
             self._refresh_hydrus_services)
-        scroll = _wrap_scroll(self.hydrus_panel)
-        # Only ever scroll vertically: the form's natural width is the width
-        # it needs, and a horizontal bar under the group boxes is pure noise.
-        scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        hydrus_lay.addWidget(scroll, stretch=1)
-        # Pinned outside the scroll area: the query about to run is the last
-        # thing read before Start, so it must never be what scrolled away.
-        self.hydrus_panel.preview.setParent(hydrus_tab)
+        # No scroll area on purpose. The form is laid out to fit, and when
+        # the window is shorter than it the window grows (see
+        # _apply_scan_mode) rather than hiding half the options in a box.
+        hydrus_lay.addWidget(self.hydrus_panel, stretch=1)
         hydrus_lay.addWidget(self.hydrus_panel.preview)
         self.main_tabs.addTab(hydrus_tab, "Hydrus Scan")
 
@@ -1707,7 +1729,23 @@ class MainWindow(QMainWindow):
         self.open_report_btn.setEnabled(bool(self._last_report_path))
         if not self._split_user_set:
             total = max(400, self.split.height() or 880)
-            top = int(total * (0.66 if hydrus else 0.28))
+            if hydrus:
+                # Give the form exactly the room it needs so it shows whole.
+                # If the window is too short for that plus the run surface,
+                # grow the window once (as far as the screen allows) rather
+                # than hide options behind a scrollbar.
+                top = self.main_tabs.widget(self.TAB_HYDRUS).sizeHint().height()
+                top += self.main_tabs.tabBar().sizeHint().height() + 12
+                bottom = self.split.widget(1).minimumSizeHint().height()
+                short = top + bottom + self.split.handleWidth() - total
+                if short > 0 and self.isVisible():
+                    screen = self.screen().availableGeometry().height()
+                    grow = min(short, max(0, screen - self.height()))
+                    if grow:
+                        self.resize(self.width(), self.height() + grow)
+                        total += grow
+            else:
+                top = int(total * 0.28)
             self.split.setSizes([top, total - top])
         # Switching tabs mid-run must not clear the summary or re-enable Start.
         if self.scan_worker and self.scan_worker.isRunning():
