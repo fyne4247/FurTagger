@@ -65,10 +65,12 @@ packaging/build/
 .furtag_review.json
 .furtag_pdf.json
 .furtag_pdf_complete.json
+.furtag-tmp/
 duplicates.log
 
 # Local test media + generated sidecars
 test files/
+*.*.txt
 *.urls.txt
 
 # Editor / IDE
