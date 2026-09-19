@@ -86,6 +86,12 @@ class OutputSettings:
     sidecar_tag_filename: str = DEFAULT_TAG_PATTERN
     sidecar_url_filename: str = DEFAULT_URL_PATTERN
     sidecar_json_filename: str = DEFAULT_JSON_PATTERN
+    # A small post-run breakdown for people who enjoy seeing what happened.
+    # It is GUI-only; terminal output always retains the compact summary.
+    show_run_stats_dialog: bool = True
+    # Folder scans write one compact JSON summary beside Hydrus scan reports.
+    # This is independent of the on-disk per-directory ledgers.
+    write_folder_json_report: bool = True
 
 
 @dataclass
@@ -568,6 +574,12 @@ class ScanSummary:
     matched_via_deleted_duplicate: int = 0
     stop_reason: str = ""
     report_path: str = ""
+    # ── Folder scan recap ──────────────────────────────────────────────────
+    tagged_images: int = 0
+    tagged_videos: int = 0
+    duplicate_copies_tagged: int = 0
+    tag_assignments: int = 0
+    tag_counts: Dict[str, int] = field(default_factory=dict)
 
     def empty(self) -> bool:
         return (self.tagged == 0 and self.unmatched == 0 and

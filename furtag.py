@@ -66,6 +66,7 @@ import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
@@ -202,6 +203,7 @@ _MAGICK_MISSING_NOTIFIED = False
 # Written beside rendered PDF page PNGs so comic:/creator: survive later runs.
 PDF_META_FILE    = ".furtag_pdf.json"
 PDF_COMPLETE_FILE = ".furtag_pdf_complete.json"
+FURARCHIVER_METADATA_VERSION = 1
 
 # "Artist unknown" placeholder tags that every booru emits in some form — useless
 # noise in a Hydrus library, so they're dropped before writing. Compared against
@@ -339,7 +341,7 @@ class LiveDisplay:
         self.source_hits: Dict[str, int] = {
             name: 0 for name in
             ("e621", "inkbunny", "danbooru", "gelbooru",
-             "fluffle", "saucenao")
+             "fluffle", "saucenao", "furarchiver")
         }
         self._drawn = 0
         self._lock = threading.Lock()
@@ -499,7 +501,7 @@ class LiveDisplay:
                 f"{self._ABBR.get(name, name)} {self.source_hits.get(name, 0)}"
                 for name in (
                     "e621", "inkbunny", "danbooru", "gelbooru",
-                    "fluffle", "saucenao"
+                    "fluffle", "saucenao", "furarchiver"
                 )
             )
         )
@@ -646,6 +648,71 @@ class SourceMetadata:
         self.urls |= other.urls
         self.force_associate_urls |= other.force_associate_urls
         self.notes.update(other.notes)
+
+
+@dataclass(frozen=True)
+class FurArchiverArchive:
+    """Metadata declared by a FurArchiver ``_readme.txt`` marker."""
+
+    root: Path
+    artist: str
+
+
+class _FurArchiverDescriptionParser(HTMLParser):
+    """Extract the archival description from FurArchiver's tiny HTML file."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._pre_depth = 0
+        self._parts: List[str] = []
+
+    def handle_starttag(self, tag: str,
+                        attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if tag.lower() == "pre":
+            self._pre_depth += 1
+        elif tag.lower() == "br" and self._pre_depth:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "pre" and self._pre_depth:
+            self._pre_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._pre_depth:
+            self._parts.append(data)
+
+    def description(self) -> str:
+        return "".join(self._parts).strip()
+
+
+def _read_furarchiver_marker(directory: Path) -> Optional[FurArchiverArchive]:
+    """Recognise a FurArchiver export without trusting an arbitrary readme."""
+    marker = directory / "_readme.txt"
+    try:
+        text = marker.read_text("utf-8-sig")
+    except (OSError, UnicodeError):
+        return None
+    lines = [line.strip() for line in text.splitlines()]
+    if not any(line.lower() == "downloaded from furarchiver.net"
+               for line in lines[:4]):
+        return None
+    artist = next((line.split(":", 1)[1].strip()
+                   for line in lines
+                   if line.lower().startswith("artist:") and ":" in line), "")
+    if not artist:
+        return None
+    return FurArchiverArchive(directory, artist)
+
+
+def _filename_names_artist(filename: str, artist: str) -> bool:
+    """Match an artist token while allowing FurArchiver filename separators."""
+    words = re.findall(r"[\w]+", artist.casefold(), flags=re.UNICODE)
+    if not words:
+        return False
+    pattern = r"(?<![\w])" + r"[^\w]+".join(
+        re.escape(word) for word in words) + r"(?![\w])"
+    # Underscores are separators in these filenames, not part of artist names.
+    return re.search(pattern, filename.casefold().replace("_", ".")) is not None
 
 
 class RetryableLookupError(RuntimeError):
@@ -1005,7 +1072,8 @@ class Ledger:
                stamp_tagged_at: Optional[bool] = None,
                decoder_profile: Optional[str] = None,
                unreadable_reason: Optional[str] = None,
-               metadata_version: Optional[int] = None) -> None:
+               metadata_version: Optional[int] = None,
+               furarchiver_metadata_version: Optional[int] = None) -> None:
         # New writers must not introduce top-level hydrus_deleted; map to
         # matched + nested checkpoint if a caller still passes the legacy name.
         if status == "hydrus_deleted":
@@ -1045,6 +1113,9 @@ class Ledger:
                 direct_notes_applied = True
             if direct_notes_applied is not None:
                 record["direct_notes_applied"] = bool(direct_notes_applied)
+            if furarchiver_metadata_version is not None:
+                record["furarchiver_metadata_version"] = int(
+                    furarchiver_metadata_version)
             if not sha256:
                 # No fresh hash from this write (sidecar-only mode, or unmatched
                 # files with hydrus_import_unmatched off) — keep the one already
@@ -1451,6 +1522,42 @@ def hydrus_scan_report_dir() -> Path:
     return resolve_settings_path().parent / "scans"
 
 
+def write_folder_scan_report(root: Path, summary: ScanSummary) -> str:
+    """Write one compact, self-contained JSON result for a folder scan.
+
+    Unlike the per-directory ledgers this is an immutable run receipt: it is
+    useful for browsing past runs, and it survives even when a run was
+    cancelled partway through.
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = hydrus_scan_report_dir() / f"folder-scan-{stamp}.json"
+    payload = {
+        "type": "folder_scan",
+        "started_or_finished": stamp,
+        "root": str(root),
+        "status": "cancelled" if summary.cancelled else "completed",
+        "tagged": summary.tagged,
+        "tagged_images": summary.tagged_images,
+        "tagged_videos": summary.tagged_videos,
+        "duplicate_copies_tagged": summary.duplicate_copies_tagged,
+        "tag_assignments": summary.tag_assignments,
+        "tag_counts": dict(sorted(summary.tag_counts.items())),
+        "unmatched": summary.unmatched,
+        "duplicates": summary.duplicates,
+        "pending_review": summary.pending_review,
+        "total_items": summary.total_items,
+        "source_hits": dict(sorted(summary.source_hits.items())),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, json.dumps(payload, ensure_ascii=False,
+                                           indent=2, sort_keys=True) + "\n")
+        return str(path)
+    except OSError as e:
+        notify(f"⚠️  Couldn't write folder scan report ({e}).")
+        return ""
+
+
 class HydrusScanReport:
     """Append-only JSONL record of one database scan, plus a text summary.
 
@@ -1667,6 +1774,9 @@ class TagIntegrator(HydrusMixin):
         self._hydrus_page_stop = False
         self._hydrus_page_run_active = False
         self._hydrus_page_failures: Dict[str, str] = {}
+        self._furarchiver_scan_root: Optional[Path] = None
+        self._furarchiver_marker_cache: Dict[
+            Path, Optional[FurArchiverArchive]] = {}
         self.apply_settings(self.settings)
 
     def apply_settings(self, settings: Settings) -> None:
@@ -2016,6 +2126,11 @@ class TagIntegrator(HydrusMixin):
         """Ledger.record with automatic search_profile_hash for search results."""
         if status in ("matched", "nomatch"):
             kwargs.setdefault("search_profile_hash", self.search_profile_hash())
+        media = ledger.dir / name
+        if self._furarchiver_metadata_applicable(media):
+            kwargs.setdefault(
+                "furarchiver_metadata_version",
+                FURARCHIVER_METADATA_VERSION)
         if "mtime_ns" not in kwargs:
             try:
                 st = (ledger.dir / name).stat()
@@ -2074,6 +2189,13 @@ class TagIntegrator(HydrusMixin):
         has_sidecar = self.has_sidecar(path, present=present)
         rec = ledger._fresh_record(
             fn, st.st_size, st.st_mtime, mtime_ns=mtime_ns)
+        archive_backfill = (
+            self._furarchiver_metadata_applicable(path)
+            and (not isinstance(rec, dict) or rec.get(
+                "furarchiver_metadata_version")
+                != FURARCHIVER_METADATA_VERSION))
+        if archive_backfill:
+            return False
         # A pre-existing/manual sidecar with no ledger row remains a supported
         # import boundary. Once FurTag has a row, however, the sidecar satisfies
         # only the sidecar sink; it cannot hide a stale search profile, a
@@ -3390,7 +3512,9 @@ class TagIntegrator(HydrusMixin):
         counting a foreign file here would silently exclude the media from every
         future scan (same root cause as the Reset-deletes-metadata bug).
         """
-        for p in self._tag_sidecar_candidates(media) + self._url_sidecar_candidates(media):
+        for p in (self._tag_sidecar_candidates(media)
+                  + self._url_sidecar_candidates(media)
+                  + [self._hydrus_pending_path(media)]):
             if present is not None and p.name not in present:
                 continue
             if p.exists():
@@ -3403,6 +3527,15 @@ class TagIntegrator(HydrusMixin):
         """Read tags and URLs from any supported sidecar shape beside *media*."""
         tags: Set[str] = set()
         urls: Set[str] = set()
+        pending = self._hydrus_pending_path(media)
+        if pending.is_file():
+            try:
+                data = json.loads(pending.read_text("utf-8"))
+                if isinstance(data, dict):
+                    tags |= {str(t) for t in data.get("tags") or [] if t}
+                    urls |= {str(u) for u in data.get("urls") or [] if u}
+            except (OSError, ValueError, TypeError):
+                pass
         # JSON first (single file with both). Same guard as has_sidecar: a
         # gallery-dl `<media>.<ext>.json` is not ours, and ingesting its "tags"
         # would push a foreign tool's vocabulary into Hydrus.
@@ -3504,6 +3637,99 @@ class TagIntegrator(HydrusMixin):
         return _pdf_base_tags_from_meta(
             meta, page=page_n, fallback_comic=media.parent.name)
 
+    def _begin_furarchiver_scan(self, root: Path) -> None:
+        """Reset the cheap per-run archive-marker cache."""
+        self._furarchiver_scan_root = Path(root).resolve()
+        self._furarchiver_marker_cache = {}
+
+    def _furarchiver_archive_for(
+            self, media: Path) -> Optional[FurArchiverArchive]:
+        """Return the nearest enclosing FurArchiver archive, if any."""
+        root = self._furarchiver_scan_root
+        if root is None:
+            return None
+        current = media.parent.resolve()
+        try:
+            current.relative_to(root)
+        except ValueError:
+            return None
+        while True:
+            if current not in self._furarchiver_marker_cache:
+                self._furarchiver_marker_cache[current] = (
+                    _read_furarchiver_marker(current))
+            archive = self._furarchiver_marker_cache[current]
+            if archive is not None:
+                return archive
+            if current == root:
+                return None
+            current = current.parent
+
+    def _furarchiver_metadata_applicable(self, media: Path) -> bool:
+        archive = self._furarchiver_archive_for(media)
+        if archive is None:
+            return False
+        return (_filename_names_artist(media.name, archive.artist)
+                or self._furarchiver_description_path(
+                    media, archive) is not None)
+
+    @staticmethod
+    def _furarchiver_description_path(
+            media: Path,
+            archive: FurArchiverArchive) -> Optional[Path]:
+        """Find either FurArchiver description layout.
+
+        Exports can put ``file.ext.html`` beside the media, or put media in
+        ``Images/`` and the same HTML filename in a sibling ``Descriptions/``.
+        """
+        candidates = (
+            Path(str(media) + ".html"),
+            archive.root / "Descriptions" / f"{media.name}.html",
+        )
+        return next((path for path in candidates if path.is_file()), None)
+
+    def _furarchiver_description(
+            self, media: Path, archive: FurArchiverArchive) -> str:
+        description_path = self._furarchiver_description_path(media, archive)
+        if description_path is None:
+            return ""
+        try:
+            raw = description_path.read_text("utf-8-sig")
+        except (OSError, UnicodeError):
+            return ""
+        parser = _FurArchiverDescriptionParser()
+        try:
+            parser.feed(raw)
+            parser.close()
+        except Exception:
+            return ""
+        return parser.description()
+
+    def _merge_furarchiver_metadata(
+            self, metadata: SourceMetadata, media: Path) -> bool:
+        """Add trustworthy local archive metadata to an existing source hit.
+
+        Returns True when the paired archive contributed a tag or a unique
+        description. Description values already supplied by a booru are not
+        repeated under a second Hydrus note name.
+        """
+        archive = self._furarchiver_archive_for(media)
+        if archive is None:
+            return False
+        contributed = False
+        if _filename_names_artist(media.name, archive.artist):
+            before = len(metadata.tags)
+            metadata.tags.update({
+                f"creator:{archive.artist}",
+                "site:furarchiver",
+                "site:furaffinity",
+            })
+            contributed = contributed or len(metadata.tags) != before
+        description = self._furarchiver_description(media, archive)
+        if description and description not in metadata.notes.values():
+            metadata.notes["furaffinity description"] = description
+            contributed = True
+        return contributed
+
     def write_results(
             self, media: Path, tags: Set[str], urls: Set[str],
             known_sha256: Optional[str] = None,
@@ -3558,6 +3784,15 @@ class TagIntegrator(HydrusMixin):
             if self.write_sidecars:
                 sidecar_complete = self._write_sidecar_results(
                     media, tags, urls)
+            elif not push.complete:
+                # Sidecars are optional, but losing a completed source lookup
+                # because Hydrus timed out is not. Keep a private payload until
+                # the Hydrus sink accepts it.
+                sidecar_complete = self._write_hydrus_pending(
+                    media, tags, urls, notes, push.sha256, url_policy,
+                    force_associate)
+            elif push.complete:
+                self._delete_hydrus_pending(media)
             complete = push.complete and sidecar_complete
             checkpoint = push.to_ledger_checkpoint()
             if not push.complete and sidecar_complete:
@@ -3580,11 +3815,28 @@ class TagIntegrator(HydrusMixin):
                 hydrus_complete=push.complete,
                 sidecar_complete=sidecar_complete)
 
-        if self.write_sidecars:
+        if self.write_sidecars and not (
+                self.settings.output.hydrus_enabled
+                and not self.settings.output.sidecars_enabled):
             sidecar_complete = self._write_sidecar_results(media, tags, urls)
             return WriteOutcome(
                 None, sidecar_complete,
                 hydrus_complete=True, sidecar_complete=sidecar_complete)
+        if self.settings.output.hydrus_enabled and (tags or urls or notes):
+            # Hydrus was configured but unavailable at startup. Stage the
+            # completed lookup privately rather than writing visible sidecars.
+            staged = self._write_hydrus_pending(
+                media, tags, urls, notes, known_sha256, url_policy,
+                force_associate)
+            return WriteOutcome(
+                known_sha256, False,
+                hydrus_complete=False, sidecar_complete=staged,
+                hydrus_output={
+                    "import_state": "retryable_failure",
+                    "metadata_state": "retryable_failure",
+                    "complete": False,
+                    "reason": "Hydrus API unavailable; output staged",
+                })
         return WriteOutcome(
             None, not (tags or urls),
             hydrus_complete=True, sidecar_complete=True)
@@ -4118,8 +4370,28 @@ class TagIntegrator(HydrusMixin):
                     sidecar_st.st_size,
                     sidecar_st.st_mtime_ns,
                 ))
+            archive = self._furarchiver_archive_for(media)
+            if archive is None:
+                # Preserve pre-feature manifests byte-for-byte for ordinary
+                # folders; only real FurArchiver exports should reopen.
+                entries.append((
+                    name, st.st_size, st.st_mtime_ns, sorted(sidecars)))
+                continue
+            archive_aux: List[Tuple[str, int, int]] = []
+            description_path = self._furarchiver_description_path(
+                media, archive)
+            for auxiliary in filter(None, (
+                    archive.root / "_readme.txt", description_path)):
+                try:
+                    aux_st = auxiliary.stat()
+                except OSError:
+                    continue
+                archive_aux.append((
+                    auxiliary.name, aux_st.st_size, aux_st.st_mtime_ns))
             entries.append((
-                name, st.st_size, st.st_mtime_ns, sorted(sidecars)))
+                name, st.st_size, st.st_mtime_ns, sorted(sidecars),
+                FURARCHIVER_METADATA_VERSION, archive.artist,
+                sorted(archive_aux)))
         encoded = json.dumps(
             entries, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
@@ -4914,8 +5186,13 @@ class TagIntegrator(HydrusMixin):
             self.apply_settings(options.settings_override)
         self._hydrus_start_result_page_run()
         try:
-            return self._run_pipeline(
+            summary = self._run_pipeline(
                 root, options, cancel_event, use_terminal_display, pdf_dpi)
+            if self.settings.output.write_folder_json_report:
+                summary.report_path = write_folder_scan_report(root, summary)
+                if summary.report_path:
+                    print(f"🗒️  Folder scan report: {summary.report_path}")
+            return summary
         finally:
             self._hydrus_finalize_result_page_run()
             self._detach_display()
@@ -4958,7 +5235,8 @@ class TagIntegrator(HydrusMixin):
         summary = ScanSummary(
             source_hits={k: 0 for k in
                          ("e621", "inkbunny", "danbooru",
-                          "gelbooru", "fluffle", "saucenao")})
+                          "gelbooru", "fluffle", "saucenao",
+                          "furarchiver")})
 
         # Apply run options onto instance
         if options is not None:
@@ -4966,8 +5244,16 @@ class TagIntegrator(HydrusMixin):
             if options.sync_sidecars and self.has_hydrus:
                 self.sync_sidecars_to_hydrus(Path(root))
 
+        root = Path(root).resolve()
+        self._begin_furarchiver_scan(root)
         discovery = self.discover(root)
         root = discovery["root"]
+        root_archive = _read_furarchiver_marker(root)
+        if root_archive is not None:
+            self._furarchiver_marker_cache[root] = root_archive
+            print(
+                f"📦 FurArchiver archive detected — artist: "
+                f"{root_archive.artist}")
         items: List[FileItem] = discovery["items"]
         candidate_dirs: Set[Path] = discovery["candidate_dirs"]
         pdf_page_dirs: Set[Path] = discovery["pdf_page_dirs"]
@@ -5126,6 +5412,18 @@ class TagIntegrator(HydrusMixin):
             with counts_lock:
                 pending_review_count += 1
 
+        def _record_tagged_media(item: FileItem, tags: Set[str]) -> None:
+            """Collect a small, run-local recap without asking Hydrus again."""
+            with counts_lock:
+                if item.kind == "video":
+                    summary.tagged_videos += 1
+                else:
+                    summary.tagged_images += 1
+                summary.tag_assignments += len(tags)
+                for tag in tags:
+                    summary.tag_counts[tag] = (
+                        summary.tag_counts.get(tag, 0) + 1)
+
         def _propagate_duplicates(
                 item: FileItem, tags: Set[str], urls: Set[str],
                 sources: List[str], sha256: Optional[str],
@@ -5227,13 +5525,25 @@ class TagIntegrator(HydrusMixin):
                     notes = (perceptual_result.metadata.notes
                              if isinstance(perceptual_result, PerceptualTierResult)
                              else {})
-                    if review_raw is not None and not (tags or urls):
+                    search_found = bool(tags or urls or notes)
+                    if not (review_raw is not None and not search_found):
+                        metadata = (
+                            perceptual_result.metadata
+                            if isinstance(perceptual_result, PerceptualTierResult)
+                            else SourceMetadata(set(tags), set(urls), dict(notes)))
+                        if self._merge_furarchiver_metadata(
+                                metadata, item.path):
+                            if "furarchiver" not in sources:
+                                sources.append("furarchiver")
+                        tags, urls, notes = (
+                            metadata.tags, metadata.urls, metadata.notes)
+                    if review_raw is not None and not search_found:
                         self._queue_pending_review(item, root, review_raw)
                         _bump_pending()
                         self._emit("finish_file", track="perceptual",
                                    result="⏳ needs review",
                                    extra={"pending_review": True})
-                    elif tags or urls:
+                    elif tags or urls or notes:
                         if item.perceptual_only:
                             tags = set(tags) | self._pdf_page_base_tags(item.path)
                         outcome = self.write_results_detailed(
@@ -5268,6 +5578,7 @@ class TagIntegrator(HydrusMixin):
                             item, tags, urls, sources, sha, notes=notes,
                             ledger_status=status,
                             hydrus_output=outcome.hydrus_output)
+                        _record_tagged_media(item, tags)
                         source_totals = _bump_hit(sources)
                         result = f"{'+'.join(sources)}  ({len(tags)} tags)"
                         ho = outcome.hydrus_output or {}
@@ -5396,7 +5707,21 @@ class TagIntegrator(HydrusMixin):
                     tags, urls, sources, force_assoc = hash_result
                     notes = (hash_result.metadata.notes
                              if isinstance(hash_result, HashTierResult) else {})
-                    if tags or urls:
+                    if item.kind == "video" or tags or urls or notes:
+                        metadata = (
+                            hash_result.metadata
+                            if isinstance(hash_result, HashTierResult)
+                            else SourceMetadata(
+                                set(tags), set(urls), dict(notes),
+                                set(force_assoc)))
+                        if self._merge_furarchiver_metadata(
+                                metadata, item.path):
+                            if "furarchiver" not in sources:
+                                sources.append("furarchiver")
+                        tags, urls, notes, force_assoc = (
+                            metadata.tags, metadata.urls, metadata.notes,
+                            metadata.force_associate_urls)
+                    if tags or urls or notes:
                         # Hash sources are additive: an e621 hit does not make a
                         # failed InkBunny/Danbooru/Gelbooru lookup irrelevant.
                         # Committing the partial hit would permanently skip the
@@ -5449,6 +5774,7 @@ class TagIntegrator(HydrusMixin):
                             force_associate_urls=force_assoc, notes=notes,
                             ledger_status=status,
                             hydrus_output=outcome.hydrus_output)
+                        _record_tagged_media(item, tags)
                         source_totals = _bump_hit(sources)
                         result = f"{'+'.join(sources)}  ({len(tags)} tags)"
                         ho = outcome.hydrus_output or {}
@@ -5586,6 +5912,7 @@ class TagIntegrator(HydrusMixin):
         summary.cancelled = self.cancelled()
         if duplicates_tagged:
             summary.duplicates = max(summary.duplicates, duplicates_tagged)
+        summary.duplicate_copies_tagged = duplicates_tagged
 
         # ── Summary ──────────────────────────────────────────────────────────
         total = len(items)
@@ -5598,6 +5925,8 @@ class TagIntegrator(HydrusMixin):
         print(f"  ├─ Gelbooru hits:  {counts['gelbooru']}")
         print(f"  ├─ Fluffle hits:   {counts['fluffle']}")
         print(f"  ├─ SauceNAO hits:  {counts['saucenao']}")
+        if counts.get("furarchiver"):
+            print(f"  ├─ FurArchiver:    {counts['furarchiver']}")
         print(f"  └─ No match:       {nomatch}")
         if pending_review_count:
             print(f"  └─ Needs review:   {pending_review_count}")

@@ -392,7 +392,7 @@ class HydrusScanPanel(QWidget):
         self.skip_scanned = QCheckBox("Skip files a previous scan marked")
         bf.addRow(self.skip_scanned)
 
-        self.write_report = QCheckBox("Write a report for each run")
+        self.write_report = QCheckBox("Write a JSONL report for each Hydrus run")
         self.write_report.setToolTip(
             "A JSONL line per file plus a text summary, saved beside "
             "settings.json.")
@@ -974,6 +974,9 @@ class SettingsPanel(QWidget):
         self.hydrus_tag_service = QLineEdit()
         self.hydrus_tag_deleted = QCheckBox("Tag deleted-file duplicate groups")
         self.sidecars_enabled = QCheckBox("Also write sidecars when Hydrus is on")
+        self.show_run_stats = QCheckBox("Show end-of-run stats recap")
+        self.write_folder_json_report = QCheckBox(
+            "Save a JSON report after every folder scan")
         self.sidecar_format = QComboBox()
         self.sidecar_format.addItems(["txt", "json"])
         self.sidecar_tag_fn = QLineEdit()
@@ -985,6 +988,8 @@ class SettingsPanel(QWidget):
         of.addRow("Tag service", self.hydrus_tag_service)
         of.addRow(self.hydrus_tag_deleted)
         of.addRow(self.sidecars_enabled)
+        of.addRow(self.show_run_stats)
+        of.addRow(self.write_folder_json_report)
         of.addRow("Sidecar format", self.sidecar_format)
         of.addRow("Tag filename", self.sidecar_tag_fn)
         of.addRow("URL filename", self.sidecar_url_fn)
@@ -1002,7 +1007,7 @@ class SettingsPanel(QWidget):
             "metadata. Descriptions can be imported directly without this "
             "slow downloader queue.")
         self.direct_source_notes = QCheckBox(
-            "Import e621 / InkBunny descriptions directly")
+            "Import source descriptions directly")
         self.direct_source_notes.setToolTip(
             "Reuse source API responses FurTag already fetched and write their "
             "descriptions straight to Hydrus notes. Requires the Hydrus "
@@ -1209,6 +1214,8 @@ class SettingsPanel(QWidget):
         self.hydrus_tag_service.setText(o.hydrus_tag_service)
         self.hydrus_tag_deleted.setChecked(o.hydrus_tag_deleted_duplicates)
         self.sidecars_enabled.setChecked(o.sidecars_enabled)
+        self.show_run_stats.setChecked(o.show_run_stats_dialog)
+        self.write_folder_json_report.setChecked(o.write_folder_json_report)
         self.sidecar_format.setCurrentText(o.sidecar_format)
         self.sidecar_tag_fn.setText(o.sidecar_tag_filename)
         self.sidecar_url_fn.setText(o.sidecar_url_filename)
@@ -1259,6 +1266,9 @@ class SettingsPanel(QWidget):
         s.output.hydrus_tag_service = self.hydrus_tag_service.text().strip() or "downloader tags"
         s.output.hydrus_tag_deleted_duplicates = self.hydrus_tag_deleted.isChecked()
         s.output.sidecars_enabled = self.sidecars_enabled.isChecked()
+        s.output.show_run_stats_dialog = self.show_run_stats.isChecked()
+        s.output.write_folder_json_report = (
+            self.write_folder_json_report.isChecked())
         s.output.sidecar_format = self.sidecar_format.currentText()
         s.output.sidecar_tag_filename = self.sidecar_tag_fn.text().strip()
         s.output.sidecar_url_filename = self.sidecar_url_fn.text().strip()
@@ -2321,8 +2331,82 @@ class MainWindow(QMainWindow):
         # Authoritative count at end of run — reconcile the event-driven tally.
         self._review_count = summary.pending_review
         self._set_review_badge(self._review_count)
+        if self.settings.output.show_run_stats_dialog:
+            QMessageBox.information(
+                self, "FurTag run stats", self._run_stats_text(summary))
         if self._closing and not self.discover_workers:
             self.close()
+
+    @staticmethod
+    def _run_stats_text(summary: ScanSummary) -> str:
+        """Human-friendly post-run numbers; all tag counts are this run only."""
+        label = "Cancelled — results so far" if summary.cancelled else "Finished"
+        counts = summary.tag_counts
+        # These are technically tags, but not the kind of thing that makes a
+        # recap feel like a recap. Keep the leaderboard for actual scene,
+        # wardrobe, prop, setting, and style details instead of anatomy/porn
+        # taxonomy, broad species/body labels, ratings, and basic composition.
+        generic = {
+            "male", "female", "intersex", "ambiguous_gender", "solo",
+            "duo", "group", "sex", "oral", "anal", "vaginal",
+            "masturbation", "cum", "cum_in_mouth", "cum_on_body",
+            "penetration", "erection", "genitalia", "penis", "vagina",
+            "breasts", "nipple", "ass", "butt", "testicles", "balls",
+            "anus", "pussy", "cock", "dick", "gape", "sex_toy",
+            "furry", "anthro", "feral", "human", "mammal", "canine",
+            "feline", "equine", "dragon", "wolf", "fox", "cat", "dog",
+            "explicit", "questionable", "safe", "rating", "hi_res",
+            "lowres", "highres", "animated", "video", "sound", "flash",
+            "image", "digital_media", "simple_background", "white_background",
+            "black_background", "looking_at_viewer", "open_mouth", "smile",
+            "standing", "sitting", "lying", "kneeling", "close-up",
+            "close_up", "from_behind", "spread_legs", "tail", "fur",
+            "scalie", "big_breasts", "big_penis", "hair", "clothing",
+        }
+        anatomy_words = {
+            "penis", "vagina", "genital", "breast", "nipple", "anus",
+            "testicle", "scrotum", "cum", "semen", "dick", "cock",
+            "pussy", "butt", "ass", "oral", "anal", "sex", "penetrat",
+        }
+
+        def top(namespace: str, n: int = 1) -> str:
+            prefix = namespace + ":"
+            rows = [(tag[len(prefix):], count) for tag, count in counts.items()
+                    if tag.startswith(prefix)]
+            rows.sort(key=lambda row: (-row[1], row[0].casefold()))
+            return ", ".join(f"{name} ({count})" for name, count in rows[:n]) or "none"
+
+        def is_interesting(tag: str, count: int) -> bool:
+            folded = tag.casefold()
+            words = set(folded.replace("-", "_").split("_"))
+            if ":" in folded or folded in generic or words & anatomy_words:
+                return False
+            # A tag occurring on almost everything is usually a library-wide
+            # descriptor, not a fun fact about this particular run.
+            return count < max(6, summary.tagged * 0.65)
+
+        interesting = [(tag, count) for tag, count in counts.items()
+                       if is_interesting(tag, count)]
+        interesting.sort(key=lambda row: (-row[1], row[0].casefold()))
+        top_tags = ", ".join(
+            f"{tag} ({count})" for tag, count in interesting[:5]) or "none"
+        return (
+            f"{label}\n\n"
+            f"Tagged media: {summary.tagged}\n"
+            f"  Images: {summary.tagged_images}\n"
+            f"  Videos: {summary.tagged_videos}\n"
+            f"Duplicate copies inherited tags: {summary.duplicate_copies_tagged}\n"
+            f"Tag assignments generated: {summary.tag_assignments}\n"
+            f"Unmatched: {summary.unmatched}\n"
+            f"Pending review: {summary.pending_review}\n\n"
+            f"Top interesting tags: {top_tags}\n"
+            f"Top artist: {top('artist') if top('artist') != 'none' else top('creator')}\n"
+            f"Top series: {top('copyright') if top('copyright') != 'none' else top('series')}\n"
+            f"Top character: {top('character')}\n\n"
+            f"Source hits: " + (
+                ", ".join(f"{name} {count}" for name, count in
+                          sorted(summary.source_hits.items()) if count)
+                or "none"))
 
     @Slot(str)
     def _on_failed(self, msg: str) -> None:
@@ -2349,6 +2433,7 @@ class MainWindow(QMainWindow):
             ("gelbooru", "Gelbooru"),
             ("fluffle", "Fluffle"),
             ("saucenao", "SauceNAO"),
+            ("furarchiver", "FurArchiver"),
         )
         self.source_totals_label.setText(
             "Tagged files by source · "

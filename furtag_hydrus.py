@@ -323,6 +323,48 @@ class HydrusMixin:
             _notify(f"‼️  Hydrus API unreachable ({e}) – sidecars only. "
                    f"Is the client running with the API enabled?")
 
+    @staticmethod
+    def _hydrus_pending_path(media: Path) -> Path:
+        """Private durable Hydrus-delivery payload, separate from sidecars."""
+        return media.parent / ".furtag-tmp" / (media.name + ".hydrus.json")
+
+    def _write_hydrus_pending(self, media: Path, tags: Set[str],
+                              urls: Set[str], notes: Dict[str, str],
+                              known_sha256: Optional[str],
+                              url_policy: UrlWritePolicy,
+                              force_associate_urls: Set[str]) -> bool:
+        """Stage source results when Hydrus cannot receive them yet."""
+        path = self._hydrus_pending_path(media)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            from furtag_settings import atomic_write_text
+            atomic_write_text(path, json.dumps({
+                "version": 1,
+                "media": str(media.resolve()),
+                "tags": sorted(tags),
+                "urls": sorted(urls),
+                "notes": notes,
+                "known_sha256": known_sha256,
+                "url_policy": url_policy.value,
+                "force_associate_urls": sorted(force_associate_urls),
+            }, ensure_ascii=False, indent=2) + "\n")
+            return True
+        except Exception as e:
+            _notify(f"❌ Could not stage Hydrus output for {media.name}: {e}")
+            return False
+
+    def _delete_hydrus_pending(self, media: Path) -> None:
+        path = self._hydrus_pending_path(media)
+        try:
+            path.unlink(missing_ok=True)
+            try:
+                path.parent.rmdir()
+            except OSError:
+                pass
+        except OSError as e:
+            _notify(f"⚠️  Hydrus succeeded but could not remove pending file "
+                    f"{path.name}: {e}")
+
 
     def hydrus_mode_desc(self) -> str:
         """e.g. "import+tag" / "tag-only + sidecars" — used in startup banners."""
@@ -1640,6 +1682,7 @@ class HydrusMixin:
                 stamp_tagged_at=False,
                 metadata_version=rec.get("metadata_version", 0))
             if push.complete:
+                self._delete_hydrus_pending(path)
                 result.completed_paths.add(path.resolve())
             else:
                 result.failed += 1

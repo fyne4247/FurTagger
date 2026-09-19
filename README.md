@@ -2,7 +2,7 @@
 
 **Point it at a folder. It finds where the art came from and tags it for [Hydrus](https://hydrusnetwork.github.io/hydrus/).**
 
-FurTag reverse-image-searches your media against furry/booru sources (**e621, InkBunny, Danbooru, Gelbooru**, then **Fluffle** / **SauceNAO**), then **imports + tags + source URLs** into a running Hydrus client — or writes Hydrus-compatible sidecars if you prefer files only.
+FurTag reverse-image-searches your media against furry/booru sources (**e621, InkBunny, Danbooru, Gelbooru**, then **Fluffle** / **SauceNAO**), recognises **FurArchiver** exports, then **imports + tags + source URLs + descriptions** into a running Hydrus client — or writes Hydrus-compatible sidecars if you prefer files only.
 
 | | |
 | --- | --- |
@@ -15,7 +15,8 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
 
 ```bash
 # GUI
-./FurTag-GUI.command
+./FurTag.command gui
+# legacy GUI-only shortcut: ./FurTag-GUI.command
 
 # CLI
 ./FurTag.command
@@ -32,11 +33,12 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
 - **Pipelined tiers** — hash and perceptual work run together; a two-track progress display shows each tier’s current file, phase, and ETA.
 - **PDF support** — pages render to PNG and enter the perceptual tier. Before rendering, you can set **comic name** and optional **artist** per PDF (`comic:` / `creator:` / `page:`). Choices are saved in `.furtag_pdf.json` beside the pages. Optional if PyMuPDF is installed.
 - **Exact-duplicate fan-out** — byte-identical files share one network search; copies get matching ledger records and sidecars.
+- **FurArchiver-aware fallback** — a valid `_readme.txt` identifies the archived artist. Files whose names contain that artist receive `creator:<artist>`, `site:furarchiver`, and `site:furaffinity` even when every online search misses. Paired archival HTML becomes a Hydrus note named **furaffinity description**. Both export layouts are supported: HTML beside the media, or `Images/` and sibling `Descriptions/` directories. Exact description text already supplied by another source for the same file is not duplicated.
 
 ### Hydrus
 
 - **Client API output** — import files, apply tags, associate URLs (default service: **downloader tags**).
-- **Direct source notes** — e621 descriptions and InkBunny titles/descriptions are reused from source API responses FurTag already fetched, then written straight to Hydrus notes by SHA-256. This is the default and does **not** queue a downloader job per URL.
+- **Direct source notes** — e621 descriptions, InkBunny titles/descriptions, and FurArchiver HTML descriptions are reused from data FurTag already has, then written straight to Hydrus notes by SHA-256. This is the default and does **not** queue a downloader job per URL.
 - **Optional legacy URL enrichment** — exact post URLs can still be queued through Hydrus for parser-only metadata such as timestamps. It is off by default because it is substantially slower. Perceptual/external URLs and multi-file InkBunny submissions remain associate-only.
 - **Resumable sidecar sync** — push existing `<file>.txt` / `<file>.urls.txt` into Hydrus without re-searching; successful payloads are checkpointed in the ledger.
 - **Configurable live result pages** — New Imports, Newly Tagged, and Duplicate Tagged can update while a scan is running (10-second default cadence) or be created at the end. Each page has its own enabled state, name, and limit; Already Tagged is a separate one-shot pre-scan page.
@@ -45,6 +47,12 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
 - **Deleted duplicates recovered onto the kept file** — a kept file no booru recognises may share a duplicate group with a deleted file they do. Hydrus keeps the MD5s of files it no longer stores, so those are free extra lookups whose tags belong to the surviving file. Only relationship `8` (duplicate) is followed; alternates are different artwork and are never used. Recovered files appear on the Duplicate Tagged page.
 - **Scan bookkeeping as tags** — a database scan marks `furtag:scanned` plus `furtag:matched`/`furtag:nomatch` in a configurable tag service and excludes `-furtag:scanned` next run, so a capped scan walks the database across runs. Files whose lookups errored stay unmarked and are retried. Each run writes a JSONL report and a text summary beside `settings.json`.
 - **Database-scoped checkpoints** — Hydrus completion state is bound to a persisted, non-secret database identity plus API origin. If the database is replaced at the same address, use **Hydrus → Use a new/replaced Hydrus database…** to rotate the identity and revalidate old decisions.
+- **Private Hydrus outage queue** — when Hydrus is enabled, ordinary sidecars are off, and an import/tag/URL/note call cannot complete, FurTag stores the completed lookup payload under the media folder's hidden `.furtag-tmp/` directory. The next normal run retries Hydrus without repeating booru or Fluffle calls, then deletes the payload after successful delivery.
+
+### Reports and run stats
+
+- **Folder-scan JSON receipts** — every completed or cancelled folder scan can write a compact JSON report containing totals, image/video counts, source hits, tag counts, duplicates, unmatched files, and pending reviews. Reports live under the platform settings directory (`~/Library/Application Support/FurTag/scans/` on macOS) rather than beside the media. This is on by default and can be disabled under **Settings → Output** without affecting ledgers or retry behavior.
+- **Optional GUI stats recap** — after a folder run finishes or is cancelled, the GUI can show tagged images/videos, duplicate copies tagged, individual tag assignments, source totals, top artist/series/character, and five “interesting” tags. The interesting-tag list filters namespaces, anatomy/sex taxonomy, ratings, broad species/body labels, basic poses, and tags present on almost the whole run. The dialog has its own **Settings → Output** toggle.
 
 ### Reliability
 
@@ -83,7 +91,8 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
 ### GUI
 
 ```bash
-./FurTag-GUI.command
+./FurTag.command gui
+# or ./FurTag-GUI.command
 # or
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
@@ -109,6 +118,11 @@ Switching to **The Hydrus database** replaces the folder picker with the scan's
 options and shows the exact Hydrus query it will run; progress, issues, the run
 log, and Cancel are shared with folder scans. The perceptual card is hidden
 because this mode does not use it.
+
+The most recently selected folder is restored when the GUI opens, but it is
+not indexed automatically. Click **Index** (or choose/drop a different folder)
+when you are ready, so opening FurTag cannot immediately walk a large external
+volume.
 
 Hydrus review pages are configured persistently on the GUI's **Settings →
 Hydrus** tab. The CLI uses those saved settings; it no longer asks for a shared
@@ -179,7 +193,7 @@ every `brew upgrade python@3.14` silently revokes it. Two ways out:
   prompts, because a stable signature is something macOS can remember. A free
   self-signed certificate is enough.
 
-Non-secret options (thresholds, source toggles, page configuration, sidecar patterns, rate limits, direct notes, optional URL enrichment, and Hydrus database identity) live in platform-specific `settings.json` via `platformdirs`.
+Non-secret options (thresholds, source toggles, page configuration, sidecar patterns, rate limits, direct notes, optional URL enrichment, run stats/reports, and Hydrus database identity) live in platform-specific `settings.json` via `platformdirs`.
 
 Each Hydrus review page has its own toggle, name, and limit (`0` means
 unlimited). For the three scan-result pages:
@@ -220,7 +234,13 @@ The GUI also remembers up to 12 recently selected scan folders there, including 
 2. **Hash** — MD5 (and optional Hydrus SHA-256 cache) in a thread pool.
 3. **Hash tier** — e621 / InkBunny / Danbooru / Gelbooru by MD5, concurrent.
 4. **Perceptual tier** — Fluffle → SauceNAO for images that missed every hash lookup.
-5. **Write** — Hydrus push and/or sidecars; source descriptions go directly to Hydrus notes. Exact URLs may optionally enter the legacy downloader-enrichment path.
+5. **Local archive enrichment** — when an enclosing FurArchiver `_readme.txt` is present, merge its filename-qualified artist/site tags and paired HTML description. This supplements a web match or becomes the fallback when no web source matches.
+6. **Write** — Hydrus push and/or sidecars; source descriptions go directly to Hydrus notes. Exact URLs may optionally enter the legacy downloader-enrichment path.
+
+FurArchiver's HTML `<img src>` is a relative FurArchiver asset path such as
+`/artist/filename.ext`; it is not a Fur Affinity submission page and does not
+contain the original FA `/view/<id>` value. FurTag therefore does not associate
+it as a Fur Affinity source URL.
 
 **URL write policy**
 
@@ -230,7 +250,7 @@ The GUI also remembers up to 12 recently selected scan folders there, including 
 | Multi-file InkBunny submission pages (`/s/{id}` with pagecount > 1) | Associated only (never queued for download) |
 | Perceptual / external / artist “source” links | Associated only |
 
-**Ledger statuses** include `matched`, `nomatch`, `duplicate`, `pending_review`, `unreadable`, and `hashed` (retry later). Hydrus import/metadata disposition, unmatched-import completion, and sidecar reconciliation are stored as independent nested checkpoints. If lookup succeeded and sidecars were written but Hydrus failed, the row remains `matched` with an incomplete `hydrus_output` checkpoint; the next normal launch retries only that path from its sidecars before source searching. The manual whole-folder sidecar-sync option is not needed for this recovery. Legacy top-level `hydrus_deleted` rows remain readable but are revalidated once if they lack the current Hydrus database scope.
+**Ledger statuses** include `matched`, `nomatch`, `duplicate`, `pending_review`, `unreadable`, and `hashed` (retry later). Hydrus import/metadata disposition, unmatched-import completion, FurArchiver metadata version, and sidecar reconciliation are stored as independent checkpoints. If lookup succeeded but Hydrus failed, the row remains retryable and the next normal launch restores the payload from a normal sidecar or the private `.furtag-tmp/<media>.hydrus.json` queue before source searching. The temporary payload is removed after successful delivery, so the manual whole-folder sidecar-sync option is not needed for this recovery. Legacy top-level `hydrus_deleted` rows remain readable but are revalidated once if they lack the current Hydrus database scope.
 
 The metadata ledger version was bumped for direct notes. Once Hydrus has note-editing permission, the next scan intentionally revisits older e621/Inkbunny matches once, reusing cached MD5s. Old rows that lack a search profile or scoped Hydrus checkpoint may also be revalidated once after this upgrade; cached MD5s avoid repeating the disk-heavy hash pass. If Hydrus is offline, notes are disabled, or the key lacks permission, note backfill is deferred without repeatedly querying sources.
 
@@ -253,6 +273,7 @@ When sidecars are enabled:
 | ---- | -------- |
 | `<file>.<ext>.txt` | tags, one per line |
 | `<file>.<ext>.urls.txt` | source URLs, one per line |
+| `<file>.<ext>.json` | tags and URLs together when JSON sidecars are selected |
 
 Namespaces follow Hydrus conventions (`creator:`, `character:`, `species:`, `series:`, `comic:`, `page:`, `site:`, …).
 
