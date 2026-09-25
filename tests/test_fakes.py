@@ -1543,7 +1543,7 @@ class TestHydrusInstanceIdentity(unittest.TestCase):
             ],
         }
 
-    def test_init_hydrus_binds_fingerprint_without_rotating_first_sighting(self):
+    def test_init_hydrus_rotates_unscoped_identity_on_first_sighting(self):
         session = FakeSession([
             ("GET", "verify_access_key", FakeResponse(200, {
                 "basic_permissions": [0, 1, 2, 3, 4],
@@ -1563,7 +1563,7 @@ class TestHydrusInstanceIdentity(unittest.TestCase):
                 "hydrus_access_key": "test-key",
             })
             self.assertTrue(ti.has_hydrus)
-            self.assertEqual(ti.settings.hydrus.hydrus_profile_uuid, original)
+            self.assertNotEqual(ti.settings.hydrus.hydrus_profile_uuid, original)
             self.assertTrue(ti.settings.hydrus.hydrus_instance_fingerprint)
             persisted = store.load()
             self.assertEqual(

@@ -138,6 +138,10 @@ class HydrusSettings:
     # fingerprint → profile_uuid. Switching back to a previously seen Hydrus
     # database restores that database's scope instead of minting a new one.
     hydrus_instance_bindings: Dict[str, str] = field(default_factory=dict)
+    # Version 1 guarantees that the first fingerprint binding did not inherit
+    # an unscoped pre-auto-detection UUID.  Version 0 includes settings written
+    # by the initial, buggy implementation and is migrated on next connect.
+    hydrus_instance_binding_version: int = 0
 
 
 @dataclass
@@ -415,6 +419,11 @@ def _normalize_settings(s: Settings) -> None:
             s.hydrus.hydrus_instance_fingerprint,
             s.hydrus.hydrus_profile_uuid)
     s.hydrus.hydrus_instance_bindings = cleaned
+    try:
+        s.hydrus.hydrus_instance_binding_version = max(
+            0, int(s.hydrus.hydrus_instance_binding_version))
+    except (TypeError, ValueError):
+        s.hydrus.hydrus_instance_binding_version = 0
 
 
 def normalize_hydrus_scan(scan: "HydrusScanSettings") -> None:
@@ -558,8 +567,9 @@ def bind_hydrus_instance_identity(
         settings: Settings, fingerprint: str) -> Tuple[str, Optional[str]]:
     """Update settings for a live Hydrus instance fingerprint.
 
-    Returns ``(profile_uuid, change)`` where *change* is ``None`` (unchanged /
-    first sighting), ``"switched"`` (restored a previously seen database), or
+    Returns ``(profile_uuid, change)`` where *change* is ``None`` (unchanged),
+    ``"initialized"`` (the first fingerprint-capable connection after an
+    upgrade), ``"switched"`` (restored a previously seen database), or
     ``"detected"`` (first sighting of a different database than last time).
     """
     fp = (fingerprint or "").strip()
@@ -568,7 +578,19 @@ def bind_hydrus_instance_identity(
     hy = settings.hydrus
     bindings = dict(hy.hydrus_instance_bindings or {})
     previous_fp = (hy.hydrus_instance_fingerprint or "").strip()
-    current_uuid = (hy.hydrus_profile_uuid or "").strip() or str(uuid.uuid4())
+
+    # Repair both legacy settings and the first auto-detection release, which
+    # persisted the live fingerprint against an older unscoped UUID.  That
+    # pairing could let a stale directory seal skip an entire folder.  Rotate
+    # once even when the fingerprint is already present in bindings.
+    if hy.hydrus_instance_binding_version < 1:
+        new_uuid = str(uuid.uuid4())
+        bindings[fp] = new_uuid
+        hy.hydrus_profile_uuid = new_uuid
+        hy.hydrus_instance_fingerprint = fp
+        hy.hydrus_instance_bindings = bindings
+        hy.hydrus_instance_binding_version = 1
+        return new_uuid, "initialized"
 
     if fp in bindings:
         restored = bindings[fp]
@@ -587,12 +609,14 @@ def bind_hydrus_instance_identity(
         hy.hydrus_instance_bindings = bindings
         return new_uuid, "detected"
 
-    # First fingerprint for this install, or reconnect to the same unknown DB.
-    bindings[fp] = current_uuid
-    hy.hydrus_profile_uuid = current_uuid
+    # Defensive fallback for a versioned settings object with no bindings.
+    new_uuid = str(uuid.uuid4())
+    bindings[fp] = new_uuid
+    hy.hydrus_profile_uuid = new_uuid
     hy.hydrus_instance_fingerprint = fp
     hy.hydrus_instance_bindings = bindings
-    return current_uuid, None
+    hy.hydrus_instance_binding_version = 1
+    return new_uuid, "initialized"
 
 
 def rotate_hydrus_profile_for_current_instance(settings: Settings) -> str:
@@ -618,6 +642,8 @@ def persist_hydrus_instance_identity(
         settings.hydrus.hydrus_instance_fingerprint)
     on_disk.hydrus.hydrus_instance_bindings = dict(
         settings.hydrus.hydrus_instance_bindings or {})
+    on_disk.hydrus.hydrus_instance_binding_version = (
+        settings.hydrus.hydrus_instance_binding_version)
     store.save(on_disk)
 
 

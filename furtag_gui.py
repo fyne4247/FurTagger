@@ -2532,6 +2532,8 @@ class MainWindow(QMainWindow):
             src.hydrus.hydrus_instance_fingerprint)
         dst.hydrus.hydrus_instance_bindings = dict(
             src.hydrus.hydrus_instance_bindings or {})
+        dst.hydrus.hydrus_instance_binding_version = (
+            src.hydrus.hydrus_instance_binding_version)
 
     def _overlay_hydrus_identity(self, settings: Settings) -> None:
         """Keep auto-detected Hydrus identity through Preferences apply."""

@@ -300,8 +300,8 @@ class TestSettingsStore(unittest.TestCase):
         s = Settings()
         first_uuid = s.hydrus.hydrus_profile_uuid
         uid, change = bind_hydrus_instance_identity(s, "finger-a")
-        self.assertEqual(uid, first_uuid)
-        self.assertIsNone(change)
+        self.assertNotEqual(uid, first_uuid)
+        self.assertEqual(change, "initialized")
         self.assertEqual(s.hydrus.hydrus_instance_fingerprint, "finger-a")
 
         uid2, change2 = bind_hydrus_instance_identity(s, "finger-b")
@@ -311,8 +311,8 @@ class TestSettingsStore(unittest.TestCase):
 
         uid3, change3 = bind_hydrus_instance_identity(s, "finger-a")
         self.assertEqual(change3, "switched")
-        self.assertEqual(uid3, first_uuid)
-        self.assertEqual(s.hydrus.hydrus_profile_uuid, first_uuid)
+        self.assertEqual(uid3, uid)
+        self.assertEqual(s.hydrus.hydrus_profile_uuid, uid)
 
     def test_manual_rotate_only_rebinds_current_fingerprint(self):
         s = Settings()
@@ -324,6 +324,23 @@ class TestSettingsStore(unittest.TestCase):
         self.assertNotEqual(new_b, old_b)
         self.assertEqual(s.hydrus.hydrus_instance_bindings["finger-b"], new_b)
         self.assertEqual(s.hydrus.hydrus_instance_bindings["finger-a"], old_a)
+
+    def test_buggy_persisted_first_binding_is_rotated_once(self):
+        s = Settings()
+        stale = s.hydrus.hydrus_profile_uuid
+        s.hydrus.hydrus_instance_fingerprint = "finger-a"
+        s.hydrus.hydrus_instance_bindings = {"finger-a": stale}
+        s.hydrus.hydrus_instance_binding_version = 0
+
+        repaired, change = bind_hydrus_instance_identity(s, "finger-a")
+        self.assertEqual(change, "initialized")
+        self.assertNotEqual(repaired, stale)
+        self.assertEqual(s.hydrus.hydrus_instance_bindings["finger-a"], repaired)
+        self.assertEqual(s.hydrus.hydrus_instance_binding_version, 1)
+
+        unchanged, change2 = bind_hydrus_instance_identity(s, "finger-a")
+        self.assertEqual(unchanged, repaired)
+        self.assertIsNone(change2)
 
 
 class TestPreflight(unittest.TestCase):

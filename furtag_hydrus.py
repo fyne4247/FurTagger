@@ -422,7 +422,12 @@ class HydrusMixin:
         if not fingerprint:
             return
         _uuid, change = bind_hydrus_instance_identity(settings, fingerprint)
-        if change == "detected":
+        if change == "initialized":
+            _notify(
+                "🔄 Hydrus database identity initialized — old completion "
+                "checkpoints will be revalidated once against this library "
+                "(search results are kept).")
+        elif change == "detected":
             _notify(
                 "🆕 Hydrus database changed at this API address — FurTag bound a "
                 "new identity. Prior completion checkpoints will be revalidated "
