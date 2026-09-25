@@ -9,6 +9,9 @@ from furtag_settings import (
     Settings,
     SettingsStore,
     SidecarPatternError,
+    bind_hydrus_instance_identity,
+    hydrus_instance_fingerprint_from_services,
+    rotate_hydrus_profile_for_current_instance,
     validate_run_preflight,
     validate_sidecar_pattern,
     render_sidecar_name,
@@ -268,6 +271,59 @@ class TestSettingsStore(unittest.TestCase):
         self.assertNotEqual(
             hydrus_scope_id(uid, "http://127.0.0.1:45869"),
             hydrus_scope_id(uid, "http://127.0.0.1:45870"))
+
+    def test_instance_fingerprint_prefers_combined_local_domains(self):
+        data = {
+            "services_v2": [
+                {"name": "my files", "type": 2, "service_key": "aaa"},
+                {"name": "extra", "type": 2, "service_key": "bbb"},
+                {"name": "all local files", "type": 15, "service_key": "ccc"},
+                {"name": "all my files", "type": 21, "service_key": "ddd"},
+                {"name": "my tags", "type": 5, "service_key": "eee"},
+            ],
+        }
+        fp = hydrus_instance_fingerprint_from_services(data)
+        # Adding another type-2 domain must not change the fingerprint.
+        data["services_v2"].append(
+            {"name": "more files", "type": 2, "service_key": "fff"})
+        self.assertEqual(fp, hydrus_instance_fingerprint_from_services(data))
+        other = {
+            "services_v2": [
+                {"name": "all local files", "type": 15, "service_key": "zzz"},
+                {"name": "all my files", "type": 21, "service_key": "yyy"},
+            ],
+        }
+        self.assertNotEqual(
+            fp, hydrus_instance_fingerprint_from_services(other))
+
+    def test_bind_restores_previous_database_identity(self):
+        s = Settings()
+        first_uuid = s.hydrus.hydrus_profile_uuid
+        uid, change = bind_hydrus_instance_identity(s, "finger-a")
+        self.assertEqual(uid, first_uuid)
+        self.assertIsNone(change)
+        self.assertEqual(s.hydrus.hydrus_instance_fingerprint, "finger-a")
+
+        uid2, change2 = bind_hydrus_instance_identity(s, "finger-b")
+        self.assertEqual(change2, "detected")
+        self.assertNotEqual(uid2, first_uuid)
+        self.assertEqual(s.hydrus.hydrus_instance_fingerprint, "finger-b")
+
+        uid3, change3 = bind_hydrus_instance_identity(s, "finger-a")
+        self.assertEqual(change3, "switched")
+        self.assertEqual(uid3, first_uuid)
+        self.assertEqual(s.hydrus.hydrus_profile_uuid, first_uuid)
+
+    def test_manual_rotate_only_rebinds_current_fingerprint(self):
+        s = Settings()
+        bind_hydrus_instance_identity(s, "finger-a")
+        old_a = s.hydrus.hydrus_profile_uuid
+        bind_hydrus_instance_identity(s, "finger-b")
+        old_b = s.hydrus.hydrus_profile_uuid
+        new_b = rotate_hydrus_profile_for_current_instance(s)
+        self.assertNotEqual(new_b, old_b)
+        self.assertEqual(s.hydrus.hydrus_instance_bindings["finger-b"], new_b)
+        self.assertEqual(s.hydrus.hydrus_instance_bindings["finger-a"], old_a)
 
 
 class TestPreflight(unittest.TestCase):

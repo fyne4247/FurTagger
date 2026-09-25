@@ -24,6 +24,12 @@ from typing import (
 
 import requests
 
+from furtag_settings import (
+    bind_hydrus_instance_identity,
+    hydrus_instance_fingerprint_from_services,
+    iter_hydrus_service_entries,
+    persist_hydrus_instance_identity,
+)
 from furtag_urls import UrlWritePolicy, is_enrichable_post_url, partition_urls
 
 if TYPE_CHECKING:
@@ -310,7 +316,13 @@ class HydrusMixin:
                 and can_manage_pages)
             if page_requested and not can_manage_pages:
                 _notify("⚠️  Hydrus pages disabled – access key needs Manage Pages permission.")
-            svc_key = self._hydrus_resolve_tag_service(self.hydrus_tag_service_name)
+            services_data = self._hydrus_get_services()
+            if services_data is None:
+                _notify("‼️  Hydrus get_services failed – sidecars only.")
+                return
+            self._hydrus_sync_instance_identity(services_data)
+            svc_key = self._hydrus_resolve_tag_service(
+                self.hydrus_tag_service_name, services_data=services_data)
             if not svc_key:
                 _notify(f"‼️  Hydrus tag service '{self.hydrus_tag_service_name}' not found – "
                        f"sidecars only.")
@@ -386,26 +398,54 @@ class HydrusMixin:
         }
 
 
-    def _hydrus_resolve_tag_service(self, name_or_key: str) -> str:
-        """Map a tag service display name (or raw key) to its service_key."""
-        r = self.session.get(
-            f"{self.hydrus_api_url}/get_services",
-            headers=self._hydrus_headers(),
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
+    def _hydrus_get_services(self) -> Optional[Dict[str, Any]]:
+        """GET /get_services, or None when the Client API call fails."""
+        try:
+            r = self.session.get(
+                f"{self.hydrus_api_url}/get_services",
+                headers=self._hydrus_headers(),
+                timeout=10,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except (requests.RequestException, ValueError, TypeError) as e:
+            _notify(f"⚠️  Hydrus: couldn't list services ({e}).")
+            return None
+        return data if isinstance(data, dict) else None
 
-        # Normalize both the modern services_v2 list and the legacy services
-        # object into one (name, type, service_key) iterable.
-        services = data.get("services_v2")
-        if isinstance(services, list):
-            entries = [(s.get("name") or "", s.get("type"), s.get("service_key") or "")
-                       for s in services if isinstance(s, dict)]
-        else:
-            legacy = data.get("services") or {}
-            entries = [(sname, (sinfo or {}).get("type"), (sinfo or {}).get("service_key") or "")
-                       for sname, sinfo in legacy.items()]
+    def _hydrus_sync_instance_identity(self, services_data: Dict[str, Any]) -> None:
+        """Bind scope to the live Hydrus database; restore known instances."""
+        settings = getattr(self, "settings", None)
+        if settings is None:
+            return
+        fingerprint = hydrus_instance_fingerprint_from_services(services_data)
+        if not fingerprint:
+            return
+        _uuid, change = bind_hydrus_instance_identity(settings, fingerprint)
+        if change == "detected":
+            _notify(
+                "🆕 Hydrus database changed at this API address — FurTag bound a "
+                "new identity. Prior completion checkpoints will be revalidated "
+                "against this library (search results are kept).")
+        elif change == "switched":
+            _notify(
+                "🔁 Restored FurTag's identity for a previously seen Hydrus "
+                "database at this API address.")
+        store = getattr(self, "settings_store", None)
+        if store is not None:
+            try:
+                persist_hydrus_instance_identity(settings, store=store)
+            except OSError as e:
+                _notify(f"⚠️  Couldn't persist Hydrus database identity ({e}).")
+
+    def _hydrus_resolve_tag_service(
+            self, name_or_key: str,
+            services_data: Optional[Dict[str, Any]] = None) -> str:
+        """Map a tag service display name (or raw key) to its service_key."""
+        data = services_data if services_data is not None else self._hydrus_get_services()
+        if not data:
+            return ""
+        entries = iter_hydrus_service_entries(data)
 
         if any(key == name_or_key for _, _, key in entries):
             return name_or_key  # already a raw service_key
@@ -1572,6 +1612,12 @@ class HydrusMixin:
         if not self.has_hydrus:
             return result
         profile = self.search_profile_hash()
+        current_scope = self._hydrus_scope_id()
+
+        def _scope_mismatch(checkpoint: Dict) -> bool:
+            return bool(
+                current_scope is not None
+                and checkpoint.get("scope_id") != current_scope)
 
         def _needs_resume(rec: Dict) -> bool:
             checkpoint = rec.get("hydrus_output")
@@ -1580,13 +1626,17 @@ class HydrusMixin:
                 # checkpoints existed. The path-level sidecar check below
                 # keeps ordinary unresolved hashes in the lookup pipeline.
                 return True
-            return bool(
-                rec.get("status") == "matched"
-                and rec.get("search_profile_hash") == profile
-                and isinstance(checkpoint, dict)
-                and not checkpoint.get("complete")
-                and isinstance(
-                    checkpoint.get("resume_from_sidecars"), dict))
+            if not (
+                    rec.get("status") == "matched"
+                    and rec.get("search_profile_hash") == profile
+                    and isinstance(checkpoint, dict)):
+                return False
+            if not checkpoint.get("complete"):
+                return isinstance(
+                    checkpoint.get("resume_from_sidecars"), dict)
+            # Complete under another Hydrus database: re-push from sidecars
+            # without repeating booru/Fluffle lookups.
+            return _scope_mismatch(checkpoint)
 
         entries: List[Tuple[Path, Ledger, str, os.stat_result, Dict]] = []
         for ledger in ledger_mgr.touched():
@@ -1655,10 +1705,14 @@ class HydrusMixin:
                 sub=f"Hydrus retry (tagged sidecar) "
                     f"{done}/{len(entries)} · {path.name}")
             result.attempted_paths.add(path.resolve())
+            # Hashes from another Hydrus database are not proof the file is
+            # present here — force add_file / local hash against this library.
+            known_sha = None
+            if not _scope_mismatch(checkpoint):
+                known_sha = checkpoint.get("sha256") or rec.get("sha256")
             push = self._hydrus_push_detailed(
                 path, tags, urls,
-                known_sha256=(
-                    checkpoint.get("sha256") or rec.get("sha256")),
+                known_sha256=known_sha,
                 url_policy=url_policy,
                 force_associate_urls=force_associate,
                 notes=notes)

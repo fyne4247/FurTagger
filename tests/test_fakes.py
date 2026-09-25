@@ -13,7 +13,7 @@ import requests
 from furtag import (
     FileItem, Ledger, LedgerManager, RetryableLookupError, TagIntegrator,
 )
-from furtag_settings import Settings
+from furtag_settings import Settings, SettingsStore, hydrus_scope_id
 
 
 class FakeResponse:
@@ -1526,3 +1526,158 @@ class TestGelbooruConnectionRetry(unittest.TestCase):
         with self.assertRaises(RetryableLookupError):
             ti._gelbooru_get({"tags": "md5:abc"})
         self.assertEqual(len(calls), 1, "a real HTTP reply must not retry")
+
+
+class TestHydrusInstanceIdentity(unittest.TestCase):
+    @staticmethod
+    def _services(local_key="local-a", combined_key="combined-a"):
+        return {
+            "services_v2": [
+                {"name": "my files", "type": 2, "service_key": local_key},
+                {"name": "all local files", "type": 15,
+                 "service_key": combined_key},
+                {"name": "all my files", "type": 21,
+                 "service_key": combined_key + "-all"},
+                {"name": "downloader tags", "type": 5,
+                 "service_key": "svc123"},
+            ],
+        }
+
+    def test_init_hydrus_binds_fingerprint_without_rotating_first_sighting(self):
+        session = FakeSession([
+            ("GET", "verify_access_key", FakeResponse(200, {
+                "basic_permissions": [0, 1, 2, 3, 4],
+                "permits_everything": False,
+            })),
+            ("GET", "get_services", FakeResponse(200, self._services())),
+        ])
+        settings = Settings()
+        original = settings.hydrus.hydrus_profile_uuid
+        with tempfile.TemporaryDirectory() as td:
+            store = SettingsStore(Path(td) / "settings.json")
+            store.save(settings)
+            ti = TagIntegrator(settings=settings, session=session)
+            ti.settings_store = store
+            ti._init_hydrus({
+                "hydrus_api_url": "http://127.0.0.1:45869",
+                "hydrus_access_key": "test-key",
+            })
+            self.assertTrue(ti.has_hydrus)
+            self.assertEqual(ti.settings.hydrus.hydrus_profile_uuid, original)
+            self.assertTrue(ti.settings.hydrus.hydrus_instance_fingerprint)
+            persisted = store.load()
+            self.assertEqual(
+                persisted.hydrus.hydrus_instance_fingerprint,
+                ti.settings.hydrus.hydrus_instance_fingerprint)
+
+    def test_init_hydrus_detects_new_database_then_restores_old(self):
+        settings = Settings()
+        with tempfile.TemporaryDirectory() as td:
+            store = SettingsStore(Path(td) / "settings.json")
+            store.save(settings)
+
+            session_a = FakeSession([
+                ("GET", "verify_access_key", FakeResponse(200, {
+                    "basic_permissions": [1, 2, 3],
+                    "permits_everything": False,
+                })),
+                ("GET", "get_services",
+                 FakeResponse(200, self._services("la", "ca"))),
+            ])
+            ti = TagIntegrator(settings=settings, session=session_a)
+            ti.settings_store = store
+            ti._init_hydrus({
+                "hydrus_api_url": "http://127.0.0.1:45869",
+                "hydrus_access_key": "key-a",
+            })
+            first_uuid = ti.settings.hydrus.hydrus_profile_uuid
+            first_fp = ti.settings.hydrus.hydrus_instance_fingerprint
+
+            session_b = FakeSession([
+                ("GET", "verify_access_key", FakeResponse(200, {
+                    "basic_permissions": [1, 2, 3],
+                    "permits_everything": False,
+                })),
+                ("GET", "get_services",
+                 FakeResponse(200, self._services("lb", "cb"))),
+            ])
+            ti.session = session_b
+            ti.has_hydrus = False
+            ti._init_hydrus({
+                "hydrus_api_url": "http://127.0.0.1:45869",
+                "hydrus_access_key": "key-b",
+            })
+            second_uuid = ti.settings.hydrus.hydrus_profile_uuid
+            self.assertNotEqual(second_uuid, first_uuid)
+            self.assertNotEqual(
+                ti.settings.hydrus.hydrus_instance_fingerprint, first_fp)
+
+            ti.session = session_a
+            ti.has_hydrus = False
+            ti._init_hydrus({
+                "hydrus_api_url": "http://127.0.0.1:45869",
+                "hydrus_access_key": "key-a",
+            })
+            self.assertEqual(ti.settings.hydrus.hydrus_profile_uuid, first_uuid)
+            self.assertEqual(
+                ti.settings.hydrus.hydrus_instance_fingerprint, first_fp)
+
+
+class TestHydrusScopeMismatchResume(unittest.TestCase):
+    def test_scope_mismatch_reimports_without_trusting_old_sha(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            media = root / "old-scope.jpg"
+            media.write_bytes(b"fresh-library-bytes")
+            Path(str(media) + ".txt").write_text(
+                "creator:test\n", encoding="utf-8")
+            Path(str(media) + ".urls.txt").write_text(
+                "https://e621.net/posts/1\n", encoding="utf-8")
+
+            new_hash = "n" * 64
+            session = FakeSession([
+                ("POST", "add_files/add_file", FakeResponse(200, {
+                    "status": 1, "hash": new_hash,
+                })),
+                ("POST", "add_tags/add_tags", FakeResponse(200, {})),
+                ("POST", "add_urls/associate_url", FakeResponse(200, {})),
+            ])
+            ti = _hydrus_ti(session)
+            ti.hydrus_can_edit_urls = True
+            ti.settings.hydrus.hydrus_profile_uuid = "new-library"
+            old_scope = hydrus_scope_id(
+                "old-library", ti.hydrus_api_url)
+            st = media.stat()
+            led = Ledger(root)
+            ti.ledger_record(
+                led, media.name, st.st_size, st.st_mtime,
+                "a" * 32, "matched", ["e621"],
+                search_profile_hash=ti.search_profile_hash(),
+                sha256="o" * 64,
+                hydrus_output={
+                    "scope_id": old_scope,
+                    "policy_hash": ti.hydrus_output_policy_hash(),
+                    "import_state": "live",
+                    "metadata_state": "applied_original",
+                    "sha256": "o" * 64,
+                    "complete": True,
+                })
+            led.save()
+
+            mgr = LedgerManager()
+            mgr.get(root)
+            queued = [FileItem(
+                path=media, relpath=media.name, size=st.st_size,
+                mtime=st.st_mtime, kind="image", ledger=led)]
+            result = ti._hydrus_reconcile_prior_matches(mgr, queued)
+
+            self.assertEqual(len(result.completed_paths), 1)
+            self.assertEqual(queued, [])
+            self.assertTrue(any(
+                "add_files/add_file" in url for _, url, _ in session.calls))
+            # Reconcile updates the manager's in-memory ledger (not a detached
+            # Ledger handle from before mgr.get()).
+            checkpoint = mgr.get(root).records[media.name]["hydrus_output"]
+            self.assertEqual(checkpoint["sha256"], new_hash)
+            self.assertEqual(checkpoint["scope_id"], ti._hydrus_scope_id())
+            self.assertNotEqual(checkpoint["sha256"], "o" * 64)

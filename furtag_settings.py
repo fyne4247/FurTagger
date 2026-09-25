@@ -126,11 +126,18 @@ class HydrusSettings:
     # Shared cadence for live result pages. Zero wakes the publisher for every
     # accepted result; positive values allow arrivals to coalesce into batches.
     live_page_update_interval: int = 10
-    # Non-secret identity for this Hydrus database binding. Rotate via an
-    # explicit "new/replaced Hydrus database" action; never derived from the
-    # access key. Combined with API origin into hydrus_scope_id().
+    # Non-secret identity for this Hydrus database binding. Prefer automatic
+    # switching via hydrus_instance_fingerprint (durable local service keys);
+    # Reset… force-rotates the UUID for the *current* fingerprint only. Never
+    # derived from the access key. Combined with API origin into hydrus_scope_id().
     hydrus_profile_uuid: str = field(
         default_factory=lambda: str(uuid.uuid4()))
+    # SHA-256[:32] of durable combined local-file service keys from the last
+    # successful Client API connect. Empty until Hydrus has been reached once.
+    hydrus_instance_fingerprint: str = ""
+    # fingerprint → profile_uuid. Switching back to a previously seen Hydrus
+    # database restores that database's scope instead of minting a new one.
+    hydrus_instance_bindings: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -390,6 +397,24 @@ def _normalize_settings(s: Settings) -> None:
         s.hydrus.hydrus_profile_uuid = str(uuid.uuid4())
     else:
         s.hydrus.hydrus_profile_uuid = profile.strip()
+    fp = s.hydrus.hydrus_instance_fingerprint
+    s.hydrus.hydrus_instance_fingerprint = (
+        fp.strip() if isinstance(fp, str) else "")
+    raw_bindings = s.hydrus.hydrus_instance_bindings
+    cleaned: Dict[str, str] = {}
+    if isinstance(raw_bindings, dict):
+        for key, value in raw_bindings.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                continue
+            k, v = key.strip(), value.strip()
+            if k and v:
+                cleaned[k] = v
+    # Keep the active fingerprint ↔ UUID pair coherent after hand-edits.
+    if s.hydrus.hydrus_instance_fingerprint and s.hydrus.hydrus_profile_uuid:
+        cleaned.setdefault(
+            s.hydrus.hydrus_instance_fingerprint,
+            s.hydrus.hydrus_profile_uuid)
+    s.hydrus.hydrus_instance_bindings = cleaned
 
 
 def normalize_hydrus_scan(scan: "HydrusScanSettings") -> None:
@@ -472,11 +497,128 @@ def normalize_hydrus_api_origin(api_url: str) -> str:
 def hydrus_scope_id(profile_uuid: str, api_url: str) -> str:
     """Non-secret scope id for Hydrus deletion/sync checkpoints.
 
-    Rotating profile_uuid (explicit “new Hydrus database”) or changing API
-    origin invalidates scoped seals. Access keys never enter the digest.
+    Rotating profile_uuid (explicit “new Hydrus database” / newly detected
+    instance) or changing API origin invalidates scoped seals. Access keys
+    never enter the digest.
     """
     material = f"{(profile_uuid or '').strip()}|{normalize_hydrus_api_origin(api_url)}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+# Combined local file domains are stable when the user adds extra "my files"
+# domains; concrete type-2 keys are only a fallback for older Hydrus builds.
+HYDRUS_INSTANCE_FINGERPRINT_TYPES = (15, 21)
+HYDRUS_INSTANCE_FINGERPRINT_FALLBACK_TYPES = (2,)
+
+
+def iter_hydrus_service_entries(data: Any) -> List[Tuple[str, Any, str]]:
+    """Normalize get_services JSON into (name, type, service_key) rows."""
+    if not isinstance(data, dict):
+        return []
+    services = data.get("services_v2")
+    if isinstance(services, list):
+        return [
+            (s.get("name") or "", s.get("type"), s.get("service_key") or "")
+            for s in services if isinstance(s, dict)
+        ]
+    legacy = data.get("services") or {}
+    if not isinstance(legacy, dict):
+        return []
+    return [
+        (name, (info or {}).get("type"), (info or {}).get("service_key") or "")
+        for name, info in legacy.items()
+    ]
+
+
+def hydrus_instance_fingerprint_from_services(data: Any) -> str:
+    """Non-secret fingerprint of a Hydrus database from durable service keys.
+
+    Hydrus does not expose a database UUID over the Client API. Combined local
+    file service keys are minted per database and stay put when an access key
+    is rotated, so they identify "which library is answering at this URL"
+    without putting secrets into ledgers.
+    """
+    entries = iter_hydrus_service_entries(data)
+    keys = sorted({
+        key for _, typ, key in entries
+        if key and typ in HYDRUS_INSTANCE_FINGERPRINT_TYPES
+    })
+    if not keys:
+        keys = sorted({
+            key for _, typ, key in entries
+            if key and typ in HYDRUS_INSTANCE_FINGERPRINT_FALLBACK_TYPES
+        })
+    if not keys:
+        return ""
+    material = "|".join(keys)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def bind_hydrus_instance_identity(
+        settings: Settings, fingerprint: str) -> Tuple[str, Optional[str]]:
+    """Update settings for a live Hydrus instance fingerprint.
+
+    Returns ``(profile_uuid, change)`` where *change* is ``None`` (unchanged /
+    first sighting), ``"switched"`` (restored a previously seen database), or
+    ``"detected"`` (first sighting of a different database than last time).
+    """
+    fp = (fingerprint or "").strip()
+    if not fp:
+        return settings.hydrus.hydrus_profile_uuid, None
+    hy = settings.hydrus
+    bindings = dict(hy.hydrus_instance_bindings or {})
+    previous_fp = (hy.hydrus_instance_fingerprint or "").strip()
+    current_uuid = (hy.hydrus_profile_uuid or "").strip() or str(uuid.uuid4())
+
+    if fp in bindings:
+        restored = bindings[fp]
+        hy.hydrus_profile_uuid = restored
+        hy.hydrus_instance_fingerprint = fp
+        hy.hydrus_instance_bindings = bindings
+        if previous_fp and previous_fp != fp:
+            return restored, "switched"
+        return restored, None
+
+    if previous_fp and previous_fp != fp:
+        new_uuid = str(uuid.uuid4())
+        bindings[fp] = new_uuid
+        hy.hydrus_profile_uuid = new_uuid
+        hy.hydrus_instance_fingerprint = fp
+        hy.hydrus_instance_bindings = bindings
+        return new_uuid, "detected"
+
+    # First fingerprint for this install, or reconnect to the same unknown DB.
+    bindings[fp] = current_uuid
+    hy.hydrus_profile_uuid = current_uuid
+    hy.hydrus_instance_fingerprint = fp
+    hy.hydrus_instance_bindings = bindings
+    return current_uuid, None
+
+
+def rotate_hydrus_profile_for_current_instance(settings: Settings) -> str:
+    """Force-revalidate the currently bound Hydrus database only."""
+    new_uuid = str(uuid.uuid4())
+    hy = settings.hydrus
+    hy.hydrus_profile_uuid = new_uuid
+    fp = (hy.hydrus_instance_fingerprint or "").strip()
+    if fp:
+        bindings = dict(hy.hydrus_instance_bindings or {})
+        bindings[fp] = new_uuid
+        hy.hydrus_instance_bindings = bindings
+    return new_uuid
+
+
+def persist_hydrus_instance_identity(
+        settings: Settings, *, store: Optional["SettingsStore"] = None) -> None:
+    """Write only Hydrus identity fields so unsaved GUI edits are preserved."""
+    store = store or SettingsStore()
+    on_disk = store.load()
+    on_disk.hydrus.hydrus_profile_uuid = settings.hydrus.hydrus_profile_uuid
+    on_disk.hydrus.hydrus_instance_fingerprint = (
+        settings.hydrus.hydrus_instance_fingerprint)
+    on_disk.hydrus.hydrus_instance_bindings = dict(
+        settings.hydrus.hydrus_instance_bindings or {})
+    store.save(on_disk)
 
 
 def normalize_recent_scan_paths(

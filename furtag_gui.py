@@ -10,7 +10,6 @@ import os
 import sys
 import threading
 import time
-import uuid
 import webbrowser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -1064,10 +1063,11 @@ class SettingsPanel(QWidget):
         self.hydrus_profile_label = QLabel()
         self.rotate_hydrus_profile = QPushButton("Reset…")
         self.rotate_hydrus_profile.setToolTip(
-            "Use a new or replaced Hydrus database: rotates FurTag's "
-            "non-secret Hydrus database identity. Use this "
-            "only after replacing the Hydrus database at this API address; "
-            "existing completion checkpoints will be revalidated.")
+            "Force-revalidate the Hydrus database FurTag is currently bound "
+            "to. FurTag normally detects a different library at this API "
+            "address automatically (and restores the old identity if you "
+            "switch back). Use Reset only to reopen completion checkpoints "
+            "for the same database.")
         self.rotate_hydrus_profile.clicked.connect(
             self._rotate_hydrus_profile_uuid)
         metadata_group = QGroupBox("Metadata downloader (separate Hydrus-owned page)")
@@ -1317,15 +1317,18 @@ class SettingsPanel(QWidget):
 
     def _rotate_hydrus_profile_uuid(self) -> None:
         answer = QMessageBox.question(
-            self, "New Hydrus database?",
-            "Only do this if the Hydrus database was replaced or rebuilt. "
-            "FurTag will distrust old Hydrus completion checkpoints and "
-            "revalidate files on later scans. Continue?",
+            self, "Force-revalidate this Hydrus database?",
+            "FurTag already detects a different Hydrus library at this API "
+            "address and restores a previous identity when you switch back.\n\n"
+            "Reset only force-reopens completion checkpoints for the database "
+            "you are currently using. Other remembered libraries stay intact. "
+            "Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self._initial.hydrus.hydrus_profile_uuid = str(uuid.uuid4())
+        from furtag_settings import rotate_hydrus_profile_for_current_instance
+        rotate_hydrus_profile_for_current_instance(self._initial)
         self.hydrus_profile_label.setText(
             self._initial.hydrus.hydrus_profile_uuid[:8] + "…")
         QMessageBox.information(
@@ -1389,6 +1392,7 @@ class MainWindow(QMainWindow):
         self.settings = self.settings_store.load()
         self.cred_store = CredentialStore()
         self.integrator = TagIntegrator(settings=self.settings)
+        self.integrator.settings_store = self.settings_store
 
         self.folder: Optional[Path] = None
         self.inventory: Optional[dict] = None
@@ -1422,6 +1426,7 @@ class MainWindow(QMainWindow):
         set_active_observer(QtObserver(self.bridge))
         self._migrate_legacy_credentials()
         self.integrator.load_credentials_from_store(self.cred_store)
+        self._pull_hydrus_identity_into_ui()
         self._load_last_used_folder()
         self._refresh_source_status()
 
@@ -1839,6 +1844,9 @@ class MainWindow(QMainWindow):
         self.integrator.apply_settings(s)
         self.integrator.cancel_event.clear()
         self.integrator.load_credentials_from_store(self.cred_store)
+        self._pull_hydrus_identity_into_ui()
+        self._overlay_hydrus_identity(s)
+        self.integrator.apply_settings(s)
         self._refresh_source_status()
 
         problems: List[str] = []
@@ -2072,7 +2080,15 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self._set_indexing(True)
         # Honor current Settings-tab toggles (e.g. PDF off) during discovery.
-        self.integrator.apply_settings(self.settings_panel.to_settings())
+        # Re-probe Hydrus first so a library swap is detected before index
+        # seals/checkpoints are evaluated, then keep that identity through
+        # apply_settings (the panel may still hold a pre-detect UUID).
+        self.integrator.cancel_event.clear()
+        self.integrator.load_credentials_from_store(self.cred_store)
+        self._pull_hydrus_identity_into_ui()
+        s = self.settings_panel.to_settings()
+        self._overlay_hydrus_identity(s)
+        self.integrator.apply_settings(s)
         worker = DiscoverWorker(
             self.integrator, self.folder, self.bridge, generation)
         self.discover_workers.append(worker)
@@ -2168,6 +2184,9 @@ class MainWindow(QMainWindow):
         self.integrator.cancel_event.clear()
         # Reload credentials in case user updated them
         self.integrator.load_credentials_from_store(self.cred_store)
+        self._pull_hydrus_identity_into_ui()
+        self._overlay_hydrus_identity(s)
+        self.integrator.apply_settings(s)
         self._refresh_source_status()
 
         errs = validate_run_preflight(
@@ -2494,14 +2513,38 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.integrator = TagIntegrator(
                 settings=self.settings_panel.to_settings())
+            self.integrator.settings_store = self.settings_store
             self.integrator.load_credentials_from_store(self.cred_store)
+            self._pull_hydrus_identity_into_ui()
             self._refresh_source_status()
 
     def _reconnect_sources(self) -> None:
         """Manually re-check Hydrus/source availability without restarting."""
         self.integrator.load_credentials_from_store(self.cred_store)
+        self._pull_hydrus_identity_into_ui()
         self._refresh_source_status()
         self._log("Rechecked Hydrus and source connections.")
+
+    @staticmethod
+    def _copy_hydrus_identity(dst: Settings, src: Settings) -> None:
+        dst.hydrus.hydrus_profile_uuid = src.hydrus.hydrus_profile_uuid
+        dst.hydrus.hydrus_instance_fingerprint = (
+            src.hydrus.hydrus_instance_fingerprint)
+        dst.hydrus.hydrus_instance_bindings = dict(
+            src.hydrus.hydrus_instance_bindings or {})
+
+    def _overlay_hydrus_identity(self, settings: Settings) -> None:
+        """Keep auto-detected Hydrus identity through Preferences apply."""
+        self._copy_hydrus_identity(settings, self.integrator.settings)
+
+    def _pull_hydrus_identity_into_ui(self) -> None:
+        """Mirror integrator/disk identity into the Settings panel and cache."""
+        self._copy_hydrus_identity(self.settings, self.integrator.settings)
+        self._copy_hydrus_identity(
+            self.settings_panel._initial, self.integrator.settings)
+        uuid_text = self.integrator.settings.hydrus.hydrus_profile_uuid
+        self.settings_panel.hydrus_profile_label.setText(
+            uuid_text[:8] + "…" if uuid_text else "unset")
 
     def closeEvent(self, event) -> None:
         if self.scan_worker and self.scan_worker.isRunning():

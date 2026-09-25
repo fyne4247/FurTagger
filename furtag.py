@@ -1676,6 +1676,9 @@ class TagIntegrator(HydrusMixin):
     def __init__(self, settings: Optional[Settings] = None,
                  session: Optional[requests.Session] = None) -> None:
         self.settings = (settings or Settings()).clone()
+        # Optional SettingsStore so Hydrus instance-identity binds persist
+        # without writing during unit tests that construct a bare integrator.
+        self.settings_store: Optional[SettingsStore] = None
         self.session = session if session is not None else requests.Session()
         self.cancel_event = threading.Event()
         self._observer: RunObserver = NullObserver()
@@ -6962,6 +6965,7 @@ def main() -> None:
     store = SettingsStore()
     settings = store.load()
     ti = TagIntegrator(settings=settings)
+    ti.settings_store = store
     ti.load_credentials_from_store(CredentialStore())
     print(f"📋 {ti.enabled_pipeline_description()}")
     print("⏭️  Skips files already tagged or logged in .furtag_ledger.json\n")
