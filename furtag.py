@@ -234,6 +234,134 @@ def _is_junk_tag(tag: str) -> bool:
     return False
 
 
+# Tags that should still be *written*, but that don't belong in the end-of-run
+# "interesting tags" recap. Parsers store booru names with spaces (`hi res`),
+# so every comparison goes through `_tag_key` — an underscore denylist never
+# matched the tags that were actually counted.
+#
+# e621's tag dump is the guide for which classes those are, not a cutoff on
+# post count. Meta tags split into file properties (resolution, playtime,
+# animation format, year, "has text") and style (sketch, watercolor, comic).
+# Only the file properties are uninteresting. A post-count cutoff would also
+# hide wardrobe, props, and settings, which is what the recap is for. Anatomy,
+# gender, and clothing *state* are matched by word so compounds (`penile
+# penetration`, `humanoid genitalia`, `mostly nude`) drop with the base tag.
+# Specific garments (`shirt`, `collar`) stay.
+_GENERIC_TAGS = {
+    # How many subjects, and the rating — never a scene.
+    "solo", "duo", "trio", "group",
+    "explicit", "questionable", "safe", "rating",
+    "ambiguous gender",
+    # Broad species / body plan. Particular species stay namespaced and are
+    # dropped by the colon check; these are the unnamespaced leftovers.
+    "furry", "anthro", "feral", "human", "humanoid", "biped",
+    "mammal", "canine", "canid", "feline", "felid", "equine", "equid",
+    "dragon", "wolf", "fox", "cat", "dog", "scalie",
+    # Broad surface labels, not a specific feature such as "wings" or "horns".
+    "tail", "fur", "hair", "clothing",
+    # Clothing taxonomy buckets. A named garment is still interesting.
+    "topwear", "bottomwear", "underwear", "legwear", "footwear",
+    "headwear", "headgear", "handwear", "armwear", "neckwear", "accessory",
+    # Clothing state (also caught by word, listed here so the set reads clearly).
+    "nude", "clothed", "naked", "bottomless", "topless", "unclothed",
+    "partially clothed", "mostly nude", "fully clothed",
+    # Basic expression and composition.
+    "simple background", "white background", "black background",
+    "grey background", "gray background", "transparent background",
+    "looking at viewer", "looking back", "open mouth", "closed mouth",
+    "smile", "blush", "teeth", "tongue", "tongue out",
+    "eyes closed", "closed eyes",
+    "standing", "sitting", "lying", "kneeling", "close up",
+    "from behind", "from behind position", "spread legs",
+    "text", "dialogue", "speech bubble", "signature",
+    # File properties: resolution, playback, container. Style tags
+    # (`sketch`, `watercolor (artwork)`, `comic`) are intentionally absent.
+    "hi res", "high res", "absurd res", "superabsurd res", "low res",
+    "highres", "lowres", "absurdres", "4k", "2k",
+    "animated", "animated gif", "animated png", "animated webp",
+    "2d animation", "3d animation", "pixel animation",
+    "short playtime", "long playtime",
+    "video", "sound", "no sound", "flash", "image", "loop", "gif", "webm",
+    "digital media", "digital media (artwork)", "digital drawing (artwork)",
+    "alpha channel", "huge filesize", "watermark", "artist name", "url",
+    "bodily fluids",
+}
+# Whole words. Short ones are exact on purpose: prefix "ass"/"butt"/"cum"
+# also matches assembly, butterfly, cumulus.
+_ANATOMY_WORDS = {
+    "cum", "cumshot", "ass", "butt", "balls", "cock", "dick", "sex", "anal",
+    "oral", "anus", "pussy", "semen", "sheath", "knot", "knotted",
+    "breast", "breasts", "gape", "nipple", "nipples", "vulva", "pubes",
+    "pubic", "glans", "foreskin", "areola", "clitoris", "scrotum",
+}
+# Longer stems, matched as a prefix of one word (`genitals`, `penile
+# penetration`, `vaginal`, `testicles`).
+_ANATOMY_STEMS = (
+    "genital", "penis", "penile", "vagina", "testic", "scrot", "clitor",
+    "ejaculat", "orgasm", "fellatio", "cunniling", "masturbat", "penetrat",
+    "erect", "precum", "nipple", "areola", "gape",
+)
+_GENDER_WORDS = {
+    "male", "female", "intersex", "gynomorph", "andromorph",
+    "herm", "hermaphrodite",
+}
+_CLOTHING_STATE_WORDS = {
+    "nude", "clothed", "naked", "bottomless", "topless", "unclothed",
+}
+_YEAR_TAG = re.compile(r"^(?:19|20)\d{2}$")
+
+
+def _tag_key(tag: str) -> str:
+    """Comparable form of a stored tag: casefold, separators as spaces."""
+    text = tag.casefold().replace("_", " ").replace("-", " ").replace("/", " ")
+    return " ".join(text.split())
+
+
+def _tag_words(key: str) -> List[str]:
+    cleaned = key.replace("(", " ").replace(")", " ")
+    return [word for word in cleaned.split() if word]
+
+
+def _is_anatomy_word(word: str) -> bool:
+    if word in _ANATOMY_WORDS:
+        return True
+    return any(word.startswith(stem) for stem in _ANATOMY_STEMS)
+
+
+def is_interesting_tag(tag: str, count: int, tagged: int) -> bool:
+    """False for namespaces and for generic tags that shouldn't lead a recap.
+
+    `tagged` is how many files this run actually tagged. A tag on almost all
+    of them is usually a library-wide descriptor, whatever it's called.
+    """
+    if not tag or ":" in tag:
+        return False
+    key = _tag_key(tag)
+    if not key or key in _GENERIC_TAGS or _YEAR_TAG.match(key):
+        return False
+    # "english text", "japanese text", … — the picture contains text, which
+    # is a file note, not a scene. Bare "text" is in the generic set.
+    if key.endswith(" text"):
+        return False
+    words = _tag_words(key)
+    if any(word in _GENDER_WORDS or word in _CLOTHING_STATE_WORDS
+           or _is_anatomy_word(word) for word in words):
+        return False
+    return count < max(6, tagged * 0.65)
+
+
+def interesting_tags(counts: Dict[str, int], tagged: int,
+                     limit: int = 5) -> List[Tuple[str, int]]:
+    """Up to `limit` (tag, count) rows worth showing in the run recap.
+
+    The tag text is returned as stored. Sorting is count, then name.
+    """
+    rows = [(tag, count) for tag, count in counts.items()
+            if is_interesting_tag(tag, count, tagged)]
+    rows.sort(key=lambda row: (-row[1], row[0].casefold()))
+    return rows[:limit]
+
+
 def _truthy(val: str, default: bool = False) -> bool:
     """Parse a serialized boolean (true/yes/1/on). Empty → default."""
     if val is None or str(val).strip() == "":
@@ -316,6 +444,18 @@ class _Track:
     interval: float = 0.0   # seconds/file for a rate-limit-based ETA (hash track only)
 
 
+def format_elapsed(sec: float) -> str:
+    """Clock form of a duration. Always HH:MM:SS; hours may exceed 99.
+
+    Truncates toward zero (the progress UI ticks in whole seconds). Negative
+    values, which a clock skew could produce, read as zero.
+    """
+    sec = max(0, int(sec))
+    hours, rem = divmod(sec, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 class LiveDisplay:
     """A fixed, in-place status panel with two independently-updating tracks
     (hash tier / perceptual tier), each showing previous / current / next
@@ -351,10 +491,7 @@ class LiveDisplay:
 
     @staticmethod
     def _fmt(sec: float) -> str:
-        sec = max(0, int(sec))
-        h, rem = divmod(sec, 3600)
-        m, s = divmod(rem, 60)
-        return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        return format_elapsed(sec)
 
     @staticmethod
     def _trim(name: str, width: int = 44) -> str:

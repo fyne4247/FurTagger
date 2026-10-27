@@ -161,7 +161,7 @@ from furtag import (
     TagIntegrator, prompt_for_pdf_dpi, _nuke_candidates, _pdf_render_candidates,
     _is_furtag_sidecar, LEDGER_FILE, DUPLICATES_FILE,
     is_filesystem_root, perform_nuke, set_active_observer,
-    _normalize_pdf_meta, notify_info,
+    _normalize_pdf_meta, notify_info, format_elapsed, interesting_tags,
 )
 from furtag_settings import (
     Settings, SettingsStore, RunOptions, ScanSummary, HydrusScanSettings,
@@ -2315,7 +2315,9 @@ class MainWindow(QMainWindow):
             card["sub"].setText(event.result or event.message)
             if card["start"] and card["total"]:
                 elapsed = time.monotonic() - card["start"]
-                card["eta"].setText(f"elapsed {int(elapsed)}s · {card['done']}/{card['total']}")
+                card["eta"].setText(
+                    f"elapsed {format_elapsed(elapsed)} · "
+                    f"{card['done']}/{card['total']}")
         elif event.kind == "grow":
             card["total"] = card["total"] + int(event.extra.get("by") or 1)
             card["bar"].setRange(0, max(1, card["total"]))
@@ -2361,32 +2363,6 @@ class MainWindow(QMainWindow):
         """Human-friendly post-run numbers; all tag counts are this run only."""
         label = "Cancelled — results so far" if summary.cancelled else "Finished"
         counts = summary.tag_counts
-        # These are technically tags, but not the kind of thing that makes a
-        # recap feel like a recap. Keep the leaderboard for actual scene,
-        # wardrobe, prop, setting, and style details instead of anatomy/porn
-        # taxonomy, broad species/body labels, ratings, and basic composition.
-        generic = {
-            "male", "female", "intersex", "ambiguous_gender", "solo",
-            "duo", "group", "sex", "oral", "anal", "vaginal",
-            "masturbation", "cum", "cum_in_mouth", "cum_on_body",
-            "penetration", "erection", "genitalia", "penis", "vagina",
-            "breasts", "nipple", "ass", "butt", "testicles", "balls",
-            "anus", "pussy", "cock", "dick", "gape", "sex_toy",
-            "furry", "anthro", "feral", "human", "mammal", "canine",
-            "feline", "equine", "dragon", "wolf", "fox", "cat", "dog",
-            "explicit", "questionable", "safe", "rating", "hi_res",
-            "lowres", "highres", "animated", "video", "sound", "flash",
-            "image", "digital_media", "simple_background", "white_background",
-            "black_background", "looking_at_viewer", "open_mouth", "smile",
-            "standing", "sitting", "lying", "kneeling", "close-up",
-            "close_up", "from_behind", "spread_legs", "tail", "fur",
-            "scalie", "big_breasts", "big_penis", "hair", "clothing",
-        }
-        anatomy_words = {
-            "penis", "vagina", "genital", "breast", "nipple", "anus",
-            "testicle", "scrotum", "cum", "semen", "dick", "cock",
-            "pussy", "butt", "ass", "oral", "anal", "sex", "penetrat",
-        }
 
         def top(namespace: str, n: int = 1) -> str:
             prefix = namespace + ":"
@@ -2395,20 +2371,10 @@ class MainWindow(QMainWindow):
             rows.sort(key=lambda row: (-row[1], row[0].casefold()))
             return ", ".join(f"{name} ({count})" for name, count in rows[:n]) or "none"
 
-        def is_interesting(tag: str, count: int) -> bool:
-            folded = tag.casefold()
-            words = set(folded.replace("-", "_").split("_"))
-            if ":" in folded or folded in generic or words & anatomy_words:
-                return False
-            # A tag occurring on almost everything is usually a library-wide
-            # descriptor, not a fun fact about this particular run.
-            return count < max(6, summary.tagged * 0.65)
-
-        interesting = [(tag, count) for tag, count in counts.items()
-                       if is_interesting(tag, count)]
-        interesting.sort(key=lambda row: (-row[1], row[0].casefold()))
         top_tags = ", ".join(
-            f"{tag} ({count})" for tag, count in interesting[:5]) or "none"
+            f"{tag} ({count})"
+            for tag, count in interesting_tags(counts, summary.tagged)
+        ) or "none"
         return (
             f"{label}\n\n"
             f"Tagged media: {summary.tagged}\n"
