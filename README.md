@@ -52,7 +52,7 @@ Built for large libraries: multi-source MD5 lookups, resumable ledgers, polite r
 ### Reports and run stats
 
 - **Folder-scan JSON receipts** — every completed or cancelled folder scan can write a compact JSON report containing totals, image/video counts, source hits, tag counts, duplicates, unmatched files, and pending reviews. Reports live under the platform settings directory (`~/Library/Application Support/FurTag/scans/` on macOS) rather than beside the media. This is on by default and can be disabled under **Settings → Output** without affecting ledgers or retry behavior.
-- **Optional GUI stats recap** — after a folder run finishes or is cancelled, the GUI can show tagged images/videos, duplicate copies tagged, individual tag assignments, source totals, top artist/series/character, and five “interesting” tags. The interesting-tag list filters namespaces, anatomy/sex taxonomy, ratings, broad species/body labels, basic poses, and tags present on almost the whole run. The dialog has its own **Settings → Output** toggle.
+- **Optional GUI stats recap** — after a folder run finishes or is cancelled, the GUI can show tagged images/videos, duplicate copies tagged, individual tag assignments, source totals, top artist/series/character, and five “interesting” tags. The interesting-tag list filters namespaces, anatomy/sex taxonomy, ratings, broad species/body labels, basic poses and expressions, clothing state, file properties (resolution, playtime, animation format), and tags present on almost the whole run. Named garments, settings, and style tags still count. The dialog has its own **Settings → Output** toggle.
 
 ### Reliability
 
